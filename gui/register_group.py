@@ -1,8 +1,12 @@
-"""Reusable scrollable register grid widget."""
+"""RegisterGroup -- scrollable register list with collapsible sections.
+
+All non-Output/Control registers in one scrollable frame,
+grouped by category with section headers.
+"""
+
 import tkinter as tk
 from tkinter import ttk
 from core.pmbus_formats import decode_value, encode_value
-
 
 class RegisterGroup(ttk.Frame):
     """Scrollable grid of registers with per-register read/write buttons."""
