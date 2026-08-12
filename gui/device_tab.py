@@ -1,3 +1,5 @@
+# gui/device_tab.py
+
 """DeviceTab -- all channels side-by-side, global status TreeView."""
 
 import tkinter as tk
@@ -61,8 +63,11 @@ class DeviceTab(ttk.Frame):
 
         gt_fr = ttk.LabelFrame(left, text=" Global Telemetry ")
         gt_fr.pack(fill='x', padx=2, pady=(0, 2))
+
         for key, label, unit, color in [
             ('VIN',     'VIN',              'V', '#2196F3'),
+            ('IIN',     'IIN',              'A', '#FF9800'),
+            ('PIN',     'PIN',              'W', '#E91E63'),
             ('TEMP_IC', 'IC Temperature',   'C', '#795548'),
         ]:
             rf = ttk.Frame(gt_fr)
@@ -154,7 +159,7 @@ class DeviceTab(ttk.Frame):
                 'ok':    '#228B22',
             }[tag])
 
-    # ======================================================= channel columns
+    # channel columns
     def _build_channels(self):
         ch_frame = ttk.Frame(self)
         ch_frame.grid(row=1, column=0, sticky='nsew', padx=4, pady=2)
@@ -165,7 +170,7 @@ class DeviceTab(ttk.Frame):
             cc.grid(row=0, column=p, sticky='nsew', padx=3, pady=2)
             self.channels.append(cc)
 
-# ========================================================== button bar
+    # button bar
     def _build_buttons(self):
         bf = ttk.Frame(self)
         bf.grid(row=2, column=0, sticky='ew', padx=4, pady=(0, 4))
@@ -176,7 +181,6 @@ class DeviceTab(ttk.Frame):
             ("Store NVM",     self.do_store),
             ("Restore NVM",   self.do_restore),
             ("Clear Faults",  self.do_clear),
-
         ]:
             ttk.Button(bf, text=text, command=cmd).pack(
                 side='left', padx=2)
@@ -204,12 +208,7 @@ class DeviceTab(ttk.Frame):
             ttk.Button(bf, text=text, command=cmd).pack(
                 side='left', padx=2)
 
-        for text, cmd in [
-        ]:
-            ttk.Button(bf, text=text, command=cmd).pack(
-                side='left', padx=2)
-
-    # ========================================================== read / write
+    # read / write
     def _write_single_global(self, key):
         """Write one global parameter to device."""
         if key not in self.global_cfg_data:
@@ -237,25 +236,25 @@ class DeviceTab(ttk.Frame):
                     sv.set("ERR")
 
             gt = self.device.read_global_telemetry()
-            for key in ('VIN', 'TEMP_IC'):
+            for key in ('VIN', 'IIN', 'PIN', 'TEMP_IC'):
                 v = gt.get(key)
                 lbl = self.global_telem_lbl.get(key)
                 if lbl:
-                    lbl.configure(
-                        text=f"{v:.3f}" if v is not None else "N/A")
+                    lbl.configure(text=f"{v:.3f}" if v is not None else "N/A")
 
             for ch in self.channels:
                 cfg = self.device.read_channel_config(ch.page)
                 ch.update_config(cfg)
+
                 ct = self.device.read_channel_telemetry(ch.page)
                 ch.update_telemetry(ct)
+
                 cs = self.device.read_channel_status(ch.page)
                 ch.update_status(cs)
 
             gs = self.device.read_global_status()
             self._update_global_status(gs)
 
-            # Read all register groups in channel tabs
             for ch in self.channels:
                 ch.read_all_reg_groups()
         except Exception as e:
@@ -312,7 +311,7 @@ class DeviceTab(ttk.Frame):
         self.device.clear_faults()
         self._refresh_status()
 
-    # ============================================================ monitor
+    # monitor
     def toggle_monitor(self):
         if self.monitoring:
             self.monitoring = False
@@ -327,15 +326,16 @@ class DeviceTab(ttk.Frame):
             return
         try:
             gt = self.device.read_global_telemetry()
-            for key in ('VIN', 'TEMP_IC'):
+            for key in ('VIN', 'IIN', 'PIN', 'TEMP_IC'):
                 v = gt.get(key)
                 lbl = self.global_telem_lbl.get(key)
                 if lbl:
-                    lbl.configure(
-                        text=f"{v:.3f}" if v is not None else "N/A")
+                    lbl.configure(text=f"{v:.3f}" if v is not None else "N/A")
+
             for ch in self.channels:
                 ct = self.device.read_channel_telemetry(ch.page)
                 ch.update_telemetry(ct)
+
             self._refresh_status()
         except Exception:
             pass
@@ -410,7 +410,7 @@ class DeviceTab(ttk.Frame):
             self.global_status_ind.configure(
                 text="OK", fg='#00FF00')
 
-    # ============================================================= dump
+    # dump
     def _dump_page(self):
         try:
             return int(self.dump_page_var.get())
@@ -508,6 +508,6 @@ class DeviceTab(ttk.Frame):
         if hasattr(self, '_reg_tab'):
             self._reg_tab._do_read_all()
 
-# ============================================================ cleanup
+    # cleanup
     def stop_all(self):
         self.monitoring = False
