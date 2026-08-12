@@ -30,3 +30,14 @@ STATUS_CML_BITS = {
     7: "Invalid Cmd", 6: "Invalid Data", 5: "PEC Failed", 4: "Memory Fault",
     3: "Processor (N/S)", 2: "Reserved", 1: "PMBus Fault", 0: "Unknown (N/S)",
 }
+
+STATUS_MFR_BITS = {
+    7: "External fault occurred",
+    6: "Discharge fault occurred",
+    5: "Channel shorted to GND",
+    4: "Clock sync fault",
+    3: "Mfr temperature fault",
+    2: "Internal AnaFault",
+    1: "Short-cycle fault",
+    0: "Servo target error",
+}
