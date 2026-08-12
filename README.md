@@ -1,4 +1,4 @@
 На данный момент поломан demo режим.
 Более-менее стабильно работате с CH341T как на картинке, но требуются ещё проверки, а таже доработка интерфейса.
-<img width="375" height="500" alt="7480912455" src="https://github.com/user-attachments/assets/9dedb59b-c2ed-4f85-b067-b451e84a8c03" />
+<img width="263" height="350" alt="7480912455" src="https://github.com/user-attachments/assets/9dedb59b-c2ed-4f85-b067-b451e84a8c03" />
 В дальнейшем надо будет сделать поддержку FTDI FT232H.
