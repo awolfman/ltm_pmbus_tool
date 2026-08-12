@@ -3,7 +3,7 @@ MFR registers per LTM4673 Rev A datasheet.
 """
 from core.devices.registry import register_device
 
-for _id in (0x4480, 0x4730, 0x47A0):
+for _id in (0x4480, 0x4730, 0x47A0, 0x0236):
     register_device(_id, "LTM4673", 4, __name__)
 
 REGISTER_OVERRIDES = {
