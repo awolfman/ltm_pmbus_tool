@@ -394,3 +394,4 @@ class RegisterTab(ttk.Frame):
             text=f"Written: {written}, Failed: {failed}")
         # Re-read all
         self._do_read_all()
+        
