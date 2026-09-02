@@ -43,7 +43,7 @@ def _url_for(desc):
     return f'ftdi://ftdi:{name}/1'
 
 
-class FtdiBus:
+class FTDIBus:
     """SMBus-compatible I2C bus via FTDI MPSSE.
 
     Shared I2cController per physical device.
@@ -55,8 +55,9 @@ class FtdiBus:
 
     def __init__(self, dev_index=0):
         self._idx = dev_index
-        with FtdiBus._global_lock:
-            if dev_index not in FtdiBus._shared:
+        self._closed = False
+        with FTDIBus._global_lock:
+            if dev_index not in FTDIBus._shared:
                 self._open(dev_index)
 
     def _open(self, dev_index):
@@ -77,10 +78,12 @@ class FtdiBus:
         ctrl = I2cController()
         ctrl.configure(url)
 
-        FtdiBus._shared[dev_index] = {
+        FTDIBus._shared[dev_index] = {
             'ctrl':  ctrl,
             'ports': {},
             'lock':  threading.Lock(),
+            'desc': desc,
+            'url': url,
         }
 
         label = getattr(desc, 'description', '') or \
@@ -88,16 +91,22 @@ class FtdiBus:
         print(f"[FTDI] opened {label} ({url})")
 
     def _port(self, addr):
-        entry = FtdiBus._shared[self._idx]
+        entry = FTDIBus._shared[self._idx]
         if addr not in entry['ports']:
             entry['ports'][addr] = entry['ctrl'].get_port(addr)
         return entry['ports'][addr]
 
-    # ============================================ SMBus interface
+    def close(self):
+        """Close this bus instance (does not close shared controller)."""
+        self._closed = True
+
+    # SMBus interface
 
     def read_byte(self, addr):
         """Read single byte (device detect / SMBus read byte)."""
-        entry = FtdiBus._shared[self._idx]
+        if self._closed:
+            raise RuntimeError("Bus is closed")
+        entry = FTDIBus._shared[self._idx]
         with entry['lock']:
             port = self._port(addr)
             data = port.read(1)
@@ -105,7 +114,9 @@ class FtdiBus:
 
     def read_byte_data(self, addr, cmd):
         """Write register, repeated start, read 1 byte."""
-        entry = FtdiBus._shared[self._idx]
+        if self._closed:
+            raise RuntimeError("Bus is closed")
+        entry = FTDIBus._shared[self._idx]
         with entry['lock']:
             port = self._port(addr)
             data = port.read_from(cmd, 1)
@@ -113,7 +124,9 @@ class FtdiBus:
 
     def read_word_data(self, addr, cmd):
         """Write register, repeated start, read 2 bytes (LE)."""
-        entry = FtdiBus._shared[self._idx]
+        if self._closed:
+            raise RuntimeError("Bus is closed")
+        entry = FTDIBus._shared[self._idx]
         with entry['lock']:
             port = self._port(addr)
             data = port.read_from(cmd, 2)
@@ -121,7 +134,9 @@ class FtdiBus:
 
     def read_i2c_block_data(self, addr, cmd, length):
         """Block read: write register, repeated start, read N."""
-        entry = FtdiBus._shared[self._idx]
+        if self._closed:
+            raise RuntimeError("Bus is closed")
+        entry = FTDIBus._shared[self._idx]
         with entry['lock']:
             port = self._port(addr)
             data = port.read_from(cmd, length)
@@ -129,32 +144,49 @@ class FtdiBus:
 
     def write_byte(self, addr, val):
         """SMBus send byte."""
-        entry = FtdiBus._shared[self._idx]
+        if self._closed:
+            raise RuntimeError("Bus is closed")
+        entry = FTDIBus._shared[self._idx]
         with entry['lock']:
             port = self._port(addr)
             port.write(bytes([val & 0xFF]))
 
     def write_byte_data(self, addr, cmd, val):
         """SMBus write byte data."""
-        entry = FtdiBus._shared[self._idx]
+        if self._closed:
+            raise RuntimeError("Bus is closed")
+        entry = FTDIBus._shared[self._idx]
         with entry['lock']:
             port = self._port(addr)
             port.write_to(cmd, bytes([val & 0xFF]))
 
     def write_word_data(self, addr, cmd, val):
         """SMBus write word data (LE)."""
-        entry = FtdiBus._shared[self._idx]
+        if self._closed:
+            raise RuntimeError("Bus is closed")
+        entry = FTDIBus._shared[self._idx]
         with entry['lock']:
             port = self._port(addr)
             port.write_to(cmd, bytes([val & 0xFF,
                                       (val >> 8) & 0xFF]))
 
-    # ============================================ context manager
+    def write_i2c_block_data(self, addr, cmd, data):
+        """SMBus write block data."""
+        if self._closed:
+            raise RuntimeError("Bus is closed")
+        entry = FTDIBus._shared[self._idx]
+        with entry['lock']:
+            port = self._port(addr)
+            # Convert data to bytes if it's a list
+            if isinstance(data, list):
+                data = bytes(data)
+            port.write_to(cmd, data)
+
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
-        pass
+        self.close()
 
     @classmethod
     def close_all(cls):
@@ -163,7 +195,25 @@ class FtdiBus:
             for entry in cls._shared.values():
                 try:
                     entry['ctrl'].terminate()
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[FTDI] Error terminating controller: {e}")
             cls._shared.clear()
             print("[FTDI] all devices released")
+
+    @classmethod
+    def get_available_devices(cls):
+        """Return list of available FTDI devices with info."""
+        if not HAS_PYFTDI:
+            return []
+        devs = find_ftdi_devices()
+        result = []
+        for i, desc in enumerate(devs):
+            info = {
+                'index': i,
+                'description': getattr(desc, 'description', ''),
+                'sn': getattr(desc, 'sn', ''),
+                'pid': desc.pid,
+                'vid': desc.vid,
+            }
+            result.append(info)
+        return result
