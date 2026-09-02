@@ -145,37 +145,59 @@ def find_buses():
 
     buses = []
 
-    # ---- Linux /dev/i2c-N ----
+    # ---- Linux /dev/i2c-N (0-99) ----
     for i in range(20):
         if os.path.exists(f"/dev/i2c-{i}"):
-            buses.append(i)
+            buses.append(i)  # 0-19
 
-    # ---- CH341 USB ----
+    # ---- CH341 USB (100-199) ----
     try:
-        from .ch341_i2c import find_ch341_devices
-        for idx in range(len(find_ch341_devices())):
-            buses.append(CH341_OFFSET + idx)
+        from .ch341_i2c import find_ch341_devices, CH341_PID_I2C
+        ch341_devices = find_ch341_devices()
+        i2c_count = 0
+        for dev in ch341_devices:
+            if hasattr(dev, 'idProduct') and dev.idProduct == CH341_PID_I2C:
+                bus_num = CH341_OFFSET + i2c_count  # 100 + i
+                if bus_num not in buses:
+                    buses.append(bus_num)
+                    i2c_count += 1
     except ImportError:
         pass
     except Exception as e:
         print(f"[scan] CH341 error: {e}")
 
-    # ---- FTDI USB (FT232H / FT2232H / FT4232H) ----
+    # ---- FTDI USB (200-299) ----
     try:
         from .ftdi_i2c import find_ftdi_devices
-        for idx in range(len(find_ftdi_devices())):
-            buses.append(FTDI_OFFSET + idx)
+        ftdi_devices = find_ftdi_devices()
+        for idx in range(len(ftdi_devices)):
+            bus_num = FTDI_OFFSET + idx  # 200 + i
+            if bus_num not in buses:
+                buses.append(bus_num)
     except ImportError:
         pass
     except Exception as e:
         print(f"[scan] FTDI error: {e}")
-
-    return buses
-
+    return sorted(buses)
 
 def bus_label(bus_num):
     if is_sim():
         return "Simulated I2C #0"
+
+    # CH341 buses (100-199)
+    if CH341_OFFSET <= bus_num < FTDI_OFFSET:
+        idx = bus_num - CH341_OFFSET
+        try:
+            from .ch341_i2c import find_ch341_devices
+            devs = find_ch341_devices()
+            if idx < len(devs):
+                dev = devs[idx]
+                return f"CH341 #{idx} (bus={dev.bus}, addr={dev.address})"
+        except:
+            pass
+        return f"CH341 #{idx}"
+
+    # FTDI buses (200-299)
     if bus_num >= FTDI_OFFSET:
         idx = bus_num - FTDI_OFFSET
         try:
@@ -189,8 +211,8 @@ def bus_label(bus_num):
         except Exception:
             pass
         return f"FTDI #{idx}"
-    if bus_num >= CH341_OFFSET:
-        return f"CH341 #{bus_num - CH341_OFFSET}"
+
+    # System I2C buses (0-99)
     return f"/dev/i2c-{bus_num}"
 
 
