@@ -6,6 +6,8 @@ import sys
 import random
 from .bus_factory import create_bus, CH341_OFFSET, FTDI_OFFSET
 from .pmbus_device import PMBusDevice
+import signal
+import time
 
 # Глобальные адреса, которые не являются отдельными устройствами
 GLOBAL_ADDRESSES = {0x5A, 0x5B, 0x7C}
@@ -215,7 +217,6 @@ def bus_label(bus_num):
     # System I2C buses (0-99)
     return f"/dev/i2c-{bus_num}"
 
-
 def scan_bus(bus_num):
     if is_sim():
         print("[scan_bus] DEMO mode: returning simulated device")
@@ -225,22 +226,23 @@ def scan_bus(bus_num):
     bl = bus_label(bus_num)
     print(f"[scan_bus] scanning {bl} ...")
 
-    is_ftdi = bus_num >= FTDI_OFFSET
-
     try:
-        bus = create_bus(bus_num)   # <--- убрали with
-
-        if is_ftdi:
-            scan_addrs = [0x0C, 0x5B, 0x5C, 0x58, 0x5A, 0x5D, 0x4C, 0x4D]
-            print(f"[scan_bus] FTDI режим: сканируем только PMBus адреса")
-        else:
-            scan_addrs = range(0x08, 0x78)
+        bus = create_bus(bus_num)
+        scan_addrs = range(0x08, 0x78)
 
         for addr in scan_addrs:
             if addr in GLOBAL_ADDRESSES:
                 continue
+
             try:
-                bus.read_byte(addr)
+                # Небольшая пауза перед каждым адресом, чтобы шина и чипы «отдыхали»
+                time.sleep(0.005)
+
+                res = bus.read_byte(addr)
+                if res == 0xFF:
+                    continue
+
+                # Если адрес ответил (res != 0xFF), проверяем устройство
                 dev = PMBusDevice(bus_num, addr)
                 if dev.identify():
                     devices.append(dev)
@@ -250,12 +252,10 @@ def scan_bus(bus_num):
                           f"id=0x{dev.special_id:04X}")
             except Exception:
                 continue
+
     except Exception as e:
         print(f"[scan] ошибка при сканировании шины {bus_num}: {e}")
         return []
-
-    print(f"[scan_bus] found {len(devices)} device(s)")
-    return devices
 
     print(f"[scan_bus] found {len(devices)} device(s)")
     return devices
