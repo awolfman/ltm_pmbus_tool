@@ -17,6 +17,7 @@ _BUS_CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
 def create_bus(bus_num):
+    print(f"[DEBUG] create_bus({bus_num}) called")
     global _BUS_CACHE
 
     with _CACHE_LOCK:
@@ -25,6 +26,7 @@ def create_bus(bus_num):
             ch341_index = bus_num - CH341_OFFSET
             if bus_num not in _BUS_CACHE:
                 _BUS_CACHE[bus_num] = CH341Bus(ch341_index)
+            print(f"[DEBUG] create_bus({bus_num}) returning {_BUS_CACHE[bus_num]}")
             return _BUS_CACHE[bus_num]
         elif bus_num >= FTDI_OFFSET:
             # FTDI bus
