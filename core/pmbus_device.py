@@ -98,13 +98,8 @@ class PMBusDevice:
         with self._lock:
             for attempt in range(RETRY_COUNT):
                 try:
-                    if self._is_ftdi:
-                        def _read():
-                            return bus.read_byte_data(self.address, cmd)
-                        val = with_timeout(_read, FTDI_TIMEOUT)
-                    else:
-                        val = bus.read_byte_data(self.address, cmd)
-
+                    # Убираем with_timeout, он бесполезен для C-библиотеки libusb
+                    val = bus.read_byte_data(self.address, cmd)
                     time.sleep(PMBUS_PAUSE)
 
                     if cmd == 0x7E and val in (0x82, 0x02):
@@ -117,7 +112,13 @@ class PMBusDevice:
                         continue
 
                     return val if val != 0xFF else None
-                except Exception:
+                except Exception as e:
+                    print(f"[PMBusDevice] Ошибка чтения байта (cmd 0x{cmd:02X}, попытка {attempt}): {e}")
+                    # Если поймали NACK или ошибку связи на FTDI — прерываем цикл сразу!
+                    # Повторные попытки без сброса контроллера только вешают libusb
+                    if self._is_ftdi:
+                        break
+
                     if attempt < RETRY_COUNT - 1:
                         if self._has_native_reset:
                             try: bus.reset_bus()
@@ -138,13 +139,7 @@ class PMBusDevice:
         with self._lock:
             for attempt in range(RETRY_COUNT):
                 try:
-                    if self._is_ftdi:
-                        def _read():
-                            return bus.read_word_data(self.address, cmd)
-                        val = with_timeout(_read, FTDI_TIMEOUT)
-                    else:
-                        val = bus.read_word_data(self.address, cmd)
-
+                    val = bus.read_word_data(self.address, cmd)
                     time.sleep(PMBUS_PAUSE)
 
                     if (val == 0xFFFF or val is None) and attempt < RETRY_COUNT - 1:
@@ -154,7 +149,11 @@ class PMBusDevice:
                         continue
 
                     return val if val != 0xFFFF else None
-                except Exception:
+                except Exception as e:
+                    print(f"[PMBusDevice] Ошибка чтения слова (cmd 0x{cmd:02X}, попытка {attempt}): {e}")
+                    if self._is_ftdi:
+                        break
+
                     if attempt < RETRY_COUNT - 1:
                         if self._has_native_reset:
                             try: bus.reset_bus()
