@@ -84,6 +84,13 @@ class FTDIBus:
         ctrl = I2cController()
         ctrl.configure(url)
 
+        # --- ДОБАВЛЯЕМ СТРОКУ ТАЙМАУТА ДЛЯ LIBUSB ---
+        # Устанавливаем внутренний USB таймаут в миллисекундах (100 мс)
+        if hasattr(ctrl, 'ftdi') and hasattr(ctrl.ftdi, '_usb_read_timeout'):
+            ctrl.ftdi._usb_read_timeout = 100
+            ctrl.ftdi._usb_write_timeout = 100
+        # -----------------------------------
+
         FTDIBus._shared[dev_index] = {
             'ctrl':  ctrl,
             'ports': {},
@@ -127,12 +134,26 @@ class FTDIBus:
         entry = self._get_entry()
         with entry['lock']:
             try:
+                ctrl = entry['ctrl']
+
+                # Шаг 1. Безопасный низкоуровневый пинг шины.
+                # Если на адресе никого нет, poll() мгновенно отвалится по NACK, не зависая.
+                # Флаг relax=True принудительно заставляет libusb сбросить транзакцию при неудаче.
+                if not ctrl.poll(addr, relax=True):
+                    return 0xFF
+
+                # Шаг 2. Если адрес физически ответил, создаем полноценный SMBus-порт
+                # и читаем стандартный PMBus-регистр 0x00 (PAGE).
+                # Это гарантирует, что капризный чип LTM4673 примет команду и вернет ACK.
                 port = self._port(addr)
-                data = port.read(1)
+
+                # Читаем 1 байт из регистра 0x00 (PAGE)
+                data = port.read_from(0x00, 1)
+
                 if data and len(data) > 0:
                     return data[0]
                 return 0xFF
-            except Exception as e:
+            except Exception:
                 return 0xFF
 
     def read_byte_data(self, addr, cmd):
@@ -248,7 +269,8 @@ class FTDIBus:
                 return data is not None and len(data) > 0
             except Exception as e:
                 return False
-                
+
+    # ============================================ context manager
     def __enter__(self):
         return self
 
