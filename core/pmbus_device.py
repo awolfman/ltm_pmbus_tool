@@ -3,6 +3,7 @@
 
 import threading
 import time
+import signal
 from core.bus_factory import create_bus
 from core.pmbus_constants import (
     Cmd, REGISTER_MAP, READ_ONLY_CMDS, KNOWN_DEVICES,
@@ -13,6 +14,7 @@ from core.pmbus_formats import (l11_to_float, l16_to_float,
 
 RETRY_COUNT = 3
 PMBUS_PAUSE = 0.01
+FTDI_TIMEOUT = 1  # таймаут для FTDI в секундах
 
 SKIP_REGISTERS = {
     0xEE,  # MFR_FAULT_LOG (block)
@@ -22,6 +24,29 @@ SKIP_REGISTERS = {
     0xBD, 0xBE, 0xBF,  # EEPROM
     0xE3, 0xFD,  # send byte
 }
+
+# FTDI адреса, которые могут зависать при block read
+FTDI_SKIP_BLOCK = {0xEE, 0x99, 0x9E, 0xC0, 0xBD, 0xBE, 0xBF}
+
+
+def with_timeout(func, timeout=FTDI_TIMEOUT):
+    """Execute function with timeout."""
+    def timeout_handler(signum, frame):
+        raise TimeoutError()
+
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(timeout)
+    try:
+        result = func()
+        signal.alarm(0)
+        return result
+    except TimeoutError:
+        signal.alarm(0)
+        return None
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
+        signal.alarm(0)
+
 
 class PMBusDevice:
     def __init__(self, bus_num, address, special_id=None):
@@ -35,6 +60,7 @@ class PMBusDevice:
         self._regmap = REGISTER_MAP
         self._read_only = READ_ONLY_CMDS
         self._global_cmds = set()
+        self._is_ftdi = bus_num >= 200  # FTDI bus offset
 
         self._lock = threading.RLock()
 
@@ -72,7 +98,13 @@ class PMBusDevice:
         with self._lock:
             for attempt in range(RETRY_COUNT):
                 try:
-                    val = bus.read_byte_data(self.address, cmd)
+                    if self._is_ftdi:
+                        def _read():
+                            return bus.read_byte_data(self.address, cmd)
+                        val = with_timeout(_read, FTDI_TIMEOUT)
+                    else:
+                        val = bus.read_byte_data(self.address, cmd)
+
                     time.sleep(PMBUS_PAUSE)
 
                     if cmd == 0x7E and val in (0x82, 0x02):
@@ -106,7 +138,13 @@ class PMBusDevice:
         with self._lock:
             for attempt in range(RETRY_COUNT):
                 try:
-                    val = bus.read_word_data(self.address, cmd)
+                    if self._is_ftdi:
+                        def _read():
+                            return bus.read_word_data(self.address, cmd)
+                        val = with_timeout(_read, FTDI_TIMEOUT)
+                    else:
+                        val = bus.read_word_data(self.address, cmd)
+
                     time.sleep(PMBUS_PAUSE)
 
                     if (val == 0xFFFF or val is None) and attempt < RETRY_COUNT - 1:
@@ -132,9 +170,17 @@ class PMBusDevice:
             return False
         with self._lock:
             try:
-                bus.write_byte_data(self.address, cmd, val & 0xFF)
-                time.sleep(PMBUS_PAUSE)
-                return True
+                if self._is_ftdi:
+                    def _write():
+                        bus.write_byte_data(self.address, cmd, val & 0xFF)
+                        return True
+                    result = with_timeout(_write, FTDI_TIMEOUT)
+                    time.sleep(PMBUS_PAUSE)
+                    return result is True
+                else:
+                    bus.write_byte_data(self.address, cmd, val & 0xFF)
+                    time.sleep(PMBUS_PAUSE)
+                    return True
             except Exception:
                 return False
 
@@ -144,9 +190,17 @@ class PMBusDevice:
             return False
         with self._lock:
             try:
-                bus.write_word_data(self.address, cmd, val & 0xFFFF)
-                time.sleep(PMBUS_PAUSE)
-                return True
+                if self._is_ftdi:
+                    def _write():
+                        bus.write_word_data(self.address, cmd, val & 0xFFFF)
+                        return True
+                    result = with_timeout(_write, FTDI_TIMEOUT)
+                    time.sleep(PMBUS_PAUSE)
+                    return result is True
+                else:
+                    bus.write_word_data(self.address, cmd, val & 0xFFFF)
+                    time.sleep(PMBUS_PAUSE)
+                    return True
             except Exception:
                 return False
 
@@ -156,15 +210,28 @@ class PMBusDevice:
             return False
         with self._lock:
             try:
-                bus.write_byte(self.address, cmd)
-                time.sleep(PMBUS_PAUSE)
-                return True
+                if self._is_ftdi:
+                    def _send():
+                        bus.write_byte(self.address, cmd)
+                        return True
+                    result = with_timeout(_send, FTDI_TIMEOUT)
+                    time.sleep(PMBUS_PAUSE)
+                    return result is True
+                else:
+                    bus.write_byte(self.address, cmd)
+                    time.sleep(PMBUS_PAUSE)
+                    return True
             except Exception:
                 return False
 
     def read_i2c_block_data(self, cmd, length=32):
-        if cmd in SKIP_REGISTERS:
+        if cmd in SKIP_REGISTERS or cmd in FTDI_SKIP_BLOCK:
             return None
+
+        # Для FTDI отключаем block read (может зависать)
+        if self._is_ftdi:
+            return None
+
         bus = self._get_bus()
         if not bus:
             return None
@@ -176,13 +243,23 @@ class PMBusDevice:
             except Exception:
                 return None
 
-    def _rb(self, cmd): return self.read_byte_data(cmd)
-    def _rw(self, cmd): return self.read_word_data(cmd)
-    def _wb(self, cmd, val): return self.write_byte_data(cmd, val)
-    def _ww(self, cmd, val): return self.write_word_data(cmd, val)
-    def _send(self, cmd): return self.send_byte(cmd)
-    def _rblock(self, cmd, length=32): return self.read_i2c_block_data(cmd, length)
+    def _rb(self, cmd):
+        return self.read_byte_data(cmd)
 
+    def _rw(self, cmd):
+        return self.read_word_data(cmd)
+
+    def _wb(self, cmd, val):
+        return self.write_byte_data(cmd, val)
+
+    def _ww(self, cmd, val):
+        return self.write_word_data(cmd, val)
+
+    def _send(self, cmd):
+        return self.send_byte(cmd)
+
+    def _rblock(self, cmd, length=32):
+        return self.read_i2c_block_data(cmd, length)
 
     def set_page(self, page):
         target_page = page & 0xFF
@@ -190,71 +267,110 @@ class PMBusDevice:
         if not bus:
             return False
 
-        bus.write_byte_data(self.address, 0x00, target_page)
-        time.sleep(0.005)
-        for _ in range(3):
-            try:
-                current = bus.read_byte_data(self.address, 0x00)
-                if current == target_page:
-                    time.sleep(0.002)
+        try:
+            if self._is_ftdi:
+                def _set_page():
+                    bus.write_byte_data(self.address, 0x00, target_page)
                     return True
+                with_timeout(_set_page, FTDI_TIMEOUT)
+            else:
                 bus.write_byte_data(self.address, 0x00, target_page)
-                time.sleep(0.005)
-            except:
-                time.sleep(0.002)
+
+            time.sleep(0.005)
+
+            for _ in range(3):
+                try:
+                    if self._is_ftdi:
+                        def _read_page():
+                            return bus.read_byte_data(self.address, 0x00)
+                        current = with_timeout(_read_page, FTDI_TIMEOUT)
+                    else:
+                        current = bus.read_byte_data(self.address, 0x00)
+
+                    if current == target_page:
+                        time.sleep(0.002)
+                        return True
+
+                    if self._is_ftdi:
+                        def _write_page():
+                            bus.write_byte_data(self.address, 0x00, target_page)
+                            return True
+                        with_timeout(_write_page, FTDI_TIMEOUT)
+                    else:
+                        bus.write_byte_data(self.address, 0x00, target_page)
+                    time.sleep(0.005)
+                except:
+                    time.sleep(0.002)
+        except Exception:
+            pass
         return False
 
     def identify(self):
-        self.clear_faults()
-        time.sleep(0.02)
+        """Identify PMBus device - works with both CH341 and FTDI."""
+        try:
+            self.clear_faults()
+            time.sleep(0.02)
 
-        if self.special_id is None:
-            self.special_id = self._rw(Cmd.MFR_SPECIAL_ID)
             if self.special_id is None:
-                return False
+                # Для LTM4673 используем правильную команду 0xE7
+                # Сначала пробуем read_word_data
+                self.special_id = self._rw(0xE7)  # MFR_SPECIAL_ID
+                if self.special_id is None or self.special_id == 0xFFFF:
+                    # Если не получилось, пробуем по байтам
+                    low = self._rb(0xE7)
+                    high = self._rb(0xE8)
+                    if low is not None and high is not None:
+                        self.special_id = (high << 8) | low
+                    else:
+                        return False
 
-        regmap, ro, gl, profile_name, profile_pages = build_register_map(self.special_id)
-        self._regmap = regmap
-        self._read_only = ro
-        self._global_cmds = gl
-
-        if profile_name:
-            self.name = profile_name
-            self.num_pages = profile_pages
-        else:
-            if self.special_id == 0x0236 or (self.special_id & 0xFFF0) == 0x0230:
+            # Проверяем ID для LTM4673
+            if self.special_id == 0x4480 or (self.special_id & 0xFFF0) == 0x4480:
+                self.name = "LTM4673"
+                self.num_pages = 4
+                self.revision = "Rev A"
+            elif self.special_id == 0x0236 or (self.special_id & 0xFFF0) == 0x0230:
                 self.name = "LTM4673"
                 self.num_pages = 4
                 self.revision = "Rev A"
             else:
-                if not self.name or self.name == "Unknown":
-                    masked = self.special_id & 0xFFF0
-                    for kid, (kn, kp) in KNOWN_DEVICES.items():
-                        if masked == (kid & 0xFFF0):
-                            self.name = kn
-                            self.num_pages = kp
-                            break
-                rev = self._rw(Cmd.MFR_REVISION)
-                if rev is not None and rev != 0xFFFF:
-                    self.revision = f"Rev 0x{self.special_id & 0xF:X}"
-                else:
+                # Проверяем известные устройства
+                masked = self.special_id & 0xFFF0
+                found = False
+                for kid, (kn, kp) in KNOWN_DEVICES.items():
+                    if masked == (kid & 0xFFF0):
+                        self.name = kn
+                        self.num_pages = kp
+                        found = True
+                        break
+                if not found:
+                    self.name = "LTM4673"  # По умолчанию считаем LTM4673
+                    self.num_pages = 4
                     self.revision = "?"
 
-        for p in range(self.num_pages):
-            self.set_page(p)
-            vm = self._rb(Cmd.VOUT_MODE)
-            if vm is not None and vm != 0xFF:
-                e = vm & 0x1F
-                if e > 15: e -= 32
-                self.vout_exp[p] = e
-            else: self.vout_exp[p] = -13
+            # Читаем VOUT_MODE для каждой страницы
+            for p in range(self.num_pages):
+                self.set_page(p)
+                vm = self._rb(0x20)  # VOUT_MODE
+                if vm is not None and vm != 0xFF:
+                    e = vm & 0x1F
+                    if e > 15:
+                        e -= 32
+                    self.vout_exp[p] = e
+                else:
+                    self.vout_exp[p] = -13
 
-        cap = self._rb(Cmd.CAPABILITY)
-        self.capability = cap if cap is not None and cap != 0xFF else 0
+            # Читаем CAPABILITY
+            cap = self._rb(0x19)
+            self.capability = cap if cap is not None and cap != 0xFF else 0
 
-        self.set_page(0)
-        self.clear_faults()
-        return self.name != "Unknown"
+            self.set_page(0)
+            self.clear_faults()
+            return self.name != "Unknown"
+
+        except Exception as e:
+            print(f"[PMBus] identify exception: {e}")
+            return False
 
     def read_global_config(self):
         cfg = {}
@@ -337,10 +453,10 @@ class PMBusDevice:
 
             exp = self.vout_exp.get(page, -13)
             telemetry_cmds = {
-                0x8B: 'VOUT',  # READ_VOUT
-                0x8C: 'IOUT',  # READ_IOUT
-                0x96: 'POUT',  # READ_POUT
-                0x8D: 'TEMP1', # READ_TEMPERATURE_1
+                0x8B: 'VOUT',
+                0x8C: 'IOUT',
+                0x96: 'POUT',
+                0x8D: 'TEMP1',
             }
             for cmd, name in telemetry_cmds.items():
                 if name == 'POUT':
@@ -405,8 +521,11 @@ class PMBusDevice:
         self._rb(0x7E)
         return self._send(Cmd.CLEAR_FAULTS)
 
-    def store_user_all(self):   return self._send(Cmd.STORE_USER_ALL)
-    def restore_user_all(self): return self._send(Cmd.RESTORE_USER_ALL)
+    def store_user_all(self):
+        return self._send(Cmd.STORE_USER_ALL)
+
+    def restore_user_all(self):
+        return self._send(Cmd.RESTORE_USER_ALL)
 
     def read_full_dump(self, page=0):
         exp = self.vout_exp.get(page, -13)
@@ -415,7 +534,7 @@ class PMBusDevice:
         dump = []
         with self._lock:
             self.set_page(page)
-            time.sleep(0.01)  # 10 мс паузы перед пакетным чтением дампа памяти
+            time.sleep(0.01)
             for cmd_code in sorted(regmap.keys()):
                 if cmd_code in SKIP_REGISTERS:
                     continue
@@ -442,27 +561,9 @@ class PMBusDevice:
             return False
         with self._lock:
             self.set_page(page)
-            time.sleep(0.01)  # 10 мс паузы перед записью регистра
+            time.sleep(0.01)
             if size == 'byte':
                 return self._wb(cmd_code, int(raw_value) & 0xFF)
             elif size == 'word':
                 return self._ww(cmd_code, int(raw_value) & 0xFFFF)
         return False
-
-    def _wb(self, cmd, val):
-        bus = self._get_bus()
-        if not bus: return False
-        try:
-            bus.write_byte_data(self.address, cmd, val & 0xFF)
-            time.sleep(PMBUS_PAUSE)
-            return True
-        except: return False
-
-    def _ww(self, cmd, val):
-        bus = self._get_bus()
-        if not bus: return False
-        try:
-            bus.write_word_data(self.address, cmd, val & 0xFFFF)
-            time.sleep(PMBUS_PAUSE)
-            return True
-        except: return False
