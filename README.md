@@ -37,6 +37,7 @@
 | **0–99** | Локальная шина `/dev/i2c-N` (Linux) | `smbus2` | `pip install smbus2` |
 | **100–199** | USB-I2C адаптер CH341T/A (VID 1a86:5512) | `pyusb` | `pip install pyusb` |
 | **200–299** | Адаптеры FT232H / FT2232H / FT4232H | `pyftdi` | `pip install pyftdi` |
+| **300–399** | Адаптеры CP2112 | `hidapi` | `pip install hidapi` |
 
 ### 🛠 Подключение FT232H
 
@@ -114,9 +115,12 @@ sudo udevadm control --reload-rules
 │   ├── pmbus_device.py      # Класс PMBusDevice (чтение/запись/телеметрия)
 │   ├── bus_factory.py       # Фабрика шин (автовыбор smbus2/CH341/FTDI)
 │   ├── bus_scanner.py       # Сканирование I2C шин на наличие устройств
+│   └── dump_csv.py          # Модуль экспорта и импорта дампов в формат CSV
+├── drivers/
+│   ├── base_driver.py       # Общий интерфейс и общая инфраструктура для USB-to-I2C драйверов
 │   ├── ch341_i2c.py         # Драйвер для работы через USB-I2C адаптер CH341
 │   ├── ftdi_i2c.py          # Драйвер для работы через FTDI MPSSE I2C
-│   └── dump_csv.py          # Модуль экспорта и импорта дампов в формат CSV
+│   ├── cp2112_i2c.py        # Драйвер для работы через Silicon Labs CP2112 I2C
 ├── gui/                     # Графический интерфейс пользователя (Tkinter)
 │   ├── app.py               # Главное окно приложения
 │   ├── device_tab.py        # Вкладка конфигурации конкретного устройства
