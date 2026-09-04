@@ -3,7 +3,7 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 from core.bus_scanner import find_buses, scan_bus, bus_label
-from core.bus_factory import CH341_OFFSET, FTDI_OFFSET
+from core.bus_factory import CH341_OFFSET, FTDI_OFFSET, CP2112_OFFSET
 from core.pmbus_device import PMBusDevice
 from gui.device_tab import DeviceTab
 
@@ -11,7 +11,7 @@ from gui.device_tab import DeviceTab
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LTM PMBus Tool v4.6")
+        self.title("LTM PMBus Tool v4.7")
         self.geometry("1380x850")
         self.minsize(1100, 700)
         style = ttk.Style()
@@ -103,13 +103,14 @@ class App(tk.Tk):
         self.nb.add(w, text="  Welcome  ")
         tk.Label(
             w,
-            text=("LTM PMBus Tool v4.6\n\n"
+            text=("LTM PMBus Tool v4.7\n\n"
                   "LTM4671 / LTM4673 / LTM4675\n"
                   "LTM4676 / LTM4677 / LTM4678\n\n"
                   "Buses:\n"
                   "  Linux /dev/i2c-N  (smbus2)\n"
                   "  CH341T/A USB-I2C  (pyusb)\n"
-                  "  FT232H  USB-I2C   (pyftdi)\n\n"
+                  "  FT232H  USB-I2C   (pyftdi)\n"
+                  "  CP2112  USB-I2C   (hidapi)\n\n"
                   "Click Scan or enter address.\n"
                   "--sim for simulation."),
             font=('Segoe UI', 11),
@@ -137,7 +138,9 @@ class App(tk.Tk):
             self.devices = scan_bus(bus_num)
         except PermissionError:
             msg = f"No access to {bl}."
-            if bus_num >= FTDI_OFFSET:
+            if bus_num >= CP2112_OFFSET:
+                msg += "\n\nAdd udev rule for hidraw or use sudo."
+            elif bus_num >= FTDI_OFFSET:
                 msg += ("\n\nTry:\n"
                         "  sudo rmmod ftdi_sio usbserial\n"
                         "  sudo python main.py\n"
@@ -208,13 +211,13 @@ class App(tk.Tk):
             t.stop_all()
         # release USB adapters
         for mod, cls in [
-            ('core.ch341_i2c', 'CH341Bus'),
-            ('core.ftdi_i2c',  'FtdiBus'),
+            ('drivers.ch341_i2c',  'CH341Bus'),
+            ('drivers.ftdi_i2c',   'FTDIBus'),
+            ('drivers.cp2112_i2c', 'CP2112Bus'),
         ]:
             try:
                 m = __import__(mod, fromlist=[cls])
                 getattr(m, cls).close_all()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[App] close_all failed for {mod}.{cls}: {e}")
         self.destroy()
-
