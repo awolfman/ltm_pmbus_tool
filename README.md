@@ -1,4 +1,4 @@
-Language / Язык: [Русский](README.ru.md) | **English**
+Language / Язык: [Russian](README.ru.md) | **English**
 
 # 🚀 PMBus Device Manager & Telemetry Tool
 
