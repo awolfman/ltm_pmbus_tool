@@ -113,14 +113,14 @@ sudo udevadm control --reload-rules
 ├── core/                    # Core engine (protocol implementation & hardware drivers)
 │   ├── pmbus_constants.py   # Command sets, register mapping, and device profiles
 │   ├── pmbus_formats.py     # Data converters for L11/L16 types ↔ float types
-│   ├── pmbus_device.py      # PMBusDevice orchestration class (R/W, telemetry, tracking)
+│   ├── pmbus_device.py      # PMBusDevice main class (R/W, telemetry, tracking)
 │   ├── bus_factory.py       # Bus abstraction factory (dynamic smbus2/CH341/FTDI selection)
 │   ├── bus_scanner.py       # I2C network probing for discovering active device nodes
-│   ├── ch341_i2c.py         # Hardware driver layer tailored for CH341 USB-to-I2C adapters
-│   ├── ftdi_i2c.py          # Hardware driver layer tailored for FTDI MPSSE I2C engine engines
+│   ├── ch341_i2c.py         # Hardware driver layer made for CH341 USB-to-I2C adapters
+│   ├── ftdi_i2c.py          # Hardware driver layer made for FTDI MPSSE I2C engine engines
 │   └── dump_csv.py          # CSV import and export utility for hardware register maps
 ├── gui/                     # Graphical User Interface component layer (Tkinter)
-│   ├── app.py               # Main window orchestration and layout definition
+│   ├── app.py               # Main window and layout definition
 │   ├── device_tab.py        # Tab configuration layout for individual device targets
 │   ├── channel_frame.py     # Channel column layouts (telemetry fields, configs, and statuses)
 │   └── status_defs.py       # Bitmask mappings for STATUS_* registers used in error parsing
