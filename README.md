@@ -1,23 +1,25 @@
+Language / Язык: [Русский](README.ru.md) | **English**
+
 # 🚀 PMBus Device Manager & Telemetry Tool
 
-Универсальная утилита с графическим интерфейсом (Tkinter) для мониторинга, конфигурации и управления DC/DC преобразователями (полифазными модулями питания LTM) по протоколу PMBus/I2C. Поддерживает работу как с реальным оборудованием через различные USB-адаптеры, так и в режиме симуляции.
+A versatile graphical user interface (Tkinter) utility designed for real-time monitoring, configuration, and management of DC/DC converters (LTM polyphase power modules) using the PMBus/I2C protocol. It supports operations with physical hardware via various USB adapters as well as a standalone simulation mode.
 
 ---
 
-## ✨ Возможности
+## ✨ Features
 
-* **Телеметрия:** чтение в реальном времени параметров `VOUT`, `IOUT`, `POUT`, `VIN`, `IIN`, `PIN`, температуры, частоты и коэффициента заполнения (`duty cycle`).
-* **Конфигурация:** гибкая настройка выходного напряжения, порогов защит (`OV`/`UV`/`OC`/`OT`), таймингов запуска и рабочей частоты.
-* **Управление:** прямая отправка команд `OPERATION`, `ON_OFF_CONFIG`, а также сброс флагов ошибок через `CLEAR_FAULTS`.
-* **Мониторинг:** чтение регистров `STATUS_WORD`, `STATUS_VOUT`, `STATUS_IOUT`, `STATUS_INPUT`, `STATUS_TEMPERATURE`, `STATUS_CML` с детальной побитовой расшифровкой каждой ошибки.
-* **Работа с NVM:** энергонезависимая память устройств — сохранение и восстановление конфигурации (`Store/Restore RAM ↔ EEPROM`).
-* **Дампы конфигурации:** полное последовательное чтение или запись карты регистров, импорт и экспорт конфигурационных дампов в формате CSV.
+* **Telemetry:** Real-time reading of parameters such as `VOUT`, `IOUT`, `POUT`, `VIN`, `IIN`, `PIN`, temperature, operating frequency, and duty cycle.
+* **Configuration:** Flexible adjustments for output voltage, fault/warning thresholds (`OV`/`UV`/`OC`/`OT`), power-up sequencing/timings, and switching frequency.
+* **Control:** Direct command execution for `OPERATION`, `ON_OFF_CONFIG`, and fault clearing via `CLEAR_FAULTS`.
+* **Fault Monitoring:** Comprehensive polling and bitwise decoding of status registers, including `STATUS_WORD`, `STATUS_VOUT`, `STATUS_IOUT`, `STATUS_INPUT`, `STATUS_TEMPERATURE`, and `STATUS_CML`.
+* **NVM Management:** Non-Volatile Memory control to store and restore configuration settings between operational RAM and device EEPROM (`Store/Restore RAM ↔ EEPROM`).
+* **Configuration Dumps:** Sequential bulk reading and writing of the entire register map, featuring configuration export and import via CSV files.
 
 ---
 
-## 📋 Поддерживаемые устройства
+## 📋 Supported Devices
 
-| Модель | Каналов | VIN | VOUT | IOUT макс |
+| Model | Channels | VIN Range | VOUT Range | Max IOUT |
 |:---:|:---:|:---:|:---:|:---:|
 | **LTM4671** | 4 | 4.5–16V | 0.5–5.5V | 8A |
 | **LTM4673** | 4 | 4.5–16V | 0.5–5.5V | 8A |
@@ -28,76 +30,71 @@
 
 ---
 
-## ⚙️ Настройка интерфейсов и библиотек
+## ⚙️ Interface & Driver Configuration
 
-Приложение автоматически определяет тип подключения на основе выбранного ID шины:
+The application automatically identifies the connection type based on the specified Bus ID parameter:
 
-| Bus ID | Адаптер | Библиотека | Команда установки |
+| Bus ID | Target Adapter | Required Library | Installation Command |
 |:---:|:---|:---:|:---|
-| **0–99** | Локальная шина `/dev/i2c-N` (Linux) | `smbus2` | `pip install smbus2` |
-| **100–199** | USB-I2C адаптер CH341T/A (VID 1a86:5512) | `pyusb` | `pip install pyusb` |
-| **200–299** | Адаптеры FT232H / FT2232H / FT4232H | `pyftdi` | `pip install pyftdi` |
-| **300–399** | Адаптеры CP2112 | `hidapi` | `pip install hidapi` |
+| **0–99** | Native Linux SMBus `/dev/i2c-N` | `smbus2` | `pip install smbus2` |
+| **100–199** | CH341T/A USB-to-I2C Adapter (VID 1a86:5512) | `pyusb` | `pip install pyusb` |
+| **200–299** | FT232H / FT2232H / FT4232H ICs | `pyftdi` | `pip install pyftdi` |
 
-### 🛠 Подключение FT232H
+### 🛠 Connecting FT232H
 
-При использовании адаптера FT232H выполните подключение по следующей схеме:
+When working with an FT232H adapter, implement the hardware wiring according to the schematic below:
 
 ```text
-FT232H            LTM467x
-  AD0  (SCL) ────── SCL
-       
-  AD1 ───┐
-         ├── (SDA) ── SDA
-  AD2 ───┘
-       
-  GND ───────────── GND
+FT232H          LTM467x
+ AD0 (SCL) ───── SCL
+ AD1 (SDA) ───── SDA
+ GND ─────────── GND
 
-[Важно: Необходимы pull-up резисторы 2.2кОм к линии 3.3V на SCL и SDA]
+[Important: External 2.2kΩ pull-up resistors to a 3.3V rail are required on both SCL and SDA lines]
 ```
 
-Для работы платы FT232H в Linux необходимо выгрузить стандартный драйвер ядра виртуального COM-порта, иначе `pyftdi` не сможет получить эксклюзивный доступ к MPSSE-движку:
+To operate the FT232H board under Linux environments, the default kernel Virtual COM Port driver must be unloaded. Otherwise, `pyftdi` will fail to claim exclusive access to the MPSSE engine:
 ```bash
 sudo rmmod ftdi_sio usbserial
 ```
 
 ---
 
-## 📊 Форматы данных PMBus
+## 📊 PMBus Data Formatting
 
-Утилита под капотом автоматически обрабатывает низкоуровневые форматы данных протокола PMBus:
-* **L11 (Linear_5s_11s):** 5-битная экспонента + 11-битная мантисса (используется для токов, мощностей, температур и частот).
-* **L16 (Linear_16u):** 16-битное беззнаковое целое число, масштабируемое по формуле 2^VOUT_MODE (используется для высокоточного измерения напряжений).
-* **BYTE / RAW:** сырые шестнадцатеричные данные для битовых масок статуса и регистров команд.
+Under the hood, the utility manages low-level data type conversions natively defined by the PMBus specifications:
+* **L11 (Linear_5s_11s):** Consists of a 5-bit signed exponent combined with an 11-bit signed mantissa. This format is typically used for currents, power ratings, temperatures, and frequencies.
+* **L16 (Linear_16u):** An unsigned 16-bit integer parsed and scaled according to the device's `VOUT_MODE` exponent. This format handles high-precision voltage measurements.
+* **BYTE / RAW:** Unformatted hexadecimal data blocks applied directly to status bitmasks and structural command registers.
 
 ---
 
-## 📦 Зависимости и требования
+## 📦 System Dependencies & Requirements
 
-Перед запуском убедитесь, что в вашей системе установлены:
+Ensure that your target execution environment satisfies the following baseline prerequisites:
 * **Python 3.13+**
-* Компонент **tkinter** (в Linux может потребоваться установка через пакетный менеджер системы: `sudo apt install python3-tk`).
-* Системная библиотека **libusb** (необходима для работы `pyusb` с CH341).
+* The **tkinter** package component (on Linux systems, this may necessitate a dedicated installation step: `sudo apt install python3-tk`).
+* The system-level **libusb** library binaries (mandated for `pyusb` interactions with the CH341 chip architecture).
 
 ---
 
-## 🚀 Быстрый старт
+## 🚀 Quick Start
 
-### Развертывание и запуск
+### Deployment & Execution
 
-Для ознакомления и тестирования интерфейса в режиме симуляции (без подключения реального железа):
+To explore the graphical components and evaluate layout features in a mock environment without physical hardware connected:
 ```bash
 python main.py --sim
 ```
 
-Для работы с реальной шиной I2C или USB-адаптерами в Linux (требуются права суперпользователя):
+To bind the utility to an active local I2C bus or attached USB host adapters under Linux (requires administrative privileges):
 ```bash
 sudo python main.py
 ```
 
-### Настройка прав доступа для CH341 (опционально)
+### Configuring User Permissions for CH341 (Optional)
 
-Чтобы каждый раз не запускать утилиту через `sudo` при использовании адаптера **CH341**, добавьте правило `udev`, разрешающее доступ текущему пользователю:
+To circumvent the necessity of invoking `sudo` privileges for every session when utilizing the **CH341** interface, deploy a custom `udev` rule targeting your current user group:
 
 ```bash
 echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="5512", MODE="0666"' | \
@@ -108,48 +105,49 @@ sudo udevadm control --reload-rules
 
 ---
 
-## 📂 Структура проекта
+## 📂 Project Directory Structure
 
 ```text
 .
-├── main.py                  # Точка входа в приложение
-├── core/                    # Ядро системы (логика протокола и драйверы)
-│   ├── pmbus_constants.py   # Коды команд, карта регистров, ID устройств
-│   ├── pmbus_formats.py     # Конвертация форматов данных L11/L16 ↔ float
-│   ├── pmbus_device.py      # Класс PMBusDevice (чтение/запись/телеметрия)
-│   ├── bus_factory.py       # Фабрика шин (автовыбор smbus2/CH341/FTDI)
-│   ├── bus_scanner.py       # Сканирование I2C шин на наличие устройств
-│   └── dump_csv.py          # Модуль экспорта и импорта дампов в формат CSV
-├── drivers/
-│   ├── base_driver.py       # Общий интерфейс и общая инфраструктура для USB-to-I2C драйверов
-│   ├── ch341_i2c.py         # Драйвер для работы через USB-I2C адаптер CH341
-│   ├── ftdi_i2c.py          # Драйвер для работы через FTDI MPSSE I2C
-│   ├── cp2112_i2c.py        # Драйвер для работы через Silicon Labs CP2112 I2C
-├── gui/                     # Графический интерфейс пользователя (Tkinter)
-│   ├── app.py               # Главное окно приложения
-│   ├── device_tab.py        # Вкладка конфигурации конкретного устройства
-│   ├── channel_frame.py     # Колонка канала (телеметрия, конфиг, статус)
-│   └── status_defs.py       # Битовые маски STATUS_* регистров для разбора ошибок
-└── sim/                     # Модули для отладки без железа
-    └── sim_bus.py           # Эмуляция I2C шины для демонстрационного режима (--sim)
+├── main.py                  # Main application entry point
+├── core/                    # Core engine (protocol implementation & hardware drivers)
+│   ├── pmbus_constants.py   # Command sets, register mapping, and device profiles
+│   ├── pmbus_formats.py     # Data converters for L11/L16 types ↔ float types
+│   ├── pmbus_device.py      # PMBusDevice orchestration class (R/W, telemetry, tracking)
+│   ├── bus_factory.py       # Bus abstraction factory (dynamic smbus2/CH341/FTDI selection)
+│   ├── bus_scanner.py       # I2C network probing for discovering active device nodes
+│   ├── ch341_i2c.py         # Hardware driver layer tailored for CH341 USB-to-I2C adapters
+│   ├── ftdi_i2c.py          # Hardware driver layer tailored for FTDI MPSSE I2C engine engines
+│   └── dump_csv.py          # CSV import and export utility for hardware register maps
+├── gui/                     # Graphical User Interface component layer (Tkinter)
+│   ├── app.py               # Main window orchestration and layout definition
+│   ├── device_tab.py        # Tab configuration layout for individual device targets
+│   ├── channel_frame.py     # Channel column layouts (telemetry fields, configs, and statuses)
+│   └── status_defs.py       # Bitmask mappings for STATUS_* registers used in error parsing
+└── sim/                     # Mock environments for hardware-free debugging
+    └── sim_bus.py           # Mock I2C bus environment for demonstration modes (--sim)
 ```
-## 👥 Авторы
 
-* **awolfman** — *Архитектура системы, постановка задач, общая координация и тестирование в железе* 
+## 👥 Authors & AI Contributors
 
-* **Claude 4.6** — *Написание основного программного кода (ядро PMBus, обработка протоколов, интерфейс Tkinter)*
-* **Gemini** — *Тестирование, рефакторинг и доведение кода до стабильного рабочего состояния*
-* **DeepSeek** — *Отладка драйверов интерфейсов (USB-I2C), оптимизация обработки ошибок и тестирование под Linux*
+* **awolfman** — *System Architecture, Task Formulation, General Coordination, and Hardware Testing*
 
-## 🗺️ План разработки / Что нужно доработать (To-Do)
+* **Claude 4.6** — *Core Application Codebase Generation (PMBus Stack, Protocol Parsing, Tkinter Layout Assembly)*
+* **Gemini** — *System Testing, Code Refactoring, and Stabilization Engineering*
+* **DeepSeek** — *Interface Driver Debugging (USB-to-I2C Hardware Layer), Error Handling Optimization, and Linux Platform Profiling*
 
-В ближайших обновлениях планируется реализовать следующие улучшения и исправления:
+## 🗺️ Roadmap / Future Enhancements (To-Do)
 
-- [ ] **⚙️ Интерфейс и графическая оболочка (GUI)**
-  - Доработать поведение кнопки **Refresh** (оптимизировать повторное сканирование шины и обновление данных на лету без перезапуска приложения).
-  - Модернизировать вкладки **Config** (улучшить группировку параметров конфигурации PMBus и сделать более удобное редактирование полей).
+The following development tasks and feature optimizations are scheduled for upcoming release iterations:
+
+- [ ] **⚙️ UI & Graphical User Interface (GUI) Refinement**
+  - Optimize the **Refresh** routine to streamline on-the-fly bus re-scans and data updates without requiring application restarts.
+  - Redesign the **Config** tabs to improve PMBus parameter categorizations and establish field editing flows.
+
+- [ ] **🐛 Bug Fixes & Telemetry Enhancements**
+  - Correct the reading and layout decoration logic assigned to manufacturer-specific status tracking (**STATUS_MFR**).
+  - Resolve parsing failures and display behavior errors tied to communication integrity flags (**STATUS_CML**).
 
 - [ ] **🐛 Исправление ошибок и телеметрия**
   - Исправить логику чтения и декорирования регистров специфического статуса производителей (**STATUS_MFR**).
   - Починить корректное отображение и парсинг битов ошибок связи в регистре статуса (**STATUS_CML**).
-
