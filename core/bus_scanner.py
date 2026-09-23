@@ -1,21 +1,20 @@
 # core/bus_scanner.py
-"""I2C bus scanning -- /dev/i2c + CH341 + FTDI."""
+"""I2C bus scanning -- /dev/i2c + CH341 + FTDI + CP2112."""
 
 import os
 import sys
 import random
-from .bus_factory import create_bus, CH341_OFFSET, FTDI_OFFSET
-from .pmbus_device import PMBusDevice
-import signal
 import time
 
-# Глобальные адреса, которые не являются отдельными устройствами
+from .bus_factory import create_bus, CH341_OFFSET, FTDI_OFFSET, CP2112_OFFSET
+from .pmbus_device import PMBusDevice
+
 GLOBAL_ADDRESSES = {0x5A, 0x5B, 0x7C}
 
 
-# ---- КЛАСС ДЛЯ ДЕМО-РЕЖИМА (с динамическими данными) ----
 class SimDevice:
     """Фиктивное устройство для демо-режима с динамической телеметрией."""
+
     def __init__(self):
         self.address = 0x5C
         self.addr = 0x5C
@@ -81,12 +80,7 @@ class SimDevice:
         temp_ic = 42.0 + random.gauss(0, 0.5)
         iin = 1.5 + random.gauss(0, 0.05)
         pin = vin * iin
-        return {
-            'VIN': vin,
-            'TEMP_IC': temp_ic,
-            'IIN': iin,
-            'PIN': pin,
-        }
+        return {'VIN': vin, 'TEMP_IC': temp_ic, 'IIN': iin, 'PIN': pin}
 
     def read_channel_telemetry(self, page=0):
         base_voltage = 1.0 + page * 0.1
@@ -136,7 +130,6 @@ class SimDevice:
         return True
 
 
-# ---- ОСНОВНЫЕ ФУНКЦИИ ----
 def is_sim():
     return '--sim' in sys.argv or '--demo' in sys.argv
 
@@ -150,19 +143,17 @@ def find_buses():
     # ---- Linux /dev/i2c-N (0-99) ----
     for i in range(20):
         if os.path.exists(f"/dev/i2c-{i}"):
-            buses.append(i)  # 0-19
+            buses.append(i)
 
     # ---- CH341 USB (100-199) ----
     try:
-        from .ch341_i2c import find_ch341_devices, CH341_PID_I2C
+        from drivers.ch341_i2c import find_ch341_devices, CH341_PID_I2C
         ch341_devices = find_ch341_devices()
-        i2c_count = 0
-        for dev in ch341_devices:
-            if hasattr(dev, 'idProduct') and dev.idProduct == CH341_PID_I2C:
-                bus_num = CH341_OFFSET + i2c_count  # 100 + i
+        for i, dev in enumerate(ch341_devices):
+            if getattr(dev, 'idProduct', None) == CH341_PID_I2C:
+                bus_num = CH341_OFFSET + i
                 if bus_num not in buses:
                     buses.append(bus_num)
-                    i2c_count += 1
     except ImportError:
         pass
     except Exception as e:
@@ -170,17 +161,32 @@ def find_buses():
 
     # ---- FTDI USB (200-299) ----
     try:
-        from .ftdi_i2c import find_ftdi_devices
+        from drivers.ftdi_i2c import find_ftdi_devices
         ftdi_devices = find_ftdi_devices()
         for idx in range(len(ftdi_devices)):
-            bus_num = FTDI_OFFSET + idx  # 200 + i
+            bus_num = FTDI_OFFSET + idx
             if bus_num not in buses:
                 buses.append(bus_num)
     except ImportError:
         pass
     except Exception as e:
         print(f"[scan] FTDI error: {e}")
+
+    # ---- CP2112 USB (300-399) ----
+    try:
+        from drivers.cp2112_i2c import find_cp2112_devices
+        cp2112_devices = find_cp2112_devices()
+        for idx in range(len(cp2112_devices)):
+            bus_num = CP2112_OFFSET + idx
+            if bus_num not in buses:
+                buses.append(bus_num)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[scan] CP2112 error: {e}")
+
     return sorted(buses)
+
 
 def bus_label(bus_num):
     if is_sim():
@@ -190,20 +196,20 @@ def bus_label(bus_num):
     if CH341_OFFSET <= bus_num < FTDI_OFFSET:
         idx = bus_num - CH341_OFFSET
         try:
-            from .ch341_i2c import find_ch341_devices
+            from drivers.ch341_i2c import find_ch341_devices, ch341_location
             devs = find_ch341_devices()
             if idx < len(devs):
                 dev = devs[idx]
-                return f"CH341 #{idx} (bus={dev.bus}, addr={dev.address})"
-        except:
+                return f"CH341 #{idx} (port {ch341_location(dev)})"
+        except Exception:
             pass
         return f"CH341 #{idx}"
 
     # FTDI buses (200-299)
-    if bus_num >= FTDI_OFFSET:
+    if FTDI_OFFSET <= bus_num < CP2112_OFFSET:
         idx = bus_num - FTDI_OFFSET
         try:
-            from .ftdi_i2c import find_ftdi_devices, I2C_PIDS
+            from drivers.ftdi_i2c import find_ftdi_devices, I2C_PIDS
             devs = find_ftdi_devices()
             if idx < len(devs):
                 d = devs[idx]
@@ -214,8 +220,23 @@ def bus_label(bus_num):
             pass
         return f"FTDI #{idx}"
 
+    # CP2112 buses (300-399)
+    if bus_num >= CP2112_OFFSET:
+        idx = bus_num - CP2112_OFFSET
+        try:
+            from drivers.cp2112_i2c import find_cp2112_devices
+            devs = find_cp2112_devices()
+            if idx < len(devs):
+                d = devs[idx]
+                sn = d.get('serial_number') or ''
+                return f"CP2112 #{idx} {sn}".strip()
+        except Exception:
+            pass
+        return f"CP2112 #{idx}"
+
     # System I2C buses (0-99)
     return f"/dev/i2c-{bus_num}"
+
 
 def scan_bus(bus_num):
     if is_sim():
@@ -233,16 +254,12 @@ def scan_bus(bus_num):
         for addr in scan_addrs:
             if addr in GLOBAL_ADDRESSES:
                 continue
-
             try:
-                # Небольшая пауза перед каждым адресом, чтобы шина и чипы «отдыхали»
                 time.sleep(0.005)
-
                 res = bus.read_byte(addr)
                 if res == 0xFF:
                     continue
 
-                # Если адрес ответил (res != 0xFF), проверяем устройство
                 dev = PMBusDevice(bus_num, addr)
                 if dev.identify():
                     devices.append(dev)
@@ -259,6 +276,7 @@ def scan_bus(bus_num):
 
     print(f"[scan_bus] found {len(devices)} device(s)")
     return devices
+
 
 if __name__ == "__main__":
     import sys
