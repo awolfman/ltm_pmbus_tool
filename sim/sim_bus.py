@@ -1,35 +1,56 @@
+# sim/sim_bus.py
 """Simulated I2C bus for testing without hardware.
 
 Page-aware: paged registers stored as (page, cmd) keys,
 global registers as plain cmd keys.
 """
 import random
+import threading
+
+from core.drivers.base_driver import I2CDriverBase
 from core.pmbus_constants import Cmd, REGISTER_MAP, build_register_map
 from core.pmbus_formats import (float_to_l11, float_to_l16,
                                  l11_to_float, l16_to_float)
 
 
-class SimBus:
+class SimBus(I2CDriverBase):
     """Drop-in replacement for smbus2.SMBus."""
-    _shared_wr = {}
 
-    def __init__(self, bus_num=1):
-        self._bus_num = bus_num
+    _shared = {}
+    _global_lock = threading.Lock()
+
+    def _open(self, dev_index):
         # Добавляем адрес 0x5C для LTM4673 (инженерный ID 0x0236)
-        self._devs = {
+        devs = {
             0x40: 0x4770,  # LTM4677
             0x42: 0x4480,  # LTM4673
             0x5C: 0x0236,  # LTM4673 engineering
         }
-        self._dev_regmaps = {}
-        for addr, sid in self._devs.items():
+        regmaps = {}
+        for addr, sid in devs.items():
             rm, _, _, _, _ = build_register_map(sid)
-            self._dev_regmaps[addr] = rm
-        if bus_num not in SimBus._shared_wr:
-            SimBus._shared_wr[bus_num] = {
-                a: {'_page': 0} for a in self._devs
-            }
-        self._wr = SimBus._shared_wr[bus_num]
+            regmaps[addr] = rm
+
+        self._shared[dev_index] = {
+            'devs': devs,
+            'regmaps': regmaps,
+            'wr': {a: {'_page': 0} for a in devs},
+        }
+        print(f"[SIM] bus #{dev_index} initialized")
+
+    # ---- доступ к общему состоянию через self._shared ----
+
+    @property
+    def _devs(self):
+        return self._get_entry()['devs']
+
+    @property
+    def _dev_regmaps(self):
+        return self._get_entry()['regmaps']
+
+    @property
+    def _wr(self):
+        return self._get_entry()['wr']
 
     def reset_bus(self):
         """Сброс шины (эмуляция)."""
@@ -198,12 +219,7 @@ class SimBus:
         key = self._key(addr, cmd)
         d[key] = val
 
-    def write_byte(self, addr, cmd):
+    def write_byte(self, addr, val):
         if addr not in self._devs:
             raise OSError(f"[sim] no device at 0x{addr:02X}")
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        pass
