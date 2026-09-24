@@ -1,5 +1,4 @@
 # gui/channel_frame.py
-# gui/channel_frame.py
 
 """ChannelColumn -- per-channel: telemetry + config tabs + status tree.
 Registers grouped into tabs; Output and Control keep existing layout,
