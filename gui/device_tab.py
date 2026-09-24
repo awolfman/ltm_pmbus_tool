@@ -7,7 +7,14 @@ from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 from core.dump_csv import dump_to_csv_string, csv_string_to_dump
 from gui.channel_frame import ChannelColumn
-from gui.status_defs import STATUS_INPUT_BITS, STATUS_CML_BITS
+from gui.status_defs import (
+    configure_status_tree,
+    reset_status_tree,
+    render_standard_status,
+    render_mfr_common,
+    render_mfr_pads,
+    set_status_indicator,
+)
 
 
 class DeviceTab(ttk.Frame):
@@ -32,7 +39,7 @@ class DeviceTab(ttk.Frame):
         self._build_buttons()
         self.do_read_all()
 
-    # ============================================================ top bar
+    # top bar
     def _build_top(self):
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky='ew', padx=4, pady=(3, 0))
@@ -51,8 +58,12 @@ class DeviceTab(ttk.Frame):
                          if self.device.special_id else "N/A"),
             ("Revision:", self.device.revision),
             ("Pages:",   n_ch),
-            ("Capability:", f"0x{self.device.capability:02X}"
-                            if hasattr(self.device, 'capability') else "N/A"),
+            (
+                "Capability:",
+                f"0x{self.device.capability:02X}"
+                if getattr(self.device, 'capability', None) is not None
+                else "N/A"
+            ),
         ]):
             ttk.Label(info, text=lb,
                       font=('Segoe UI', 8, 'bold')).grid(
@@ -133,24 +144,48 @@ class DeviceTab(ttk.Frame):
         self.global_status_ind.pack(fill='x', padx=2, pady=(2, 1))
 
         gtf = ttk.Frame(gs)
-        gtf.pack(fill='both', expand=True, padx=2, pady=(1, 2))
+        gtf.pack(
+            fill="both",
+            expand=True,
+            padx=2,
+            pady=(1, 2),
+        )
+        gtf.rowconfigure(0, weight=1)
+        gtf.columnconfigure(0, weight=1)
 
         self.global_tree = ttk.Treeview(
-            gtf, columns=('val', 'hex'), height=5)
-        self.global_tree.heading('#0', text='Register / Bit',
-                                  anchor='w')
-        self.global_tree.heading('val', text='St')
-        self.global_tree.heading('hex', text='Hex')
-        self.global_tree.column('#0', width=180, minwidth=120)
-        self.global_tree.column('val', width=28,
-                                anchor='center', minwidth=28)
-        self.global_tree.column('hex', width=52,
-                                anchor='center', minwidth=42)
-        gsb = ttk.Scrollbar(gtf, orient='vertical',
-                             command=self.global_tree.yview)
-        self.global_tree.configure(yscrollcommand=gsb.set)
-        self.global_tree.pack(side='left', fill='both', expand=True)
-        gsb.pack(side='right', fill='y')
+            gtf,
+            columns=("val", "hex"),
+            height=8,
+        )
+        configure_status_tree(
+            self.global_tree, global_view=True
+        )
+
+        vertical = ttk.Scrollbar(
+            gtf,
+            orient="vertical",
+            command=self.global_tree.yview,
+        )
+        horizontal = ttk.Scrollbar(
+            gtf,
+            orient="horizontal",
+            command=self.global_tree.xview,
+        )
+        self.global_tree.configure(
+            yscrollcommand=vertical.set,
+            xscrollcommand=horizontal.set,
+        )
+
+        self.global_tree.grid(
+            row=0, column=0, sticky="nsew"
+        )
+        vertical.grid(
+            row=0, column=1, sticky="ns"
+        )
+        horizontal.grid(
+            row=1, column=0, sticky="ew"
+        )
 
         for tag in ('fault', 'warn', 'ok'):
             self.global_tree.tag_configure(tag, foreground={
@@ -227,38 +262,55 @@ class DeviceTab(ttk.Frame):
 
     def do_read_all(self):
         try:
-            self.global_cfg_data = self.device.read_global_config()
-            for key, sv in self.global_cfg_vars.items():
-                d = self.global_cfg_data.get(key)
-                if d and d['value'] is not None:
-                    sv.set(f"{d['value']:.4f}")
+            self.global_cfg_data = (
+                self.device.read_global_config()
+            )
+
+            for key, variable in self.global_cfg_vars.items():
+                item = self.global_cfg_data.get(key)
+                if item and item["value"] is not None:
+                    variable.set(f"{item['value']:.4f}")
+                elif item is None:
+                    variable.set("N/S")
                 else:
-                    sv.set("ERR")
+                    variable.set("ERR")
 
-            gt = self.device.read_global_telemetry()
-            for key in ('VIN', 'IIN', 'PIN', 'TEMP_IC'):
-                v = gt.get(key)
-                lbl = self.global_telem_lbl.get(key)
-                if lbl:
-                    lbl.configure(text=f"{v:.3f}" if v is not None else "N/A")
+            global_telemetry = (
+                self.device.read_global_telemetry()
+            )
+            for key in ("VIN", "IIN", "PIN", "TEMP_IC"):
+                value = global_telemetry.get(key)
+                label = self.global_telem_lbl.get(key)
+                if label is not None:
+                    label.configure(
+                        text=(
+                            f"{value:.3f}"
+                            if value is not None
+                            else "N/A"
+                        )
+                    )
 
-            for ch in self.channels:
-                cfg = self.device.read_channel_config(ch.page)
-                ch.update_config(cfg)
+            for channel in self.channels:
+                config = self.device.read_channel_config(
+                    channel.page
+                )
+                channel.update_config(config)
 
-                ct = self.device.read_channel_telemetry(ch.page)
-                ch.update_telemetry(ct)
+                telemetry = (
+                    self.device.read_channel_telemetry(
+                        channel.page
+                    )
+                )
+                channel.update_telemetry(telemetry)
 
-                cs = self.device.read_channel_status(ch.page)
-                ch.update_status(cs)
+                channel.read_all_reg_groups()
 
-            gs = self.device.read_global_status()
-            self._update_global_status(gs)
-
-            for ch in self.channels:
-                ch.read_all_reg_groups()
-        except Exception as e:
-            messagebox.showerror("Read error", str(e))
+        except Exception as exc:
+            messagebox.showerror(
+                "Read error", str(exc)
+            )
+        finally:
+            self._refresh_status()
 
     def do_write_all(self):
         errs = []
@@ -343,72 +395,76 @@ class DeviceTab(ttk.Frame):
             self.after(500, self._mon_loop)
 
     def _refresh_status(self):
+        for channel in self.channels:
+            try:
+                status = self.device.read_channel_status(
+                    channel.page
+                )
+            except Exception:
+                status = {}
+
+            channel.update_status(status)
+
         try:
-            gs = self.device.read_global_status()
-            self._update_global_status(gs)
-            for ch in self.channels:
-                cs = self.device.read_channel_status(ch.page)
-                ch.update_status(cs)
+            global_status = self.device.read_global_status()
         except Exception:
-            pass
+            global_status = {
+                "STATUS_INPUT": None,
+                "STATUS_CML": None,
+            }
 
-    def _update_global_status(self, gs):
+            regmap = getattr(self.device, "_regmap", {})
+            for name, cmd in (
+                ("MFR_PADS", 0xE5),
+                ("MFR_COMMON", 0xEF),
+            ):
+                info = regmap.get(cmd)
+                if info is not None and not info[3]:
+                    global_status[name] = None
+
+        self._update_global_status(global_status)
+
+    def _update_global_status(self, status_data):
         tree = self.global_tree
-        for i in tree.get_children():
-            tree.delete(i)
+        configure_status_tree(tree, global_view=True)
+        expanded = reset_status_tree(tree)
+        levels = []
 
-        any_fault = False
-        any_warn = False
+        for name in ("STATUS_INPUT", "STATUS_CML"):
+            levels.append(
+                render_standard_status(
+                    tree,
+                    expanded,
+                    self.device,
+                    name,
+                    status_data.get(name),
+                    8,
+                )
+            )
 
-        # ---- STATUS_INPUT ----
-        si = gs.get('STATUS_INPUT')
-        if si is not None:
-            tg = 'fault' if si else 'ok'
-            rid = tree.insert(
-                '', 'end', text='STATUS_INPUT',
-                values=('F' if si else 'OK', f'0x{si:02X}'),
-                tags=(tg,), open=False)
-            for b in range(7, -1, -1):
-                bv = (si >> b) & 1
-                d = STATUS_INPUT_BITS.get(b, f"b{b}")
-                if bv and b >= 4:
-                    bt = 'fault'; any_fault = True
-                elif bv:
-                    bt = 'warn'; any_warn = True
-                else:
-                    bt = 'ok'
-                tree.insert(rid, 'end',
-                            text=f"  b{b}: {d}",
-                            values=(bv, ''), tags=(bt,))
+        if "MFR_PADS" in status_data:
+            levels.append(
+                render_mfr_pads(
+                    tree,
+                    expanded,
+                    self.device,
+                    status_data["MFR_PADS"],
+                )
+            )
 
-        # ---- STATUS_CML ----
-        sc = gs.get('STATUS_CML')
-        if sc is not None:
-            tg = 'fault' if sc else 'ok'
-            rid = tree.insert(
-                '', 'end', text='STATUS_CML',
-                values=('F' if sc else 'OK', f'0x{sc:02X}'),
-                tags=(tg,), open=False)
-            for b in range(7, -1, -1):
-                bv = (sc >> b) & 1
-                d = STATUS_CML_BITS.get(b, f"b{b}")
-                if bv:
-                    bt = 'fault'; any_fault = True
-                else:
-                    bt = 'ok'
-                tree.insert(rid, 'end',
-                            text=f"  b{b}: {d}",
-                            values=(bv, ''), tags=(bt,))
+        if "MFR_COMMON" in status_data:
+            levels.append(
+                render_mfr_common(
+                    tree,
+                    expanded,
+                    self.device,
+                    status_data["MFR_COMMON"],
+                )
+            )
 
-        if any_fault:
-            self.global_status_ind.configure(
-                text="FAULT", fg='#FF4444')
-        elif any_warn:
-            self.global_status_ind.configure(
-                text="WARNING", fg='#FFD700')
-        else:
-            self.global_status_ind.configure(
-                text="OK", fg='#00FF00')
+        set_status_indicator(
+            self.global_status_ind, levels
+        )
 
     # dump
     def _dump_page(self):
@@ -511,3 +567,5 @@ class DeviceTab(ttk.Frame):
     # cleanup
     def stop_all(self):
         self.monitoring = False
+
+
