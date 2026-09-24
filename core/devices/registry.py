@@ -23,9 +23,45 @@ def get_device_profile(special_id):
                 info['name'],
                 info['num_pages'],
                 {
-                    'register_overrides': getattr(mod, 'REGISTER_OVERRIDES', {}),
-                    'read_only_extra': getattr(mod, 'READ_ONLY_EXTRA', set()),
-                    'global_cmds_extra': getattr(mod, 'GLOBAL_CMDS_EXTRA', set()),
+                    'register_overrides': getattr(
+                        mod, 'REGISTER_OVERRIDES', {}
+                    ),
+                    'read_only_extra': getattr(
+                        mod, 'READ_ONLY_EXTRA', set()
+                    ),
+                    'global_cmds_extra': getattr(
+                        mod, 'GLOBAL_CMDS_EXTRA', set()
+                    ),
+                    'send_commands': getattr(
+                        mod, 'SEND_COMMANDS', {}
+                    ),
+                    'special_protocol_commands': getattr(
+                        mod, 'SPECIAL_PROTOCOL_COMMANDS', {}
+                    ),
+                    'special_access_extra': getattr(
+                        mod, 'SPECIAL_ACCESS_EXTRA', set()
+                    ),
+                    'no_generic_write_extra': getattr(
+                        mod, 'NO_GENERIC_WRITE_EXTRA', set()
+                    ),
+                    'write_one_to_clear': getattr(
+                        mod, 'WRITE_ONE_TO_CLEAR', set()
+                    ),
+                    'custom_formats': getattr(
+                        mod, 'CUSTOM_FORMATS', {}
+                    ),
+                    'block_lengths': getattr(
+                        mod, 'BLOCK_LENGTHS', {}
+                    ),
+                    'block_allowed_lengths': getattr(
+                        mod, 'BLOCK_ALLOWED_LENGTHS', {}
+                    ),
+                    'register_units': getattr(
+                        mod, 'REGISTER_UNITS', {}
+                    ),
+                    'vout_exponent': getattr(
+                        mod, 'VOUT_EXPONENT', None
+                    ),
                 },
             )
     return None, 1, {}
