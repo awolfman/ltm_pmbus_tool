@@ -1,61 +1,62 @@
 # core/bus_factory.py
-"""
-Bus factory - supports CH341, FTDI and CP2112 adapters.
-"""
+"""Cached factory for USB-to-I2C adapters."""
 
+import logging
 import threading
 
-from .drivers import (
-    CH341Bus,
-    FTDIBus, HAS_PYFTDI,
-    CP2112Bus,
-)
+from .drivers import CH341Bus, FTDIBus, HAS_PYFTDI, CP2112Bus
 
-# Offsets for bus numbering (используются в GUI)
-# /dev/i2c-N: 0-99
-CH341_OFFSET = 100    # CH341: 100-199
-FTDI_OFFSET = 200     # FTDI: 200-299
-CP2112_OFFSET = 300   # CP2112: 300-399
 
-# Глобальный кэш для хранения открытых адаптеров
+logger = logging.getLogger(__name__)
+
+CH341_OFFSET = 100
+FTDI_OFFSET = 200
+CP2112_OFFSET = 300
+
 _BUS_CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
 
 def create_bus(bus_num):
-    print(f"[DEBUG] create_bus({bus_num}) called")
-    global _BUS_CACHE
+    if (
+        isinstance(bus_num, bool)
+        or not isinstance(bus_num, int)
+        or bus_num < 0
+    ):
+        raise ValueError(f"Invalid bus number: {bus_num!r}")
 
     with _CACHE_LOCK:
+        cached = _BUS_CACHE.get(bus_num)
+        if cached is not None and not getattr(
+            cached, "_closed", False
+        ):
+            return cached
+
         if CH341_OFFSET <= bus_num < FTDI_OFFSET:
-            # CH341 bus
-            ch341_index = bus_num - CH341_OFFSET
-            if bus_num not in _BUS_CACHE:
-                _BUS_CACHE[bus_num] = CH341Bus(ch341_index)
-            print(f"[DEBUG] create_bus({bus_num}) returning {_BUS_CACHE[bus_num]}")
-            return _BUS_CACHE[bus_num]
+            bus = CH341Bus(bus_num - CH341_OFFSET)
 
         elif FTDI_OFFSET <= bus_num < CP2112_OFFSET:
-            # FTDI bus
             if not HAS_PYFTDI:
-                raise ImportError("pyftdi not installed. Please install: pip install pyftdi")
+                raise ImportError(
+                    "pyftdi is required for FTDI adapters"
+                )
+            bus = FTDIBus(bus_num - FTDI_OFFSET)
 
-            ftdi_index = bus_num - FTDI_OFFSET
-            if bus_num not in _BUS_CACHE:
-                _BUS_CACHE[bus_num] = FTDIBus(ftdi_index)
-            return _BUS_CACHE[bus_num]
+        elif CP2112_OFFSET <= bus_num < 400:
+            bus = CP2112Bus(bus_num - CP2112_OFFSET)
 
-        elif bus_num >= CP2112_OFFSET:
-            # CP2112 bus
-            cp2112_index = bus_num - CP2112_OFFSET
-            if bus_num not in _BUS_CACHE:
-                _BUS_CACHE[bus_num] = CP2112Bus(cp2112_index)
-            return _BUS_CACHE[bus_num]
+        elif 0 <= bus_num < CH341_OFFSET:
+            raise ValueError(
+                "System I2C buses are not implemented "
+                "in this factory"
+            )
 
         else:
-            # /dev/i2c-N bus (0-99)
-            # Здесь можно добавить поддержку системных шин если нужно
-            raise ValueError(f"Bus number {bus_num} is reserved for system I2C buses (0-99)")
+            raise ValueError(f"Unsupported bus number: {bus_num}")
+
+        _BUS_CACHE[bus_num] = bus
+        logger.debug("Opened bus %s", bus_num)
+        return bus
 
 
 def create_bus_from_index(bus_num):
@@ -63,29 +64,19 @@ def create_bus_from_index(bus_num):
 
 
 def close_all_buses():
-    """Close all open bus connections."""
-    global _BUS_CACHE
-
     with _CACHE_LOCK:
-        # Close FTDI buses
-        try:
-            FTDIBus.close_all()
-        except Exception as e:
-            print(f"[BusFactory] Error closing FTDI buses: {e}")
-
-        # Close CP2112 buses
-        try:
-            CP2112Bus.close_all()
-        except Exception as e:
-            print(f"[BusFactory] Error closing CP2112 buses: {e}")
-
-        # Close CH341 (и любые прочие) buses, у которых нет своего close_all
-        for bus in _BUS_CACHE.values():
+        for driver_class in (CH341Bus, FTDIBus, CP2112Bus):
             try:
-                if hasattr(bus, 'close'):
-                    bus.close()
-            except Exception as e:
-                print(f"[BusFactory] Error closing bus: {e}")
+                driver_class.close_all()
+            except Exception:
+                logger.warning(
+                    "Cannot close %s",
+                    driver_class.__name__,
+                    exc_info=True,
+                )
+
+        for bus in _BUS_CACHE.values():
+            if hasattr(bus, "_closed"):
+                bus._closed = True
 
         _BUS_CACHE.clear()
-        print("[BusFactory] All buses closed")
