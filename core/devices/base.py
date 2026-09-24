@@ -1,12 +1,12 @@
-"""Base PMBus register map shared across all LTM467x devices.
+"""Common register transport descriptors for LTM4673/4677/4678.
 
-Registers 0x00-0xBF are standard PMBus or common to the family.
-Device-specific modules override the 0xD0+ MFR range.
+Tuple fields:
+    name, size, format, is_paged
+
+Shared descriptors do not imply identical bit semantics,
+allowed values, defaults or side effects.
 """
 
-# (name, size, format, is_paged)
-# size: 'byte', 'word', 'block'
-# format: 'BYTE', 'L11', 'L16', 'RAW', 'ASC'
 BASE_REGISTER_MAP = {
     0x00: ('PAGE',                      'byte', 'BYTE', False),
     0x01: ('OPERATION',                 'byte', 'BYTE', True),
@@ -18,59 +18,35 @@ BASE_REGISTER_MAP = {
     0x24: ('VOUT_MAX',                  'word', 'L16',  True),
     0x25: ('VOUT_MARGIN_HIGH',          'word', 'L16',  True),
     0x26: ('VOUT_MARGIN_LOW',           'word', 'L16',  True),
-    0x27: ('VOUT_TRANSITION_RATE',      'word', 'L11',  True),
-    0x33: ('FREQUENCY_SWITCH',          'word', 'L11',  True),
     0x35: ('VIN_ON',                    'word', 'L11',  False),
     0x36: ('VIN_OFF',                   'word', 'L11',  False),
-    0x38: ('IOUT_CAL_GAIN',             'word', 'L11',  True),
-    0x40: ('VOUT_OV_FAULT_LIMIT',       'word', 'L16',  True),
-    0x41: ('VOUT_OV_FAULT_RESPONSE',    'byte', 'BYTE', True),
-    0x42: ('VOUT_OV_WARN_LIMIT',        'word', 'L16',  True),
-    0x43: ('VOUT_UV_WARN_LIMIT',        'word', 'L16',  True),
-    0x44: ('VOUT_UV_FAULT_LIMIT',       'word', 'L16',  True),
-    0x45: ('VOUT_UV_FAULT_RESPONSE',    'byte', 'BYTE', True),
-    0x46: ('IOUT_OC_FAULT_LIMIT',       'word', 'L11',  True),
-    0x47: ('IOUT_OC_FAULT_RESPONSE',    'byte', 'BYTE', True),
-    0x4A: ('IOUT_OC_WARN_LIMIT',        'word', 'L11',  True),
-    0x4B: ('IOUT_UC_FAULT_LIMIT',       'word', 'L11',  True),
-    0x4C: ('IOUT_UC_FAULT_RESPONSE',    'byte', 'BYTE', True),
-    0x4F: ('OT_FAULT_LIMIT',            'word', 'L11',  True),
-    0x50: ('OT_FAULT_RESPONSE',         'byte', 'BYTE', True),
+    0x40: ('VOUT_OV_FAULT_LIMIT',        'word', 'L16',  True),
+    0x41: ('VOUT_OV_FAULT_RESPONSE',     'byte', 'BYTE', True),
+    0x42: ('VOUT_OV_WARN_LIMIT',         'word', 'L16',  True),
+    0x43: ('VOUT_UV_WARN_LIMIT',         'word', 'L16',  True),
+    0x44: ('VOUT_UV_FAULT_LIMIT',        'word', 'L16',  True),
+    0x45: ('VOUT_UV_FAULT_RESPONSE',     'byte', 'BYTE', True),
+    0x46: ('IOUT_OC_FAULT_LIMIT',        'word', 'L11',  True),
+    0x47: ('IOUT_OC_FAULT_RESPONSE',     'byte', 'BYTE', True),
+    0x4A: ('IOUT_OC_WARN_LIMIT',         'word', 'L11',  True),
+    0x4F: ('OT_FAULT_LIMIT',             'word', 'L11',  True),
+    0x50: ('OT_FAULT_RESPONSE',          'byte', 'BYTE', True),
     0x51: ('OT_WARN_LIMIT',             'word', 'L11',  True),
-    0x52: ('UT_WARN_LIMIT',             'word', 'L11',  True),
-    0x53: ('UT_FAULT_LIMIT',            'word', 'L11',  True),
-    0x54: ('UT_FAULT_RESPONSE',         'byte', 'BYTE', True),
-    0x55: ('VIN_OV_FAULT_LIMIT',        'word', 'L11',  False),
-    0x56: ('VIN_OV_FAULT_RESPONSE',     'byte', 'BYTE', False),
-    0x57: ('VIN_OV_WARN_LIMIT',         'word', 'L11',  False),
-    0x58: ('VIN_UV_WARN_LIMIT',         'word', 'L11',  False),
-    0x59: ('VIN_UV_FAULT_LIMIT',        'word', 'L11',  False),
-    0x5A: ('VIN_UV_FAULT_RESPONSE',     'byte', 'BYTE', False),
-    0x5E: ('POWER_GOOD_ON',             'word', 'L16',  True),
-    0x5F: ('POWER_GOOD_OFF',            'word', 'L16',  True),
+    0x53: ('UT_FAULT_LIMIT',             'word', 'L11',  True),
+    0x54: ('UT_FAULT_RESPONSE',          'byte', 'BYTE', True),
+    0x55: ('VIN_OV_FAULT_LIMIT',         'word', 'L11',  False),
+    0x58: ('VIN_UV_WARN_LIMIT',          'word', 'L11',  False),
     0x60: ('TON_DELAY',                 'word', 'L11',  True),
     0x61: ('TON_RISE',                  'word', 'L11',  True),
-    0x62: ('TON_MAX_FAULT_LIMIT',       'word', 'L11',  True),
-    0x63: ('TON_MAX_FAULT_RESPONSE',    'byte', 'BYTE', True),
+    0x62: ('TON_MAX_FAULT_LIMIT',        'word', 'L11',  True),
+    0x63: ('TON_MAX_FAULT_RESPONSE',     'byte', 'BYTE', True),
     0x64: ('TOFF_DELAY',                'word', 'L11',  True),
-    0x65: ('TOFF_FALL',                 'word', 'L11',  True),
-    0x66: ('TOFF_MAX_WARN_LIMIT',       'word', 'L11',  True),
-    0x78: ('STATUS_BYTE',               'byte', 'BYTE', True),
-    0x79: ('STATUS_WORD',               'word', 'RAW',  True),
-    0x7A: ('STATUS_VOUT',               'byte', 'BYTE', True),
-    0x7B: ('STATUS_IOUT',               'byte', 'BYTE', True),
-    0x7C: ('STATUS_INPUT',              'byte', 'BYTE', False),
-    0x7D: ('STATUS_TEMPERATURE',        'byte', 'BYTE', True),
-    0x7E: ('STATUS_CML',                'byte', 'BYTE', False),
-    0x80: ('STATUS_MFR_SPECIFIC',       'byte', 'BYTE', True),
     0x88: ('READ_VIN',                  'word', 'L11',  False),
-    0x89: ('READ_IIN',                  'word', 'L11',  True),
     0x8B: ('READ_VOUT',                 'word', 'L16',  True),
     0x8C: ('READ_IOUT',                 'word', 'L11',  True),
-    0x8D: ('READ_TEMPERATURE_1',        'word', 'L11',  True),
-    0x8E: ('READ_TEMPERATURE_2',        'word', 'L11',  False),
+    0x8D: ('READ_TEMPERATURE_1',         'word', 'L11',  True),
+    0x8E: ('READ_TEMPERATURE_2',         'word', 'L11',  False),
     0x96: ('READ_POUT',                 'word', 'L11',  True),
-    0x97: ('READ_PIN',                  'word', 'L11',  True),
     0x98: ('PMBUS_REVISION',            'byte', 'BYTE', False),
     0xB0: ('USER_DATA_00',              'word', 'RAW',  False),
     0xB1: ('USER_DATA_01',              'word', 'RAW',  True),
@@ -83,25 +59,40 @@ BASE_REGISTER_MAP = {
     0xD7: ('MFR_IOUT_PEAK',             'word', 'L11',  True),
     0xDD: ('MFR_VOUT_PEAK',             'word', 'L16',  True),
     0xDE: ('MFR_VIN_PEAK',              'word', 'L11',  False),
-    0xDF: ('MFR_TEMPERATURE_1_PEAK',    'word', 'L11',  True),
-    0xE5: ('MFR_PADS',                  'word', 'RAW',  False),
-    0xE6: ('MFR_ADDRESS',               'byte', 'BYTE', False),
+    0xDF: ('MFR_TEMPERATURE_1_PEAK',     'word', 'L11',  True),
     0xE7: ('MFR_SPECIAL_ID',            'word', 'RAW',  False),
-    0xEE: ('MFR_FAULT_LOG',             'word', 'RAW',  False),
-    0xEF: ('MFR_COMMON',                'byte', 'BYTE', False),
+    0xF9: ('MFR_TEMP_1_OFFSET',         'word', 'L11',  True),
 }
 
 BASE_READ_ONLY = {
-    0x19, 0x20, 0x38,
-    0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x80,
-    0x88, 0x89, 0x8B, 0x8C, 0x8D, 0x8E, 0x96, 0x97, 0x98,
-    0xD7, 0xDD, 0xDE, 0xDF, 0xE5, 0xE7, 0xEE, 0xEF,
+    0x19, 0x20,
+    0x88, 0x8B, 0x8C, 0x8D, 0x8E, 0x96, 0x98,
+    0xD7, 0xDD, 0xDE, 0xDF, 0xE7,
 }
 
 BASE_GLOBAL_CMDS = {
-    0x00, 0x10, 0x19, 0x35, 0x36,
-    0x55, 0x56, 0x57, 0x58, 0x59, 0x5A,
-    0x7C, 0x7E, 0x88, 0x8E, 0x98,
-    0xB0, 0xB2, 0xB4, 0xBD, 0xBE, 0xBF,
-    0xDE, 0xE5, 0xE6, 0xE7, 0xEE, 0xEF,
+    cmd
+    for cmd, (_, _, _, paged) in BASE_REGISTER_MAP.items()
+    if not paged
+}
+
+# name, is_paged
+BASE_SEND_COMMANDS = {
+    0x15: ('STORE_USER_ALL', False),
+    0x16: ('RESTORE_USER_ALL', False),
+    0xEA: ('MFR_FAULT_LOG_STORE', False),
+    0xEC: ('MFR_FAULT_LOG_CLEAR', False),
+}
+
+# These are not ordinary configuration fields.
+# Access requires dedicated workflows and must not be part of
+# automatic configuration polling or generic dump restoration.
+BASE_SPECIAL_ACCESS = {
+    0xBD, 0xBE, 0xBF,
+}
+
+BASE_NO_GENERIC_WRITE = {
+    0x00, 0x19, 0x20,
+    0xB0, 0xB1, 0xB2,
+    0xBD, 0xBE, 0xBF,
 }
