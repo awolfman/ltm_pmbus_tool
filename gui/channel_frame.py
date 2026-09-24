@@ -1,4 +1,5 @@
 # gui/channel_frame.py
+# gui/channel_frame.py
 
 """ChannelColumn -- per-channel: telemetry + config tabs + status tree.
 Registers grouped into tabs; Output and Control keep existing layout,
@@ -6,8 +7,13 @@ remaining regs shown in category tabs via RegisterGroup."""
 
 import tkinter as tk
 from tkinter import ttk
-from gui.status_defs import (STATUS_WORD_BITS, STATUS_VOUT_BITS,
-                              STATUS_IOUT_BITS, STATUS_TEMP_BITS)
+from gui.status_defs import (
+    configure_status_tree,
+    reset_status_tree,
+    render_standard_status,
+    render_mfr_status,
+    set_status_indicator,
+)
 from gui.register_group import RegisterGroup
 
 OPERATION_OPTS = [
@@ -40,7 +46,10 @@ STATUS_CMDS = {0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x80}
 # Telemetry shown in telemetry panel
 TELEM_CMDS = {0x88, 0x89, 0x8B, 0x8C, 0x8D, 0x8E, 0x94, 0x95, 0x96, 0x97}
 # Regs in global panel of device_tab
-GLOBAL_GUI_CMDS = {0x35, 0x36, 0x55, 0x57, 0x58, 0x59}
+GLOBAL_GUI_CMDS = {
+    0x35, 0x36, 0x55, 0x57, 0x58, 0x59,
+    0xE5, 0xEF,
+}
 # Misc already shown or not useful in reg grid
 SKIP_CMDS = {0x00, 0x19, 0x20, 0x98} | STATUS_CMDS | TELEM_CMDS
 
@@ -175,8 +184,22 @@ class ChannelColumn(ttk.LabelFrame):
     def _build_reg_tabs(self):
         """Build tabs for registers not already in Output/Control."""
         regmap = getattr(self.device, '_regmap', {})
-        ro_set = getattr(self.device, '_read_only', set())
-        handled = OUTPUT_TAB_CMDS | CONTROL_TAB_CMDS | SKIP_CMDS | GLOBAL_GUI_CMDS
+        ro_set = getattr(
+            self.device,
+            'generic_write_blocked',
+            getattr(self.device, '_read_only', set())
+        )
+        special_access = getattr(
+            self.device, '_metadata', {}
+        ).get('special_access', set())
+
+        handled = (
+            OUTPUT_TAB_CMDS
+            | CONTROL_TAB_CMDS
+            | SKIP_CMDS
+            | GLOBAL_GUI_CMDS
+            | special_access
+        )
 
         # Group remaining regs by category
         groups = {}
@@ -297,31 +320,73 @@ class ChannelColumn(ttk.LabelFrame):
             self.after(600, lambda c=w: c.itemconfig('tri', fill='#4CAF50'))
 
     def _do_clear_faults(self):
-        self.device.set_page(self.page)
-        self.device.clear_faults()
+        self.device.clear_faults(page=self.page)
 
     #   status
     def _build_status(self):
         sf = ttk.LabelFrame(self, text=" Status ")
-        sf.grid(row=2, column=0, sticky='nsew', padx=3, pady=(1,3))
-        self.status_ind = tk.Label(sf, text="---", font=('Consolas',9,'bold'),
-                                  bg='#1a1a2e', fg='#00ff00', anchor='center', relief='sunken')
-        self.status_ind.pack(fill='x', padx=2, pady=(2,1))
-        tf = ttk.Frame(sf); tf.pack(fill='both', expand=True, padx=2, pady=(1,2))
-        self.status_tree = ttk.Treeview(tf, columns=('val','hex'), height=7)
-        self.status_tree.heading('#0', text='Register / Bit', anchor='w')
-        self.status_tree.heading('val', text='St')
-        self.status_tree.heading('hex', text='Hex')
-        self.status_tree.column('#0', width=165, minwidth=100)
-        self.status_tree.column('val', width=28, anchor='center', minwidth=28)
-        self.status_tree.column('hex', width=52, anchor='center', minwidth=42)
-        tsb = ttk.Scrollbar(tf, orient='vertical', command=self.status_tree.yview)
-        self.status_tree.configure(yscrollcommand=tsb.set)
-        self.status_tree.pack(side='left', fill='both', expand=True)
-        tsb.pack(side='right', fill='y')
-        for tag in ('fault','warn','ok'):
-            self.status_tree.tag_configure(tag, foreground={
-                'fault':'#FF4444','warn':'#FFD700','ok':'#228B22'}[tag])
+        sf.grid(
+            row=2,
+            column=0,
+            sticky="nsew",
+            padx=3,
+            pady=(1, 3),
+        )
+
+        self.status_ind = tk.Label(
+            sf,
+            text="UNKNOWN",
+            font=("Consolas", 9, "bold"),
+            bg="#1a1a2e",
+            fg="#BDBDBD",
+            anchor="center",
+            relief="sunken",
+        )
+        self.status_ind.pack(
+            fill="x", padx=2, pady=(2, 1)
+        )
+
+        frame = ttk.Frame(sf)
+        frame.pack(
+            fill="both",
+            expand=True,
+            padx=2,
+            pady=(1, 2),
+        )
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        self.status_tree = ttk.Treeview(
+            frame,
+            columns=("val", "hex"),
+            height=7,
+        )
+        configure_status_tree(self.status_tree)
+
+        vertical = ttk.Scrollbar(
+            frame,
+            orient="vertical",
+            command=self.status_tree.yview,
+        )
+        horizontal = ttk.Scrollbar(
+            frame,
+            orient="horizontal",
+            command=self.status_tree.xview,
+        )
+        self.status_tree.configure(
+            yscrollcommand=vertical.set,
+            xscrollcommand=horizontal.set,
+        )
+
+        self.status_tree.grid(
+            row=0, column=0, sticky="nsew"
+        )
+        vertical.grid(
+            row=0, column=1, sticky="ns"
+        )
+        horizontal.grid(
+            row=1, column=0, sticky="ew"
+        )
 
     #   public API
     def update_telemetry(self, data):
@@ -365,59 +430,42 @@ class ChannelColumn(ttk.LabelFrame):
 
     def update_status(self, status_data):
         tree = self.status_tree
-        for i in tree.get_children(): tree.delete(i)
-        any_fault = any_warn = False
+        expanded = reset_status_tree(tree)
+        levels = []
 
-        sw = status_data.get('STATUS_WORD')
-        if sw is not None:
-            tg = 'fault' if sw & 0xFFC0 else 'ok'
-            sid = tree.insert('','end', text='STATUS_WORD',
-                             values=('F' if sw else 'OK', f'0x{sw:04X}'), tags=(tg,), open=False)
-            for b in range(15,-1,-1):
-                bv = (sw>>b)&1; d = STATUS_WORD_BITS.get(b, f"b{b}")
-                if bv and b>=5: bt='fault'; any_fault=True
-                elif bv: bt='warn'; any_warn=True
-                else: bt='ok'
-                tree.insert(sid,'end', text=f"  b{b}: {d}", values=(bv,''), tags=(bt,))
+        for name, width in (
+            ("STATUS_WORD", 16),
+            ("STATUS_VOUT", 8),
+            ("STATUS_IOUT", 8),
+            ("STATUS_TEMPERATURE", 8),
+        ):
+            levels.append(
+                render_standard_status(
+                    tree,
+                    expanded,
+                    self.device,
+                    name,
+                    status_data.get(name),
+                    width,
+                )
+            )
 
-        for rn, rv, bits in [
-            ('STATUS_VOUT', status_data.get('STATUS_VOUT'), STATUS_VOUT_BITS),
-            ('STATUS_IOUT', status_data.get('STATUS_IOUT'), STATUS_IOUT_BITS),
-            ('STATUS_TEMPERATURE', status_data.get('STATUS_TEMPERATURE'), STATUS_TEMP_BITS),
-        ]:
-            if rv is None: continue
-            tg = 'fault' if rv else 'ok'
-            rid = tree.insert('','end', text=rn, values=('F' if rv else 'OK', f'0x{rv:02X}'), tags=(tg,))
-            for b in range(7,-1,-1):
-                bv = (rv>>b)&1; d = bits.get(b, f"b{b}")
-                if bv and b>=4: bt='fault'; any_fault=True
-                elif bv: bt='warn'; any_warn=True
-                else: bt='ok'
-                tree.insert(rid,'end', text=f"f b{b}: {d}", values=(bv,''), tags=(bt,))
+        manufacturer_status = status_data.get(
+            "STATUS_MFR_SPECIFIC",
+            status_data.get("STATUS_MFR"),
+        )
+        levels.append(
+            render_mfr_status(
+                tree,
+                expanded,
+                self.device,
+                manufacturer_status,
+            )
+        )
 
-        sm = status_data.get('STATUS_MFR')
-        if sm is not None:
-            try:
-                from gui.status_defs import STATUS_MFR_BITS
-            except ImportError:
-                STATUS_MFR_BITS = {}
-
-            tg = 'fault' if sm else 'ok'
-            rid = tree.insert('','end', text='STATUS_MFR',
-                             values=('F' if sm else 'OK', f'0x{sm:02X}'), tags=(tg,), open=False)
-
-            for b in range(7,-1,-1):
-                bv = (sm>>b)&1; d = STATUS_MFR_BITS.get(b, f"b{b}")
-                if bv:
-                    bt='fault'
-                    any_fault=True
-                else:
-                    bt='ok'
-                tree.insert(rid,'end', text=f"  b{b}: {d}", values=(bv,''), tags=(bt,))
-
-        if any_fault: self.status_ind.configure(text="FAULT", fg='#FF4444')
-        elif any_warn: self.status_ind.configure(text="WARNING", fg='#FFD700')
-        else: self.status_ind.configure(text="OK", fg='#00FF00')
+        set_status_indicator(
+            self.status_ind, levels
+        )
 
     def read_all_reg_groups(self):
         for rg in self._reg_groups:
