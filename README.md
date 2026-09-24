@@ -1,151 +1,292 @@
-Language / Язык: [Russian](README.ru.md) | **English**
+Language / Язык – [Русский](README.ru.md) | English
 
-# 🚀 PMBus Device Manager & Telemetry Tool
+# LTM PMBus Tool
 
-A versatile graphical user interface (Tkinter) utility designed for real-time monitoring, configuration, and management of DC/DC converters (LTM polyphase power modules) using the PMBus/I2C protocol. It supports operations with physical hardware via various USB adapters as well as a standalone simulation mode.
+A Tkinter application for reading telemetry, inspecting status registers and configuring LTM power modules over PMBus/I2C.
 
----
+The current development version is V4.8. Device profiles and USB adapter support have different levels of hardware validation. See the tables below before connecting equipment.
 
-## ✨ Features
+## Features
 
-* **Telemetry:** Real-time reading of parameters such as `VOUT`, `IOUT`, `POUT`, `VIN`, `IIN`, `PIN`, temperature, operating frequency, and duty cycle.
-* **Configuration:** Flexible adjustments for output voltage, fault/warning thresholds (`OV`/`UV`/`OC`/`OT`), power-up sequencing/timings, and switching frequency.
-* **Control:** Direct command execution for `OPERATION`, `ON_OFF_CONFIG`, and fault clearing via `CLEAR_FAULTS`.
-* **Fault Monitoring:** Comprehensive polling and bitwise decoding of status registers, including `STATUS_WORD`, `STATUS_VOUT`, `STATUS_IOUT`, `STATUS_INPUT`, `STATUS_TEMPERATURE`, and `STATUS_CML`.
-* **NVM Management:** Non-Volatile Memory control to store and restore configuration settings between operational RAM and device EEPROM (`Store/Restore RAM ↔ EEPROM`).
-* **Configuration Dumps:** Sequential bulk reading and writing of the entire register map, featuring configuration export and import via CSV files.
+- Model-specific register maps for LTM4673, LTM4677 and LTM4678.
+- Telemetry and periodic monitoring, with available measurements depending on the device profile.
+- Reading and writing supported configuration registers.
+- Explicit control actions, including CLEAR_FAULTS and NVM store/restore.
+- CSV export and import of accessible register data.
+- Profile-aware restrictions on generic reads and writes.
+- Startup dependency checks with console diagnostics.
 
----
+Opening a device tab automatically starts Read All. For a new device or an unverified profile, run a limited diagnostic test before opening the GUI.
 
-## 📋 Supported Devices
+## Device profiles and validation
 
-| Model | Channels | VIN Range | VOUT Range | Max IOUT |
-|:---:|:---:|:---:|:---:|:---:|
-| **LTM4673** | 4 | 4.5–16V | 0.5–5.5V | 8A |
-| **LTM4675** | 2 | 4.5–16V | 0.5–5.5V | 13A |
-| **LTM4677** | 2 | 4.5–16V | 0.5–1.8V | 18A |
-| **LTM4678** | 2 | 4.5–16V | 0.5–3.4V | 25A |
+| Model | Pages | Expected L16 exponent | Current validation |
+|---|---|---|---|
+| LTM4673 | 4 | -13 | Byte/word reads, PAGE selection, telemetry and statuses tested with CH341T and FT232H |
+| LTM4677 | 2 | -12 | Limited reads and PAGE selection tested with CH341T after explicit fault clearing |
+| LTM4678 | 2 | -12 | Profile implemented; hardware validation pending |
 
----
+Profile matching uses `MFR_SPECIAL_ID & 0xFFF0`.
 
-## ⚙️ Interface & Driver Configuration
+| Model | Registered ID families |
+|---|---|
+| LTM4673 | `0x448X`, `0x023X` |
+| LTM4677 | `0x47BX` |
+| LTM4678 | `0x4100X` |
 
-The application automatically identifies the connection type based on the specified Bus ID parameter:
+The LTM4673 engineering sample with ID `0x0236` is intentionally supported. Unknown IDs are not assigned an LTM4673 profile automatically.
 
-| Bus ID | Target Adapter | Required Library | Installation Command |
-|:---:|:---|:---:|:---|
-| **0–99** | Native Linux SMBus `/dev/i2c-N` | `smbus2` | `pip install smbus2` |
-| **100–199** | CH341T/A USB-to-I2C Adapter (VID 1a86:5512) | `pyusb` | `pip install pyusb` |
-| **200–299** | FT232H / FT2232H / FT4232H ICs | `pyftdi` | `pip install pyftdi` |
+LTM4675 is not included in the current profile set.
 
-### 🛠 Connecting FT232H
+Successful communication tests do not validate every register, configuration write, NVM operation or electrical operating condition.
 
-When working with an FT232H adapter, implement the hardware wiring according to the schematic below:
+Testing of the available LTM4677 module was paused because of suspected hardware problems. Its communication test completed with zero CML after explicit clearing, but the reported output current on one disabled channel remains unexplained.
+
+## USB adapters and bus numbers
+
+| Bus number | Backend | Python package | Current state |
+|---|---|---|---|
+| 0–99 | Native system I2C | `smbus2` or `smbus` | Not implemented in the current bus factory |
+| 100–199 | CH341T / compatible CH341 I2C device | `pyusb` | Tested with CH341T |
+| 200–299 | FTDI MPSSE | `pyftdi` | Tested with FT232H and PyFtdi 0.57.2 |
+| 300–399 | CP2112 | `hidapi` | Driver present; hardware debugging pending |
+
+Bus `100` selects CH341 index 0. Bus `200` selects FTDI index 0. Adapter indices are enumeration positions, not permanent hardware identifiers.
+
+The FTDI backend also enumerates FT2232H and FT4232H devices and opens interface 1. These variants have not been hardware-validated in this project.
+
+### CH341 limitations
+
+- The driver raises exceptions for USB failures and incomplete responses.
+- Intermediate read bytes are acknowledged; the final byte is terminated with NACK.
+- Slave ACK is not checked by this implementation.
+- Successful USB completion does not prove that the target accepted a write.
+- Fixed-length I2C block reads are not SMBus Block Read transactions.
+- PEC is not implemented.
+
+### FTDI behavior
+
+The FTDI wrapper uses PyFtdi for I2C transactions. It propagates transport errors rather than returning `0xFF` or `0xFFFF` as failure markers.
+
+The initial bus frequency is 100 kHz. Word transfers use little-endian byte order.
+
+Clock stretching is disabled in the current configuration. Enabling PyFtdi clock stretching requires appropriate additional wiring and separate validation.
+
+Fixed-length block helpers do not implement SMBus Block Read with a count byte. PEC is not implemented by this wrapper.
+
+## Hardware connection
+
+Disconnect power before changing signal wiring. Use one active USB adapter on the bus during initial testing.
+
+For a typical FT232H module:
+
+| FT232H signal | Connection |
+|---|---|
+| ADBUS0 / D0 | SCL |
+| ADBUS1 / D1 | SDA output, joined to D2 and target SDA |
+| ADBUS2 / D2 | SDA input, joined to D1 and target SDA |
+| GND | Target GND |
+
+Check the module schematic: some boards already join the SDA signals or include level translation.
+
+SCL and SDA require pull-ups to a voltage compatible with both the adapter and the target. A 3.3 V interface was used in the tested setup. Pull-up resistance must suit the bus capacitance, speed and existing resistors; 2.2 kΩ is not a universal requirement.
+
+Do not connect the adapter power output to an independently powered target without checking the power arrangement.
+
+## Dependencies
+
+Use a Python 3 environment with Tkinter. Python 3.13 was the installation target in the existing setup instructions; a complete minimum-version compatibility matrix has not been established.
+
+Python packages:
+
+```bash
+python -m pip install smbus2 pyusb pyftdi hidapi
+```
+
+The `hid` import used by the CP2112 driver is provided by `hidapi`. Installing a different package named `hid` may create a conflict.
+
+Tkinter is supplied by the operating system or Python installer, not by pip. CH341 and FTDI access also require the native libusb-1.0 runtime.
+
+On Debian or Ubuntu:
+
+```bash
+sudo apt install python3-venv python3-tk libusb-1.0-0
+```
+
+On openSUSE with Python 3.13:
+
+```bash
+sudo zypper install python313-tk libusb-1_0-0
+```
+
+Package names must match the interpreter and distribution in use.
+
+### Startup checks
+
+`main.py` calls `dep_check.py` before importing the application.
+
+The checker reports missing or unusable modules, the active Python executable and installation guidance to the console. It exits with a nonzero status if requirements are unavailable.
+
+The current check covers:
+
+- Tkinter and ttk.
+- PyUSB.
+- PyFtdi.
+- HIDAPI.
+- SMBus compatibility modules in hardware mode.
+- The libusb backend in hardware mode.
+
+Drivers are currently imported eagerly. Their Python dependencies are therefore checked even when only one adapter is used.
+
+The checker does not install packages, open adapters or test USB permissions. A successful dependency check does not prove that hardware is accessible.
+
+## Installation and launch
+
+Create an isolated environment from the project directory:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install smbus2 pyusb pyftdi hidapi
+python main.py
+```
+
+Run from a terminal to retain startup diagnostics.
+
+Do not use `sudo` as the normal application launch method. Configure USB permissions for the current user instead.
+
+### Linux USB permissions
+
+On desktop systems using systemd-logind, a device-specific udev rule can grant access to the active local user. For CH341 with USB ID `1a86:5512`, an example rule is:
 
 ```text
-FT232H          LTM467x
- AD0 (SCL) ───── SCL
- AD1 (SDA) ───── SDA
- GND ─────────── GND
-
-[Important: External 2.2kΩ pull-up resistors to a 3.3V rail are required on both SCL and SDA lines]
+SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="5512", TAG+="uaccess"
 ```
 
-To operate the FT232H board under Linux environments, the default kernel Virtual COM Port driver must be unloaded. Otherwise, `pyftdi` will fail to claim exclusive access to the MPSSE engine:
-```bash
-sudo rmmod ftdi_sio usbserial
-```
-
----
-
-## 📊 PMBus Data Formatting
-
-Under the hood, the utility manages low-level data type conversions natively defined by the PMBus specifications:
-* **L11 (Linear_5s_11s):** Consists of a 5-bit signed exponent combined with an 11-bit signed mantissa. This format is typically used for currents, power ratings, temperatures, and frequencies.
-* **L16 (Linear_16u):** An unsigned 16-bit integer parsed and scaled according to the device's `VOUT_MODE` exponent. This format handles high-precision voltage measurements.
-* **BYTE / RAW:** Unformatted hexadecimal data blocks applied directly to status bitmasks and structural command registers.
-
----
-
-## 📦 System Dependencies & Requirements
-
-Ensure that your target execution environment satisfies the following baseline prerequisites:
-* **Python 3.13+**
-* The **tkinter** package component (on Linux systems, this may necessitate a dedicated installation step: `sudo apt install python3-tk`).
-* The system-level **libusb** library binaries (mandated for `pyusb` interactions with the CH341 chip architecture).
-
----
-
-## 🚀 Quick Start
-
-### Deployment & Execution
-
-To explore the graphical components and evaluate layout features in a mock environment without physical hardware connected:
-```bash
-python main.py --sim
-```
-
-To bind the utility to an active local I2C bus or attached USB host adapters under Linux (requires administrative privileges):
-```bash
-sudo python main.py
-```
-
-### Configuring User Permissions for CH341 (Optional)
-
-To circumvent the necessity of invoking `sudo` privileges for every session when utilizing the **CH341** interface, deploy a custom `udev` rule targeting your current user group:
+Place the rule in an appropriate file such as `/etc/udev/rules.d/70-ltm-pmbus.rules`, then reload rules and reconnect the adapter:
 
 ```bash
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="5512", MODE="0666"' | \
-  sudo tee /etc/udev/rules.d/99-ch341.rules
-
 sudo udevadm control --reload-rules
 ```
 
----
+Use rules matching the actual USB IDs for other adapters. Headless systems may require group-based permissions instead of `uaccess`.
 
-## 📂 Project Directory Structure
+If a kernel driver prevents interface claiming, inspect the specific device binding. Unloading `ftdi_sio` and `usbserial` globally is not a required startup step and may disrupt unrelated devices.
 
-```text
-.
-├── main.py                  # Main application entry point
-├── core/                    # Core engine (protocol implementation & hardware drivers)
-│   ├── pmbus_constants.py   # Command sets, register mapping, and device profiles
-│   ├── pmbus_formats.py     # Data converters for L11/L16 types ↔ float types
-│   ├── pmbus_device.py      # PMBusDevice main class (R/W, telemetry, tracking)
-│   ├── bus_factory.py       # Bus abstraction factory (dynamic smbus2/CH341/FTDI selection)
-│   ├── bus_scanner.py       # I2C network probing for discovering active device nodes
-│   ├── ch341_i2c.py         # Hardware driver layer made for CH341 USB-to-I2C adapters
-│   ├── ftdi_i2c.py          # Hardware driver layer made for FTDI MPSSE I2C engine engines
-│   └── dump_csv.py          # CSV import and export utility for hardware register maps
-├── gui/                     # Graphical User Interface component layer (Tkinter)
-│   ├── app.py               # Main window and layout definition
-│   ├── device_tab.py        # Tab configuration layout for individual device targets
-│   ├── channel_frame.py     # Channel column layouts (telemetry fields, configs, and statuses)
-│   └── status_defs.py       # Bitmask mappings for STATUS_* registers used in error parsing
-└── sim/                     # Mock environments for hardware-free debugging
-    └── sim_bus.py           # Mock I2C bus environment for demonstration modes (--sim)
+## Register access and safety
+
+Identification uses a word read of `MFR_SPECIAL_ID` at `0xE7`. PAGE writes are verified by readback.
+
+Generic access is limited by the selected profile:
+
+- Register sizes and availability are checked before access.
+- Special-protocol commands are excluded from ordinary polling.
+- Status registers are blocked from generic writes and dump restoration.
+- Send Byte actions are separate from normal configuration writes.
+- CLEAR_FAULTS is not executed automatically when connecting.
+- Reserved LTM4673 registers `0xB5` and `0xBC` are excluded from generic access.
+
+Read Dump does not read every documented address. It reads only registers allowed by the current generic-access policy.
+
+Write Dump is not a raw clone operation. Imported CSV entries cannot override the PMBus layer's write restrictions. Verify the target model, address and page before writing.
+
+Store NVM and Restore NVM are explicit actions. Communication tests should not use them merely to diagnose a read error.
+
+## Status display
+
+Verified LTM4673 decoding is provided for standard statuses, `STATUS_MFR_SPECIFIC`, `MFR_PADS` and `MFR_COMMON`.
+
+`STATUS_MFR_SPECIFIC` is command `0x80`. The internal compatibility name `STATUS_MFR` does not refer to a separate command.
+
+For LTM4673, `STATUS_MFR_SPECIFIC=0x18` indicates that the servo target has been reached and the DAC is connected. These bits are informational, not faults.
+
+`MFR_PADS` and `MFR_COMMON` are displayed in Global Status. Their information bits are not treated as faults merely because they are set.
+
+Status updates after Read All run after the remaining register groups, so the display can expose CML errors generated during polling.
+
+LTM4677 and LTM4678 currently use raw gray status displays where model-specific decoding has not been enabled. This also affects standard status rows in the current implementation.
+
+CML bits are not masked. Failed status reads must not be interpreted as OK.
+
+## Data formats
+
+| Format | Meaning |
+|---|---|
+| L11 | Signed 11-bit mantissa multiplied by two to the signed 5-bit exponent |
+| L16 | Unsigned 16-bit value multiplied by two to the exponent obtained from VOUT_MODE |
+| BYTE / RAW | Unscaled values used for command fields and status bits |
+| Model-specific formats | Applied only where explicitly defined by the profile |
+
+The VOUT exponent does not control L11 current decoding. LTM4677's L16 exponent `-12` must not be applied to `READ_IOUT`.
+
+## Simulation
+
+The entry point retains both flags:
+
+```bash
+python main.py --sim
+python main.py --demo
 ```
 
-## 👥 Authors & AI Contributors
+Simulation is currently under repair. Updating the SMBus substitution alone does not restore the scanner path or bring simulated IDs, PAGE behavior and VOUT_MODE into agreement with the current profiles.
 
-* **awolfman** — *System Architecture, Task Formulation, General Coordination, and Hardware Testing*
+Do not treat simulation as a validated test of the current device maps.
 
-* **Claude 4.6** — *Core Application Codebase Generation (PMBus Stack, Protocol Parsing, Tkinter Layout Assembly)*
-* **Gemini** — *System Testing, Code Refactoring, and Stabilization Engineering*
-* **DeepSeek** — *Interface Driver Debugging (USB-to-I2C Hardware Layer), Error Handling Optimization, and Linux Platform Profiling*
+## Project layout
 
-## 🗺️ Roadmap / Future Enhancements (To-Do)
+```text
+main.py
+dep_check.py
+core/
+    bus_factory.py
+    bus_scanner.py
+    pmbus_constants.py
+    pmbus_device.py
+    pmbus_formats.py
+    dump_csv.py
+    devices/
+        base.py
+        registry.py
+        ltm4673.py
+        ltm4677.py
+        ltm4678.py
+    drivers/
+        base_driver.py
+        ch341_i2c.py
+        ftdi_i2c.py
+        ... CP2112 backend
+gui/
+    app.py
+    device_tab.py
+    channel_frame.py
+    register_tab.py
+    register_group.py
+    status_defs.py
+sim/
+    sim_bus.py
+```
 
-The following development tasks and feature optimizations are scheduled for upcoming release iterations:
+## Known limitations and roadmap
 
-- [ ] **⚙️ UI & Graphical User Interface (GUI) Refinement**
-  - Optimize the **Refresh** routine to streamline on-the-fly bus re-scans and data updates without requiring application restarts.
-  - Redesign the **Config** tabs to improve PMBus parameter categorizations and establish field editing flows.
+- [ ] Validate LTM4678 with CH341T and FT232H.
+- [ ] Complete CP2112 hardware debugging.
+- [ ] Add verified LTM4677 and LTM4678 status decoding.
+- [ ] Distinguish unsupported fields from read failures consistently.
+- [ ] Hide telemetry fields that the selected profile does not provide.
+- [ ] Consolidate configuration into three to five tabs.
+- [ ] Provide consistent per-register Read controls alongside Write controls.
+- [ ] Make driver dependencies optional through conditional imports.
+- [ ] Restore and validate simulation.
+- [ ] Implement native system I2C support.
+- [ ] Expand automated map, conversion and access-policy tests.
+- [ ] Validate special block protocols before exposing them in generic workflows.
 
-- [ ] **🐛 Bug Fixes & Telemetry Enhancements**
-  - Correct the reading and layout decoration logic assigned to manufacturer-specific status tracking (**STATUS_MFR**).
-  - Resolve parsing failures and display behavior errors tied to communication integrity flags (**STATUS_CML**).
+## Authors and AI contributions
 
-- [ ] **🐛 Исправление ошибок и телеметрия**
-  - Исправить логику чтения и декорирования регистров специфического статуса производителей (**STATUS_MFR**).
-  - Починить корректное отображение и парсинг битов ошибок связи в регистре статуса (**STATUS_CML**).
+- awolfman – architecture, task definition, coordination and hardware testing.
+- Claude 4.6 – initial application code, PMBus processing and Tkinter interface.
+- Gemini – testing assistance, refactoring and stabilization.
+- DeepSeek – USB–I2C driver debugging and error-handling work.
+- ChatGPT – profile-aware access, CH341 and FTDI wrapper revisions, status display changes, diagnostic tests and dependency checks.
+
+Hardware validation results are reported separately from code review and AI-generated proposals.
