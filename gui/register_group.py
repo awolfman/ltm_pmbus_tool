@@ -92,39 +92,61 @@ class RegisterGroup(ttk.Frame):
         return c
 
     def _read_one(self, cmd):
-        r = self._rows.get(cmd)
-        if not r: return
-        self.device.set_page(self.page)
-        raw = self.device._rb(cmd) if r['size'] == 'byte' else self.device._rw(cmd)
+        row = self._rows.get(cmd)
+        if row is None:
+            return
+
+        raw = self.device.read_register(self.page, cmd)
         self._show(cmd, raw)
-        b = r['btn']
-        b.itemconfig('tri', fill='#00BCD4')
-        self.after(400, lambda: b.itemconfig('tri', fill='#2196F3'))
+
+        button = row['btn']
+        button.itemconfig(
+            'tri',
+            fill='#00BCD4' if raw is not None else '#FF5252'
+        )
+        base_color = '#2196F3' if row['is_ro'] else '#4CAF50'
+        self.after(
+            400,
+            lambda b=button, c=base_color:
+                b.itemconfig('tri', fill=c)
+        )
 
     def _write_one(self, cmd, sv):
-        r = self._rows.get(cmd)
-        if not r or r['is_ro']: return
+        row = self._rows.get(cmd)
+        if row is None or row['is_ro']:
+            return
+
         text = sv.get().strip()
-        if not text: return
-        exp = self.device.vout_exp.get(self.page, -13)
-        ok = False
+        if not text:
+            return
+
         try:
             if text.lower().startswith('0x'):
-                raw_val = int(text, 16)
+                ok = self.device.write_register(
+                    self.page, cmd, int(text, 16), row['size']
+                )
             else:
-                raw_val = encode_value(float(text), r['fmt'], exp)
-            self.device.set_page(self.page)
-            if r['size'] == 'byte':
-                ok = self.device._wb(cmd, raw_val & 0xFF)
-            else:
-                ok = self.device._ww(cmd, raw_val & 0xFFFF)
-        except (ValueError, TypeError):
-            pass
-        b = r['btn']
-        b.itemconfig('tri', fill='#00E676' if ok else '#FF5252')
-        self.after(500, lambda: b.itemconfig('tri', fill='#4CAF50'))
+                ok = self.device.write_val(
+                    self.page, cmd, float(text), row['fmt']
+                )
+        except (ValueError, TypeError, OverflowError):
+            ok = False
+
+        button = row['btn']
+        button.itemconfig(
+            'tri', fill='#00E676' if ok else '#FF5252'
+        )
+        self.after(
+            500,
+            lambda b=button:
+                b.itemconfig('tri', fill='#4CAF50')
+        )
+
         if ok:
-            self._read_one(cmd)
+            self._show(
+                cmd,
+                self.device.read_register(self.page, cmd)
+            )
 
     def _show(self, cmd, raw):
         r = self._rows.get(cmd)
@@ -145,10 +167,8 @@ class RegisterGroup(ttk.Frame):
             r['dec_lbl'].configure(text="ERR")
 
     def read_all(self):
-        self.device.set_page(self.page)
         for cmd in self._rows:
-            r = self._rows[cmd]
-            raw = self.device._rb(cmd) if r['size'] == 'byte' else self.device._rw(cmd)
+            raw = self.device.read_register(self.page, cmd)
             self._show(cmd, raw)
 
     @staticmethod
