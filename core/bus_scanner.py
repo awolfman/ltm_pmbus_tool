@@ -114,7 +114,7 @@ class SimDevice:
     def write_val(self, page, cmd, value, fmt):
         return True
 
-    def clear_faults(self):
+    def clear_faults(self, page=None):
         return True
 
     def store_user_all(self):
@@ -147,7 +147,7 @@ def find_buses():
 
     # ---- CH341 USB (100-199) ----
     try:
-        from drivers.ch341_i2c import find_ch341_devices, CH341_PID_I2C
+        from .drivers.ch341_i2c import find_ch341_devices, CH341_PID_I2C
         ch341_devices = find_ch341_devices()
         for i, dev in enumerate(ch341_devices):
             if getattr(dev, 'idProduct', None) == CH341_PID_I2C:
@@ -161,7 +161,7 @@ def find_buses():
 
     # ---- FTDI USB (200-299) ----
     try:
-        from drivers.ftdi_i2c import find_ftdi_devices
+        from .drivers.ftdi_i2c import find_ftdi_devices
         ftdi_devices = find_ftdi_devices()
         for idx in range(len(ftdi_devices)):
             bus_num = FTDI_OFFSET + idx
@@ -174,7 +174,7 @@ def find_buses():
 
     # ---- CP2112 USB (300-399) ----
     try:
-        from drivers.cp2112_i2c import find_cp2112_devices
+        from .drivers.cp2112_i2c import find_cp2112_devices
         cp2112_devices = find_cp2112_devices()
         for idx in range(len(cp2112_devices)):
             bus_num = CP2112_OFFSET + idx
@@ -196,7 +196,7 @@ def bus_label(bus_num):
     if CH341_OFFSET <= bus_num < FTDI_OFFSET:
         idx = bus_num - CH341_OFFSET
         try:
-            from drivers.ch341_i2c import find_ch341_devices, ch341_location
+            from .drivers.ch341_i2c import find_ch341_devices, ch341_location
             devs = find_ch341_devices()
             if idx < len(devs):
                 dev = devs[idx]
@@ -209,7 +209,7 @@ def bus_label(bus_num):
     if FTDI_OFFSET <= bus_num < CP2112_OFFSET:
         idx = bus_num - FTDI_OFFSET
         try:
-            from drivers.ftdi_i2c import find_ftdi_devices, I2C_PIDS
+            from .drivers.ftdi_i2c import find_ftdi_devices, I2C_PIDS
             devs = find_ftdi_devices()
             if idx < len(devs):
                 d = devs[idx]
@@ -224,7 +224,7 @@ def bus_label(bus_num):
     if bus_num >= CP2112_OFFSET:
         idx = bus_num - CP2112_OFFSET
         try:
-            from drivers.cp2112_i2c import find_cp2112_devices
+            from .drivers.cp2112_i2c import find_cp2112_devices
             devs = find_cp2112_devices()
             if idx < len(devs):
                 d = devs[idx]
@@ -239,44 +239,44 @@ def bus_label(bus_num):
 
 
 def scan_bus(bus_num):
-    if is_sim():
-        print("[scan_bus] DEMO mode: returning simulated device")
-        return [SimDevice()]
-
     devices = []
-    bl = bus_label(bus_num)
-    print(f"[scan_bus] scanning {bl} ...")
+
+    print(f"[scan_bus] scanning {bus_label(bus_num)} ...")
+    print(f"[scan_bus] implementation: {scan_bus.__code__.co_filename}")
 
     try:
-        bus = create_bus(bus_num)
-        scan_addrs = range(0x08, 0x78)
+        create_bus(bus_num)
+    except Exception as exc:
+        print(f"[scan_bus] cannot open bus: {exc}")
+        return devices
 
-        for addr in scan_addrs:
-            if addr in GLOBAL_ADDRESSES:
-                continue
-            try:
-                time.sleep(0.005)
-                res = bus.read_byte(addr)
-                if res == 0xFF:
-                    continue
+    print(f"[scan_bus] PMBusDevice: {PMBusDevice.__module__}")
+    for addr in range(0x08, 0x78):
+        if addr in GLOBAL_ADDRESSES:
+            continue
 
-                dev = PMBusDevice(bus_num, addr)
-                if dev.identify():
-                    devices.append(dev)
-                    print(f"[scan_bus]  + {dev.name} "
-                          f"@ 0x{addr:02X}  "
-                          f"pages={dev.num_pages}  "
-                          f"id=0x{dev.special_id:04X}")
-            except Exception:
-                continue
+        device = PMBusDevice(bus_num, addr)
 
-    except Exception as e:
-        print(f"[scan] ошибка при сканировании шины {bus_num}: {e}")
-        return []
+        try:
+            identified = device.identify()
+        except Exception as exc:
+            print(
+                f"[scan_bus] 0x{addr:02X}: "
+                f"identification exception: {exc}"
+            )
+            continue
+
+        if identified:
+            devices.append(device)
+            print(
+                f"[scan_bus] + {device.name} "
+                f"@ 0x{addr:02X}, "
+                f"pages={device.num_pages}, "
+                f"id=0x{device.special_id:04X}"
+            )
 
     print(f"[scan_bus] found {len(devices)} device(s)")
     return devices
-
 
 if __name__ == "__main__":
     import sys
