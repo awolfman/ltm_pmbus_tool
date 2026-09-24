@@ -1,13 +1,22 @@
 # core/ftdi_i2c.py
-"""FTDI FT232H / FT2232H / FT4232H USB-to-I2C via MPSSE.
+"""FTDI I2C transport using PyFtdi.
 
-Drop-in replacement for smbus2.SMBus using pyftdi.
-pyftdi handles repeated-start internally in read_from / exchange.
+Scalar SMBus-compatible operations:
+    Receive Byte
+    Send Byte
+    Read/Write Byte Data
+    Read/Write Word Data, little-endian
 
-Requirements:  pip install pyftdi
+Block helpers implement fixed-length I2C transfers only.
+SMBus Block Read with a count byte and PEC are not implemented.
+
+Transport failures propagate as exceptions.
+No error sentinels and no automatic CLEAR_FAULTS.
 """
 
+import logging
 import threading
+from contextlib import contextmanager
 
 from .base_driver import I2CDriverBase
 
@@ -16,272 +25,403 @@ try:
     from pyftdi.ftdi import Ftdi
     HAS_PYFTDI = True
 except ImportError:
+    I2cController = None
+    Ftdi = None
     HAS_PYFTDI = False
 
-I2C_PIDS = {0x6014: '232h', 0x6010: '2232h', 0x6011: '4232h'}
+
+logger = logging.getLogger(__name__)
+
+I2C_PIDS = {
+    0x6014: "232h",
+    0x6010: "2232h",
+    0x6011: "4232h",
+}
+
+I2C_FREQUENCY = 100_000
+I2C_CLOCK_STRETCHING = False
+MAX_I2C_BLOCK_LENGTH = 32
 
 
 def find_ftdi_devices():
-    """Return list of I2C-capable FTDI device descriptors."""
+    """Return supported devices in PyFtdi enumeration order."""
     if not HAS_PYFTDI:
         return []
+
     try:
-        devs = Ftdi.list_devices()
-        result = []
-        for desc, _n_intf in devs:
-            if desc.pid in I2C_PIDS:
-                result.append(desc)
-        return result
-    except Exception as e:
-        print(f"[FTDI] scan error: {e}")
+        return [
+            desc
+            for desc, _interfaces in Ftdi.list_devices()
+            if desc.pid in I2C_PIDS
+        ]
+    except Exception:
+        logger.exception("FTDI enumeration failed")
         return []
 
 
-def _url_for(desc):
-    """Build pyftdi URL from device descriptor."""
-    name = I2C_PIDS.get(desc.pid, f'0x{desc.pid:04x}')
-    sn = getattr(desc, 'sn', None)
+def _url_for(desc, devices):
+    """Select interface 1 without silently choosing another device."""
+    vendor = f"0x{desc.vid:04x}"
+    product = f"0x{desc.pid:04x}"
+    serial = getattr(desc, "sn", None)
 
-    if sn:
-        return f'ftdi://ftdi:{name}:{sn}/1'
-    else:
-        return f'ftdi://ftdi:{name}/1'
+    if serial:
+        matches = [
+            item for item in devices
+            if item.vid == desc.vid
+            and item.pid == desc.pid
+            and getattr(item, "sn", None) == serial
+        ]
+        if len(matches) != 1:
+            raise OSError(
+                "Multiple FTDI devices have the same serial number. "
+                "Connect only the intended adapter."
+            )
+
+        return f"ftdi://{vendor}:{product}:{serial}/1"
+
+    matches = [
+        item for item in devices
+        if item.vid == desc.vid and item.pid == desc.pid
+    ]
+    if len(matches) != 1:
+        raise OSError(
+            "Cannot uniquely select an FTDI device without a serial "
+            "number. Connect only one adapter of this type."
+        )
+
+    return f"ftdi://{vendor}:{product}/1"
+
+
+def _validate_integer(value, minimum, maximum, name):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
+        raise ValueError(
+            f"{name} must be an integer in "
+            f"{minimum}..{maximum}, got {value!r}"
+        )
+    return value
+
+
+def _validate_address(addr):
+    # Exclude reserved I2C addresses.
+    return _validate_integer(addr, 0x08, 0x77, "I2C address")
+
+
+def _validate_byte(value, name):
+    return _validate_integer(value, 0, 0xFF, name)
+
+
+def _checked_response(data, length):
+    if data is None or isinstance(data, int):
+        raise OSError(f"Invalid I2C response: {data!r}")
+
+    try:
+        payload = bytes(data)
+    except (TypeError, ValueError) as exc:
+        raise OSError("Invalid I2C response type") from exc
+
+    if len(payload) != length:
+        raise OSError(
+            f"Short or oversized I2C response: "
+            f"expected {length} bytes, received {len(payload)}"
+        )
+
+    return payload
 
 
 class FTDIBus(I2CDriverBase):
-    """SMBus-compatible I2C bus via FTDI MPSSE.
+    """Shared PyFtdi controller with serialized transactions.
 
-    Shared I2cController per physical device.
-    Cached I2cPort per slave address.
-    Thread-safe via per-device lock.
+    Only interface 1 is opened.
+
+    The driver does not retry actions itself beyond one PyFtdi
+    transaction attempt. Higher-level read retries remain the
+    responsibility of PMBusDevice.
     """
 
     _shared = {}
-    _global_lock = threading.Lock()
+    _global_lock = threading.RLock()
+
+    legacy_error_sentinels = False
+    checks_i2c_ack = True
+
+    def __init__(self, dev_index=0):
+        _validate_integer(
+            dev_index, 0, 1_000_000, "FTDI device index"
+        )
+
+        self._idx = dev_index
+        self._closed = True
+        self._entry = None
+
+        with type(self)._global_lock:
+            if dev_index not in type(self)._shared:
+                self._open(dev_index)
+
+            entry = type(self)._shared[dev_index]
+            entry["users"] += 1
+            self._entry = entry
+            self._closed = False
 
     def _open(self, dev_index):
         if not HAS_PYFTDI:
             raise ImportError(
-                "pyftdi required for FTDI I2C.\n"
-                "  pip install pyftdi")
+                "PyFtdi is required. Install with: "
+                "python -m pip install pyftdi"
+            )
 
-        devs = find_ftdi_devices()
-        if dev_index >= len(devs):
+        devices = find_ftdi_devices()
+        if dev_index >= len(devices):
             raise OSError(
-                f"FTDI #{dev_index} not found "
-                f"({len(devs)} available)")
+                f"FTDI #{dev_index} not found; "
+                f"{len(devices)} supported device(s) available"
+            )
 
-        desc = devs[dev_index]
-        url = _url_for(desc)
+        desc = devices[dev_index]
+        url = _url_for(desc, devices)
+        controller = I2cController()
 
-        print(f"[FTDI] Opening: {url}")
+        try:
+            controller.configure(
+                url,
+                frequency=I2C_FREQUENCY,
+                clockstretching=I2C_CLOCK_STRETCHING,
+            )
 
-        ctrl = I2cController()
-        ctrl.configure(url)
+            # One transaction attempt. Do not replay writes silently.
+            controller.set_retry_count(1)
 
-        # --- ДОБАВЛЯЕМ СТРОКУ ТАЙМАУТА ДЛЯ LIBUSB ---
-        # Устанавливаем внутренний USB таймаут в миллисекундах (100 мс)
-        if hasattr(ctrl, 'ftdi') and hasattr(ctrl.ftdi, '_usb_read_timeout'):
-            ctrl.ftdi._usb_read_timeout = 100
-            ctrl.ftdi._usb_write_timeout = 100
-        # -----------------------------------
+        except Exception:
+            try:
+                controller.terminate()
+            except Exception:
+                logger.exception(
+                    "Failed to release FTDI after initialization error"
+                )
+            raise
 
-        self._shared[dev_index] = {
-            'ctrl':  ctrl,
-            'ports': {},
-            'lock':  threading.Lock(),
-            'desc': desc,
-            'url': url,
+        type(self)._shared[dev_index] = {
+            "ctrl": controller,
+            "ports": {},
+            "lock": threading.RLock(),
+            "desc": desc,
+            "url": url,
+            "users": 0,
+            "closed": False,
         }
 
-        label = getattr(desc, 'description', '') or \
-                getattr(desc, 'sn', '') or f'#{dev_index}'
-        print(f"[FTDI] opened {label} ({url})")
+        logger.info(
+            "FTDI opened: %s, frequency=%d Hz, clockstretching=%s",
+            url,
+            I2C_FREQUENCY,
+            I2C_CLOCK_STRETCHING,
+        )
 
-    def _port(self, addr):
-        if self._closed:
-            raise RuntimeError("Bus is closed")
-        entry = self._get_entry()
-        if addr not in entry['ports']:
-            try:
-                entry['ports'][addr] = entry['ctrl'].get_port(addr)
-            except Exception as e:
-                print(f"[FTDI] Failed to get port for 0x{addr:02X}: {e}")
-                raise
-        return entry['ports'][addr]
+    def _get_entry(self):
+        entry = self._entry
+        if (
+            self._closed
+            or entry is None
+            or entry["closed"]
+            or type(self)._shared.get(self._idx) is not entry
+        ):
+            raise RuntimeError("FTDI bus is closed")
+        return entry
 
-    # SMBus interface
+    @contextmanager
+    def _transaction(self):
+        # Acquire the transaction lock before allowing close_all
+        # to remove this entry.
+        with type(self)._global_lock:
+            entry = self._get_entry()
+            entry["lock"].acquire()
+
+        try:
+            if self._closed or entry["closed"]:
+                raise RuntimeError("FTDI bus is closed")
+            yield entry
+        finally:
+            entry["lock"].release()
+
+    @staticmethod
+    def _port_locked(entry, addr):
+        port = entry["ports"].get(addr)
+        if port is None:
+            port = entry["ctrl"].get_port(addr)
+            entry["ports"][addr] = port
+        return port
 
     def read_byte(self, addr):
-        """Read single byte (device detect / SMBus read byte)."""
-        if self._closed:
-            raise RuntimeError("Bus is closed")
+        """SMBus Receive Byte, without writing a command first.
 
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                ctrl = entry['ctrl']
+        Do not use this operation for PMBus device identification.
+        """
+        _validate_address(addr)
 
-                # Шаг 1. Безопасный низкоуровневый пинг шины.
-                # Если на адресе никого нет, poll() мгновенно отвалится по NACK, не зависая.
-                # Флаг relax=True принудительно заставляет libusb сбросить транзакцию при неудаче.
-                if not ctrl.poll(addr, relax=True):
-                    return 0xFF
+        with self._transaction() as entry:
+            port = self._port_locked(entry, addr)
+            data = port.read(1, relax=True)
+            return _checked_response(data, 1)[0]
 
-                # Шаг 2. Если адрес физически ответил, создаем полноценный SMBus-порт
-                # и читаем стандартный PMBus-регистр 0x00 (PAGE).
-                # Это гарантирует, что капризный чип LTM4673 примет команду и вернет ACK.
-                port = self._port(addr)
+    def _read_fixed(self, addr, cmd, length):
+        _validate_address(addr)
+        _validate_byte(cmd, "Command")
+        _validate_integer(
+            length, 1, MAX_I2C_BLOCK_LENGTH, "Read length"
+        )
 
-                # Читаем 1 байт из регистра 0x00 (PAGE)
-                data = port.read_from(0x00, 1)
+        with self._transaction() as entry:
+            port = self._port_locked(entry, addr)
 
-                if data and len(data) > 0:
-                    return data[0]
-                return 0xFF
-            except Exception:
-                return 0xFF
+            # Command write, repeated START, data read, STOP.
+            # ACK/NACK generation is handled by PyFtdi.
+            data = port.exchange(
+                bytes([cmd]),
+                length,
+                relax=True,
+            )
+            return _checked_response(data, length)
 
     def read_byte_data(self, addr, cmd):
-        """Write register, repeated start, read 1 byte."""
-        if self._closed:
-            raise RuntimeError("Bus is closed")
-
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                port = self._port(addr)
-                data = port.read_from(cmd, 1)  # без таймаута
-                if data is not None and len(data) > 0:
-                    return data[0]
-                return 0xFF
-            except Exception:
-                return 0xFF
+        return self._read_fixed(addr, cmd, 1)[0]
 
     def read_word_data(self, addr, cmd):
-        """Write register, repeated start, read 2 bytes (LE)."""
-        if self._closed:
-            raise RuntimeError("Bus is closed")
-
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                port = self._port(addr)
-                data = port.read_from(cmd, 2)  # без таймаута
-                if data is not None and len(data) >= 2:
-                    return data[0] | (data[1] << 8)
-                return 0xFFFF
-            except Exception:
-                return 0xFFFF
+        data = self._read_fixed(addr, cmd, 2)
+        return data[0] | (data[1] << 8)
 
     def read_i2c_block_data(self, addr, cmd, length):
-        """Block read: write register, repeated start, read N."""
-        if self._closed:
-            raise RuntimeError("Bus is closed")
+        """Fixed-length I2C read, not SMBus Block Read."""
+        return list(self._read_fixed(addr, cmd, length))
 
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                port = self._port(addr)
-                data = port.exchange(bytes([cmd]), length)
-                return list(data) if data else []
-            except Exception:
-                return []
+    def _write_payload(self, addr, payload):
+        _validate_address(addr)
+
+        with self._transaction() as entry:
+            port = self._port_locked(entry, addr)
+            port.write(payload, relax=True)
+
+        return True
 
     def write_byte(self, addr, val):
-        """SMBus send byte."""
-        if self._closed:
-            raise RuntimeError("Bus is closed")
-
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                port = self._port(addr)
-                port.write(bytes([val & 0xFF]))
-            except Exception:
-                pass
+        """SMBus Send Byte."""
+        _validate_byte(val, "Command")
+        return self._write_payload(addr, bytes([val]))
 
     def write_byte_data(self, addr, cmd, val):
-        """SMBus write byte data."""
-        if self._closed:
-            raise RuntimeError("Bus is closed")
-
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                port = self._port(addr)
-                port.write_to(cmd, bytes([val & 0xFF]))
-            except Exception:
-                pass
+        _validate_byte(cmd, "Command")
+        _validate_byte(val, "Byte value")
+        return self._write_payload(
+            addr, bytes([cmd, val])
+        )
 
     def write_word_data(self, addr, cmd, val):
-        """SMBus write word data (LE)."""
-        if self._closed:
-            raise RuntimeError("Bus is closed")
-
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                port = self._port(addr)
-                port.write_to(cmd, bytes([val & 0xFF, (val >> 8) & 0xFF]))
-            except Exception:
-                pass
+        _validate_byte(cmd, "Command")
+        _validate_integer(val, 0, 0xFFFF, "Word value")
+        return self._write_payload(
+            addr,
+            bytes([cmd, val & 0xFF, val >> 8]),
+        )
 
     def write_i2c_block_data(self, addr, cmd, data):
-        """SMBus write block data."""
-        if self._closed:
-            raise RuntimeError("Bus is closed")
+        """Fixed-length I2C write without an SMBus count byte."""
+        _validate_byte(cmd, "Command")
 
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                port = self._port(addr)
-                if isinstance(data, list):
-                    data = bytes(data)
-                port.write_to(cmd, data)
-            except Exception:
-                pass
+        if isinstance(data, (int, str)):
+            raise ValueError("Block data must be a byte sequence")
+
+        try:
+            items = list(data)
+        except TypeError as exc:
+            raise ValueError(
+                "Block data must be a byte sequence"
+            ) from exc
+
+        _validate_integer(
+            len(items), 1, MAX_I2C_BLOCK_LENGTH, "Block length"
+        )
+        for value in items:
+            _validate_byte(value, "Block byte")
+
+        return self._write_payload(
+            addr, bytes([cmd]) + bytes(items)
+        )
 
     def detect(self, addr):
-        """Check if device exists at address."""
-        if self._closed:
-            return False
+        """Probe address ACK only.
 
-        entry = self._get_entry()
-        with entry['lock']:
-            try:
-                port = self._port(addr)
-                data = port.read(1)
-                return data is not None and len(data) > 0
-            except Exception:
-                return False
+        An address probe is not PMBus identification and may affect
+        the status of some slaves. Do not use it in the PMBus scan.
+        """
+        _validate_address(addr)
+
+        with self._transaction() as entry:
+            return bool(
+                entry["ctrl"].poll(addr, relax=True)
+            )
+
+    @staticmethod
+    def _terminate_entry(entry):
+        entry["closed"] = True
+        entry["ports"].clear()
+        try:
+            entry["ctrl"].terminate()
+        except Exception:
+            logger.exception(
+                "Failed to terminate FTDI controller %s",
+                entry["url"],
+            )
+
+    def close(self):
+        cls = type(self)
+
+        with cls._global_lock:
+            if self._closed:
+                return
+
+            entry = self._entry
+            if entry is None:
+                self._closed = True
+                return
+
+            with entry["lock"]:
+                self._closed = True
+                self._entry = None
+
+                if entry["closed"]:
+                    return
+
+                entry["users"] -= 1
+                if entry["users"] == 0:
+                    if cls._shared.get(self._idx) is entry:
+                        del cls._shared[self._idx]
+                    cls._terminate_entry(entry)
 
     @classmethod
     def close_all(cls):
-        """Terminate all FTDI controllers."""
+        """Close controllers and invalidate existing bus objects."""
         with cls._global_lock:
-            for entry in cls._shared.values():
-                try:
-                    entry['ctrl'].terminate()
-                except Exception as e:
-                    print(f"[FTDI] Error terminating controller: {e}")
+            entries = list(cls._shared.values())
             cls._shared.clear()
-            print("[FTDI] all devices released")
+
+            for entry in entries:
+                with entry["lock"]:
+                    cls._terminate_entry(entry)
 
     @classmethod
     def get_available_devices(cls):
-        """Return list of available FTDI devices with info."""
-        if not HAS_PYFTDI:
-            return []
-        devs = find_ftdi_devices()
         result = []
-        for i, desc in enumerate(devs):
-            info = {
-                'index': i,
-                'description': getattr(desc, 'description', ''),
-                'sn': getattr(desc, 'sn', ''),
-                'pid': desc.pid,
-                'vid': desc.vid,
-            }
-            result.append(info)
+        for index, desc in enumerate(find_ftdi_devices()):
+            result.append({
+                "index": index,
+                "description": getattr(
+                    desc, "description", ""
+                ),
+                "sn": getattr(desc, "sn", ""),
+                "pid": desc.pid,
+                "vid": desc.vid,
+            })
         return result
