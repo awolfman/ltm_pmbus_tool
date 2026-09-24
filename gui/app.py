@@ -11,7 +11,7 @@ from gui.device_tab import DeviceTab
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LTM PMBus Tool v4.7")
+        self.title("LTM PMBus Tool v4.8")
         self.geometry("1380x850")
         self.minsize(1100, 700)
         style = ttk.Style()
@@ -103,7 +103,7 @@ class App(tk.Tk):
         self.nb.add(w, text="  Welcome  ")
         tk.Label(
             w,
-            text=("LTM PMBus Tool v4.7\n\n"
+            text=("LTM PMBus Tool v4.8\n\n"
                   "LTM4671 / LTM4673 / LTM4675\n"
                   "LTM4676 / LTM4677 / LTM4678\n\n"
                   "Buses:\n"
@@ -182,38 +182,57 @@ class App(tk.Tk):
 
     def connect_manual(self):
         try:
-            s = self.addr_var.get().strip()
-            addr = (int(s, 16) if s.lower().startswith('0x')
-                    else int(s))
+            text = self.addr_var.get().strip()
+            addr = (
+                int(text, 16)
+                if text.lower().startswith('0x')
+                else int(text)
+            )
             if not 0x08 <= addr <= 0x77:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("", "Bad address (0x08..0x77).")
+            messagebox.showerror(
+                "Address",
+                "Enter a valid 7-bit address in 0x08..0x77."
+            )
             return
+
         bus_num = self._get_bus_num()
         if bus_num is None:
-            messagebox.showerror("", "Select a bus.")
+            messagebox.showerror("Bus", "Select a bus.")
             return
+
         dev = PMBusDevice(bus_num, addr)
-        dev.identify()
-        if dev.name == "Unknown":
-            dev.name = f"PMBus@0x{addr:02X}"
+
+        if not dev.identify():
+            messagebox.showerror(
+                "Identification failed",
+                dev.last_error
+                or f"Cannot identify device at 0x{addr:02X}."
+            )
+            return
+
         dt = DeviceTab(self.nb, dev)
-        self.nb.add(dt, text=f"  {dev.name} (0x{addr:02X})  ")
+        self.nb.add(
+            dt,
+            text=f"  {dev.name} (0x{addr:02X})  "
+        )
         self.tabs.append(dt)
         self.nb.select(dt)
         self.devices.append(dev)
+
         self.cnt_lbl.configure(
-            text=f"Devices: {len(self.devices)}")
+            text=f"Devices: {len(self.devices)}"
+        )
 
     def _quit(self):
         for t in self.tabs:
             t.stop_all()
         # release USB adapters
         for mod, cls in [
-            ('drivers.ch341_i2c',  'CH341Bus'),
-            ('drivers.ftdi_i2c',   'FTDIBus'),
-            ('drivers.cp2112_i2c', 'CP2112Bus'),
+            ('core.drivers.ch341_i2c',  'CH341Bus'),
+            ('core.drivers.ftdi_i2c',   'FTDIBus'),
+            ('core.drivers.cp2112_i2c', 'CP2112Bus'),
         ]:
             try:
                 m = __import__(mod, fromlist=[cls])
