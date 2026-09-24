@@ -1,246 +1,468 @@
 # core/pmbus_device.py
-"""PMBusDevice -- I2C communication with one LTM IC."""
+"""Profile-aware PMBus access.
 
+Generic access excludes reserved and special-access commands.
+Send Byte actions are explicit and never restored from dumps.
+"""
+
+import logging
+import math
 import threading
 import time
-import signal
+
 from core.bus_factory import create_bus
 from core.pmbus_constants import (
-    Cmd, REGISTER_MAP, READ_ONLY_CMDS, KNOWN_DEVICES,
+    Cmd,
+    STATUS_COMMANDS,
+    TELEMETRY_COMMANDS,
     build_register_map,
+    build_device_metadata,
 )
-from core.pmbus_formats import (l11_to_float, l16_to_float,
-                                 float_to_l11, float_to_l16, decode_value)
+from core.pmbus_formats import decode_value, encode_value
+
+
+logger = logging.getLogger(__name__)
 
 RETRY_COUNT = 3
 PMBUS_PAUSE = 0.01
-FTDI_TIMEOUT = 1  # таймаут для FTDI в секундах
+PAGE_PAUSE = 0.005
+READY_TIMEOUT = 1.0
+NVM_TIMEOUT = 10.0
 
-SKIP_REGISTERS = {
-    0xEE,  # MFR_FAULT_LOG (block)
-    0x99,  # MFR_ID (block)
-    0x9E,  # MFR_SERIAL (block)
-    0xC0,  # MFR_EIN (block)
-    0xBD, 0xBE, 0xBF,  # EEPROM
-    0xE3, 0xFD,  # send byte
+BOOTSTRAP_READ_COMMANDS = frozenset({
+    Cmd.PAGE,
+    Cmd.MFR_SPECIAL_ID,
+    Cmd.CAPABILITY,
+    Cmd.VOUT_MODE,
+})
+
+EXPLICIT_ACTION_NAMES = frozenset({
+    "CLEAR_FAULTS",
+    "STORE_USER_ALL",
+    "RESTORE_USER_ALL",
+    "MFR_CLEAR_PEAKS",
+    "MFR_COMPARE_USER_ALL",
+    "MFR_RESET",
+    "MFR_FAULT_LOG_STORE",
+    "MFR_FAULT_LOG_RESTORE",
+    "MFR_FAULT_LOG_CLEAR",
+})
+
+NVM_ACTION_NAMES = EXPLICIT_ACTION_NAMES - {
+    "CLEAR_FAULTS",
+    "MFR_CLEAR_PEAKS",
 }
-
-# FTDI адреса, которые могут зависать при block read
-FTDI_SKIP_BLOCK = {0xEE, 0x99, 0x9E, 0xC0, 0xBD, 0xBE, 0xBF}
-
-
-def with_timeout(func, timeout=FTDI_TIMEOUT):
-    """Execute function with timeout."""
-    def timeout_handler(signum, frame):
-        raise TimeoutError()
-
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(timeout)
-    try:
-        result = func()
-        signal.alarm(0)
-        return result
-    except TimeoutError:
-        signal.alarm(0)
-        return None
-    finally:
-        signal.signal(signal.SIGALRM, old_handler)
-        signal.alarm(0)
 
 
 class PMBusDevice:
+    _device_locks = {}
+    _device_locks_guard = threading.Lock()
+
     def __init__(self, bus_num, address, special_id=None):
+        if (
+            isinstance(address, bool)
+            or not isinstance(address, int)
+            or not 0x08 <= address <= 0x77
+        ):
+            raise ValueError("Expected a 7-bit address in 0x08..0x77")
+
         self.bus_num = bus_num
         self.address = address
+        self.addr = address
+        self._expected_id = special_id
+        self.special_id = special_id
+        self._raw_bus_instance = None
+
+        with self._device_locks_guard:
+            self._lock = self._device_locks.setdefault(
+                (bus_num, address), threading.RLock()
+            )
+
+        self.last_error = None
+        self.last_errors = {}
+        self._reset_profile()
+
+    def _reset_profile(self):
         self.name = "Unknown"
         self.revision = "?"
-        self.special_id = special_id
         self.num_pages = 1
+        self.capability = None
+        self.pmbus_revision = None
         self.vout_exp = {}
-        self._regmap = REGISTER_MAP
-        self._read_only = READ_ONLY_CMDS
-        self._global_cmds = set()
-        self._is_ftdi = bus_num >= 200  # FTDI bus offset
+        self._identified = False
+        self._identifying = False
+        self._page = None
 
-        self._lock = threading.RLock()
+        (
+            self._regmap,
+            self._read_only,
+            self._global_cmds,
+            _,
+            _,
+        ) = build_register_map(None)
 
-        self._raw_bus_instance = None
-        self._has_native_reset = False
+        self._metadata = build_device_metadata(None)
+        self._generic_write_blocked = set(self._regmap)
+
+    @property
+    def pages(self):
+        return self.num_pages
+
+    @property
+    def id(self):
+        return self.special_id
+
+    @property
+    def identified(self):
+        return self._identified
+
+    @property
+    def generic_write_blocked(self):
+        return frozenset(self._generic_write_blocked)
+
+    def _error(self, operation, cmd, error, quiet=False):
+        message = (
+            f"{operation}: bus={self.bus_num}, "
+            f"addr=0x{self.address:02X}, "
+            f"page={self._page}, cmd=0x{cmd:02X}: {error}"
+        )
+        self.last_error = message
+        self.last_errors[(operation, self._page, cmd)] = message
+        if quiet:
+            logger.debug(message)
+        else:
+            logger.warning(message)
 
     def _get_bus(self):
-        """Возвращает существующий экземпляр шины или создает новый."""
         if self._raw_bus_instance is None:
-            try:
-                self._raw_bus_instance = create_bus(self.bus_num)
-                self._has_native_reset = hasattr(self._raw_bus_instance, 'reset_bus')
-            except Exception as e:
-                print(f"[PMBusDevice] Ошибка создания шины: {e}")
+            self._raw_bus_instance = create_bus(self.bus_num)
         return self._raw_bus_instance
 
     def reset_bus(self):
-        bus = self._get_bus()
-        if bus and self._has_native_reset:
-            with self._lock:
-                try:
-                    bus.reset_bus()
-                    time.sleep(PMBUS_PAUSE)
-                except Exception:
-                    pass
-
-    def read_byte_data(self, cmd):
-        if cmd in SKIP_REGISTERS:
-            return None
-
-        bus = self._get_bus()
-        if not bus:
-            return None
-
         with self._lock:
-            for attempt in range(RETRY_COUNT):
-                try:
-                    # Убираем with_timeout, он бесполезен для C-библиотеки libusb
-                    val = bus.read_byte_data(self.address, cmd)
-                    time.sleep(PMBUS_PAUSE)
-
-                    if cmd == 0x7E and val in (0x82, 0x02):
-                        return 0x00
-
-                    if (val == 0xFF or val is None) and attempt < RETRY_COUNT - 1:
-                        if self._has_native_reset:
-                            bus.reset_bus()
-                        time.sleep(PMBUS_PAUSE)
-                        continue
-
-                    return val if val != 0xFF else None
-                except Exception as e:
-                    print(f"[PMBusDevice] Ошибка чтения байта (cmd 0x{cmd:02X}, попытка {attempt}): {e}")
-                    # Если поймали NACK или ошибку связи на FTDI — прерываем цикл сразу!
-                    # Повторные попытки без сброса контроллера только вешают libusb
-                    if self._is_ftdi:
-                        break
-
-                    if attempt < RETRY_COUNT - 1:
-                        if self._has_native_reset:
-                            try: bus.reset_bus()
-                            except: pass
-                        time.sleep(PMBUS_PAUSE)
-                        continue
-                    return None
-            return None
-
-    def read_word_data(self, cmd):
-        if cmd in SKIP_REGISTERS:
-            return None
-
-        bus = self._get_bus()
-        if not bus:
-            return None
-
-        with self._lock:
-            for attempt in range(RETRY_COUNT):
-                try:
-                    val = bus.read_word_data(self.address, cmd)
-                    time.sleep(PMBUS_PAUSE)
-
-                    if (val == 0xFFFF or val is None) and attempt < RETRY_COUNT - 1:
-                        if self._has_native_reset:
-                            bus.reset_bus()
-                        time.sleep(PMBUS_PAUSE)
-                        continue
-
-                    return val if val != 0xFFFF else None
-                except Exception as e:
-                    print(f"[PMBusDevice] Ошибка чтения слова (cmd 0x{cmd:02X}, попытка {attempt}): {e}")
-                    if self._is_ftdi:
-                        break
-
-                    if attempt < RETRY_COUNT - 1:
-                        if self._has_native_reset:
-                            try: bus.reset_bus()
-                            except: pass
-                        time.sleep(PMBUS_PAUSE)
-                        continue
-                    return None
-            return None
-
-    def write_byte_data(self, cmd, val):
-        bus = self._get_bus()
-        if not bus:
-            return False
-        with self._lock:
+            self._page = None
             try:
-                if self._is_ftdi:
-                    def _write():
-                        bus.write_byte_data(self.address, cmd, val & 0xFF)
-                        return True
-                    result = with_timeout(_write, FTDI_TIMEOUT)
-                    time.sleep(PMBUS_PAUSE)
-                    return result is True
-                else:
-                    bus.write_byte_data(self.address, cmd, val & 0xFF)
-                    time.sleep(PMBUS_PAUSE)
-                    return True
-            except Exception:
+                reset = getattr(self._get_bus(), "reset_bus", None)
+                if not callable(reset):
+                    return False
+                reset()
+                return True
+            except Exception as exc:
+                self._error("reset_bus", Cmd.PAGE, exc)
                 return False
 
-    def write_word_data(self, cmd, val):
-        bus = self._get_bus()
-        if not bus:
-            return False
-        with self._lock:
-            try:
-                if self._is_ftdi:
-                    def _write():
-                        bus.write_word_data(self.address, cmd, val & 0xFFFF)
-                        return True
-                    result = with_timeout(_write, FTDI_TIMEOUT)
-                    time.sleep(PMBUS_PAUSE)
-                    return result is True
-                else:
-                    bus.write_word_data(self.address, cmd, val & 0xFFFF)
-                    time.sleep(PMBUS_PAUSE)
-                    return True
-            except Exception:
-                return False
+    def supports(self, cmd, size=None):
+        info = self._regmap.get(cmd)
+        return info is not None and (
+            size is None or info[1] == size
+        )
 
-    def send_byte(self, cmd):
-        bus = self._get_bus()
-        if not bus:
+    def command_code(self, name):
+        for cmd, info in self._regmap.items():
+            if info[0] == name:
+                return cmd
+        return None
+
+    def can_read_register(self, cmd, size=None):
+        info = self._regmap.get(cmd)
+        if info is None or info[1] not in {"byte", "word"}:
             return False
-        with self._lock:
+        if size is not None and info[1] != size:
+            return False
+        if cmd in self._metadata["special_access"]:
+            return False
+        if self._identified or self._identifying:
+            return True
+        return cmd in BOOTSTRAP_READ_COMMANDS
+
+    def _can_read_register(self, cmd, size):
+        return self.can_read_register(cmd, size)
+
+    def can_write_register(self, cmd, size=None):
+        if not self._identified:
+            return False
+        info = self._regmap.get(cmd)
+        if info is None or info[1] not in {"byte", "word"}:
+            return False
+        if size is not None and info[1] != size:
+            return False
+        return cmd not in self._generic_write_blocked
+
+    def _read_transport(
+        self, cmd, size, attempts=RETRY_COUNT, quiet=False
+    ):
+        if size not in {"byte", "word"}:
+            raise ValueError("Scalar size must be byte or word")
+
+        method = (
+            "read_byte_data" if size == "byte"
+            else "read_word_data"
+        )
+        maximum = 0xFF if size == "byte" else 0xFFFF
+        failure = None
+
+        for attempt in range(attempts):
             try:
-                if self._is_ftdi:
-                    def _send():
-                        bus.write_byte(self.address, cmd)
-                        return True
-                    result = with_timeout(_send, FTDI_TIMEOUT)
+                bus = self._get_bus()
+                value = getattr(bus, method)(self.address, cmd)
+                time.sleep(PMBUS_PAUSE)
+
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 0 <= value <= maximum
+                ):
+                    raise OSError(f"Invalid {size} response: {value!r}")
+
+                if (
+                    getattr(bus, "legacy_error_sentinels", True)
+                    and value == maximum
+                ):
+                    raise OSError(
+                        f"Ambiguous legacy response 0x{maximum:X}"
+                    )
+
+                return value
+            except Exception as exc:
+                failure = exc
+                if attempt + 1 < attempts:
                     time.sleep(PMBUS_PAUSE)
-                    return result is True
-                else:
-                    bus.write_byte(self.address, cmd)
-                    time.sleep(PMBUS_PAUSE)
-                    return True
-            except Exception:
-                return False
+
+        self._error(f"read_{size}", cmd, failure, quiet=quiet)
+        return None
+
+    def read_byte_data(self, cmd, quiet=False):
+        with self._lock:
+            if not self.can_read_register(cmd, "byte"):
+                self._error(
+                    "read_byte", cmd,
+                    "Register unavailable for generic byte access",
+                    quiet=quiet,
+                )
+                return None
+            return self._read_transport(cmd, "byte", quiet=quiet)
+
+    def read_word_data(self, cmd, quiet=False):
+        with self._lock:
+            if not self.can_read_register(cmd, "word"):
+                self._error(
+                    "read_word", cmd,
+                    "Register unavailable for generic word access",
+                    quiet=quiet,
+                )
+                return None
+            return self._read_transport(cmd, "word", quiet=quiet)
+
+    def read_block_data(self, cmd):
+        with self._lock:
+            if (
+                not self._identified
+                or not self.supports(cmd, "block")
+                or cmd in self._metadata["special_access"]
+            ):
+                self._error("read_block", cmd, "Block access unavailable")
+                return None
+
+            try:
+                reader = getattr(
+                    self._get_bus(), "read_block_data", None
+                )
+                if not callable(reader):
+                    raise NotImplementedError(
+                        "Driver has no SMBus Block Read implementation"
+                    )
+
+                payload = reader(self.address, cmd)
+                if payload is None or isinstance(payload, int):
+                    raise OSError("Invalid block response")
+                data = bytes(payload)
+
+                if len(data) > 255:
+                    raise OSError("Block exceeds profile maximum")
+
+                expected = self._metadata["block_lengths"].get(cmd)
+                if expected is not None and len(data) != expected:
+                    raise OSError(
+                        f"Expected {expected} bytes, got {len(data)}"
+                    )
+
+                allowed = self._metadata[
+                    "block_allowed_lengths"
+                ].get(cmd)
+                if allowed is not None and len(data) not in allowed:
+                    raise OSError(
+                        f"Unexpected block length {len(data)}"
+                    )
+
+                return list(data)
+            except Exception as exc:
+                self._error("read_block", cmd, exc)
+                return None
 
     def read_i2c_block_data(self, cmd, length=32):
-        if cmd in SKIP_REGISTERS or cmd in FTDI_SKIP_BLOCK:
-            return None
+        # Compatibility name only. Never substitute fixed-length I2C
+        # transactions for a genuine SMBus Block Read.
+        return self.read_block_data(cmd)
 
-        # Для FTDI отключаем block read (может зависать)
-        if self._is_ftdi:
-            return None
+    def _write_transport(self, cmd, value=None, size="byte"):
+        try:
+            bus = self._get_bus()
+            if size == "send":
+                result = bus.write_byte(self.address, cmd)
+            elif size == "byte":
+                result = bus.write_byte_data(
+                    self.address, cmd, value
+                )
+            elif size == "word":
+                result = bus.write_word_data(
+                    self.address, cmd, value
+                )
+            else:
+                raise ValueError("Unsupported write type")
 
-        bus = self._get_bus()
-        if not bus:
-            return None
+            if result is False:
+                raise OSError("Driver reported write failure")
+
+            time.sleep(PMBUS_PAUSE)
+            return True
+        except Exception as exc:
+            self._error(f"write_{size}", cmd, exc)
+            return False
+
+    def _wait_ready(self, timeout=READY_TIMEOUT):
+        if not (self._identified or self._identifying):
+            return False
+
+        if not self.supports(Cmd.MFR_COMMON, "byte"):
+            self._error(
+                "wait_ready", Cmd.MFR_COMMON,
+                "Profile has no readiness register",
+            )
+            return False
+
+        mask = 0x40 if self.name == "LTM4673" else 0x60
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            value = self._read_transport(
+                Cmd.MFR_COMMON, "byte", attempts=1, quiet=True
+            )
+            # Without verified slave ACK, all-ones is not sufficient
+            # evidence that this device is ready.
+            if value is not None and value != 0xFF:
+                if value & mask == mask:
+                    return True
+            time.sleep(PMBUS_PAUSE)
+
+        self._error(
+            "wait_ready", Cmd.MFR_COMMON,
+            f"No unambiguous ready response within {timeout:g} seconds",
+        )
+        return False
+
+    def _valid_page(self, page):
+        return (
+            isinstance(page, int)
+            and not isinstance(page, bool)
+            and 0 <= page < self.num_pages
+        )
+
+    def set_page(self, page):
         with self._lock:
-            try:
-                res = bus.read_i2c_block_data(self.address, cmd, length)
-                time.sleep(PMBUS_PAUSE)
-                return res
-            except Exception:
-                return None
+            if not (self._identified or self._identifying):
+                self._error("set_page", Cmd.PAGE, "Unknown device")
+                return False
+            if not self._valid_page(page):
+                self._error(
+                    "set_page", Cmd.PAGE, f"Invalid page {page!r}"
+                )
+                return False
+
+            self._page = None
+            if not self._wait_ready():
+                return False
+
+            for _ in range(RETRY_COUNT):
+                if not self._write_transport(Cmd.PAGE, page, "byte"):
+                    return False
+                time.sleep(PAGE_PAUSE)
+
+                current = self._read_transport(
+                    Cmd.PAGE, "byte", attempts=1, quiet=True
+                )
+                if current == page:
+                    self._page = page
+                    return True
+
+            self._error(
+                "set_page", Cmd.PAGE,
+                f"PAGE {page} verification failed",
+            )
+            return False
+
+    def _write_checked(self, cmd, value, size):
+        with self._lock:
+            if not self.can_write_register(cmd, size):
+                self._error("write_register", cmd, "Write blocked")
+                return False
+
+            maximum = 0xFF if size == "byte" else 0xFFFF
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= maximum
+            ):
+                self._error(
+                    "write_register", cmd, "Value out of range"
+                )
+                return False
+
+            if self._regmap[cmd][3]:
+                page = self._page
+                if page is None or not self.set_page(page):
+                    return False
+            elif not self._wait_ready():
+                return False
+
+            return self._write_transport(cmd, value, size)
+
+    def write_byte_data(self, cmd, val):
+        return self._write_checked(cmd, val, "byte")
+
+    def write_word_data(self, cmd, val):
+        return self._write_checked(cmd, val, "word")
+
+    def send_byte(self, cmd):
+        with self._lock:
+            action = self._metadata["send_commands"].get(cmd)
+            if (
+                not self._identified
+                or action is None
+                or action[0] not in EXPLICIT_ACTION_NAMES
+            ):
+                self._error("send_byte", cmd, "Action unavailable")
+                return False
+
+            name, paged = action
+            if paged:
+                page = self._page
+                if page is None or not self.set_page(page):
+                    return False
+            elif not self._wait_ready():
+                return False
+
+            if not self._write_transport(cmd, size="send"):
+                return False
+
+            if name in NVM_ACTION_NAMES:
+                time.sleep(0.05)
+                if not self._wait_ready(NVM_TIMEOUT):
+                    return False
+
+            if name in {"RESTORE_USER_ALL", "MFR_RESET"}:
+                self._page = None
+
+            return True
 
     def _rb(self, cmd):
         return self.read_byte_data(cmd)
@@ -260,309 +482,443 @@ class PMBusDevice:
     def _rblock(self, cmd, length=32):
         return self.read_i2c_block_data(cmd, length)
 
-    def set_page(self, page):
-        target_page = page & 0xFF
-        bus = self._get_bus()
-        if not bus:
-            return False
-
-        try:
-            if self._is_ftdi:
-                def _set_page():
-                    bus.write_byte_data(self.address, 0x00, target_page)
-                    return True
-                with_timeout(_set_page, FTDI_TIMEOUT)
-            else:
-                bus.write_byte_data(self.address, 0x00, target_page)
-
-            time.sleep(0.005)
-
-            for _ in range(3):
-                try:
-                    if self._is_ftdi:
-                        def _read_page():
-                            return bus.read_byte_data(self.address, 0x00)
-                        current = with_timeout(_read_page, FTDI_TIMEOUT)
-                    else:
-                        current = bus.read_byte_data(self.address, 0x00)
-
-                    if current == target_page:
-                        time.sleep(0.002)
-                        return True
-
-                    if self._is_ftdi:
-                        def _write_page():
-                            bus.write_byte_data(self.address, 0x00, target_page)
-                            return True
-                        with_timeout(_write_page, FTDI_TIMEOUT)
-                    else:
-                        bus.write_byte_data(self.address, 0x00, target_page)
-                    time.sleep(0.005)
-                except:
-                    time.sleep(0.002)
-        except Exception:
-            pass
-        return False
-
     def identify(self):
-        """Identify PMBus device - works with both CH341 and FTDI."""
-        try:
-            self.clear_faults()
-            time.sleep(0.02)
+        with self._lock:
+            self._reset_profile()
+            self.special_id = None
+            self.last_error = None
+            self.last_errors.clear()
 
-            if self.special_id is None:
-                # Для LTM4673 используем правильную команду 0xE7
-                # Сначала пробуем read_word_data
-                self.special_id = self._rw(0xE7)  # MFR_SPECIAL_ID
-                if self.special_id is None or self.special_id == 0xFFFF:
-                    # Если не получилось, пробуем по байтам
-                    low = self._rb(0xE7)
-                    high = self._rb(0xE8)
-                    if low is not None and high is not None:
-                        self.special_id = (high << 8) | low
-                    else:
-                        return False
+            try:
+                sid = self.read_word_data(
+                    Cmd.MFR_SPECIAL_ID, quiet=True
+                )
+                if sid is None:
+                    return False
 
-            # Проверяем ID для LTM4673
-            if self.special_id == 0x4480 or (self.special_id & 0xFFF0) == 0x4480:
-                self.name = "LTM4673"
-                self.num_pages = 4
-                self.revision = "Rev A"
-            elif self.special_id == 0x0236 or (self.special_id & 0xFFF0) == 0x0230:
-                self.name = "LTM4673"
-                self.num_pages = 4
-                self.revision = "Rev A"
-            else:
-                # Проверяем известные устройства
-                masked = self.special_id & 0xFFF0
-                found = False
-                for kid, (kn, kp) in KNOWN_DEVICES.items():
-                    if masked == (kid & 0xFFF0):
-                        self.name = kn
-                        self.num_pages = kp
-                        found = True
-                        break
-                if not found:
-                    self.name = "LTM4673"  # По умолчанию считаем LTM4673
-                    self.num_pages = 4
-                    self.revision = "?"
+                if sid in {0x0000, 0xFFFF}:
+                    self._error(
+                        "identify", Cmd.MFR_SPECIAL_ID,
+                        f"No recognized ID response: 0x{sid:04X}",
+                        quiet=True,
+                    )
+                    return False
 
-            # Читаем VOUT_MODE для каждой страницы
-            for p in range(self.num_pages):
-                self.set_page(p)
-                vm = self._rb(0x20)  # VOUT_MODE
-                if vm is not None and vm != 0xFF:
-                    e = vm & 0x1F
-                    if e > 15:
-                        e -= 32
-                    self.vout_exp[p] = e
-                else:
-                    self.vout_exp[p] = -13
+                self.special_id = sid
+                if self._expected_id is not None:
+                    if (
+                        sid & 0xFFF0
+                        != self._expected_id & 0xFFF0
+                    ):
+                        raise ValueError(
+                            f"Expected ID 0x{self._expected_id:04X}, "
+                            f"received 0x{sid:04X}"
+                        )
 
-            # Читаем CAPABILITY
-            cap = self._rb(0x19)
-            self.capability = cap if cap is not None and cap != 0xFF else 0
+                regmap, ro, globals_, name, pages = (
+                    build_register_map(sid)
+                )
+                if name is None:
+                    self._error(
+                        "identify", Cmd.MFR_SPECIAL_ID,
+                        f"Unknown ID 0x{sid:04X}",
+                        quiet=True,
+                    )
+                    return False
 
-            self.set_page(0)
-            self.clear_faults()
-            return self.name != "Unknown"
+                self._regmap = regmap
+                self._read_only = ro
+                self._global_cmds = globals_
+                self._metadata = build_device_metadata(sid)
+                self._generic_write_blocked = (
+                    set(ro)
+                    | self._metadata["no_generic_write"]
+                )
+                self.name = name
+                self.num_pages = pages
+                self._identifying = True
 
-        except Exception as e:
-            print(f"[PMBus] identify exception: {e}")
-            return False
+                for page in range(pages):
+                    if not self.set_page(page):
+                        raise OSError(f"Cannot select PAGE {page}")
+
+                    mode = self._rb(Cmd.VOUT_MODE)
+                    if mode is None or mode >> 5 != 0:
+                        raise OSError(
+                            f"Invalid VOUT_MODE on PAGE {page}: {mode!r}"
+                        )
+
+                    exponent = mode & 0x1F
+                    if exponent & 0x10:
+                        exponent -= 0x20
+
+                    expected = self._metadata["vout_exponent"]
+                    if expected is not None and exponent != expected:
+                        raise ValueError(
+                            f"VOUT exponent {exponent}, expected {expected}"
+                        )
+                    self.vout_exp[page] = exponent
+
+                self.capability = self._rb(Cmd.CAPABILITY)
+                self.pmbus_revision = self._rb(Cmd.PMBUS_REVISION)
+                self.revision = f"ID revision 0x{sid & 0x0F:X}"
+
+                if not self.set_page(0):
+                    raise OSError("Cannot restore PAGE 0")
+
+                self._identified = True
+                return True
+
+            except Exception as exc:
+                self._error("identify", Cmd.MFR_SPECIAL_ID, exc)
+                self.name = "Unknown"
+                self._identified = False
+                self._page = None
+                self._generic_write_blocked = set(self._regmap)
+                return False
+            finally:
+                self._identifying = False
+
+    def _read_scalar(self, cmd):
+        if not self.can_read_register(cmd):
+            return None
+        size = self._regmap[cmd][1]
+        if size == "byte":
+            return self._rb(cmd)
+        return self._rw(cmd)
+
+    def _decode(self, cmd, raw, page, custom=False):
+        if raw is None:
+            return None
+
+        info = self._regmap[cmd]
+        if custom and cmd in self._metadata["custom_formats"]:
+            signed, scale, _ = self._metadata["custom_formats"][cmd]
+            bits = 8 if info[1] == "byte" else 16
+            value = raw
+            if signed and value & (1 << (bits - 1)):
+                value -= 1 << bits
+            return value * scale
+
+        exponent = self.vout_exp.get(page)
+        if info[2] == "L16" and exponent is None:
+            self._error("decode", cmd, "VOUT exponent unavailable")
+            return None
+
+        return decode_value(
+            raw, info[2], exponent if exponent is not None else -13
+        )
+
+    def read_register(self, page, cmd):
+        with self._lock:
+            if not self._identified or not self.can_read_register(cmd):
+                self._error(
+                    "read_register", cmd,
+                    "Generic register read unavailable",
+                )
+                return None
+
+            if self._regmap[cmd][3] and not self.set_page(page):
+                return None
+            return self._read_scalar(cmd)
+
+    def _config_commands(self, paged):
+        result = []
+        for cmd, info in sorted(self._regmap.items()):
+            if info[3] != paged:
+                continue
+            if not self.can_read_register(cmd):
+                continue
+            if cmd in STATUS_COMMANDS or cmd in TELEMETRY_COMMANDS:
+                continue
+            if cmd in self._read_only or cmd == Cmd.PAGE:
+                continue
+            result.append(cmd)
+        return result
+
+    def _read_config(self, paged, page=0):
+        with self._lock:
+            if not self._identified:
+                return {}
+
+            ready = not paged or self.set_page(page)
+            result = {}
+            for cmd in self._config_commands(paged):
+                name, _, fmt, _ = self._regmap[cmd]
+                raw = self._read_scalar(cmd) if ready else None
+                result[name] = {
+                    "raw": raw,
+                    "value": self._decode(cmd, raw, page),
+                    "cmd": cmd,
+                    "fmt": fmt,
+                    "writable": self.can_write_register(cmd),
+                }
+            return result
 
     def read_global_config(self):
-        cfg = {}
-        for cmd_code, (name, size, fmt, is_paged) in self._regmap.items():
-            if is_paged or cmd_code in SKIP_REGISTERS or size == 'block':
-                continue
-            if 0x78 <= cmd_code <= 0x80 or 0x88 <= cmd_code <= 0x97:
-                continue
-            if cmd_code not in [0x35, 0x36, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x01, 0x02, 0x10]:
-                continue
-            r = self._rw(cmd_code) if size == 'word' else self._rb(cmd_code)
-            if r is None or (size == 'word' and r == 0xFFFF) or (size == 'byte' and r == 0xFF):
-                cfg[name] = {'raw': None, 'value': None, 'cmd': cmd_code, 'fmt': fmt}
-            else:
-                val = l11_to_float(r) if fmt == 'L11' else (l16_to_float(r, self.vout_exp.get(0, -13)) if fmt == 'L16' else r)
-                cfg[name] = {'raw': r, 'value': val, 'cmd': cmd_code, 'fmt': fmt}
-        return cfg
+        return self._read_config(False)
 
     def read_channel_config(self, page=0):
-        with self._lock:
-            self.set_page(page)
-            time.sleep(0.01)
-            exp = self.vout_exp.get(page, -13)
-            cfg = {}
-            for cmd_code, (name, size, fmt, is_paged) in self._regmap.items():
-                if not is_paged or cmd_code in SKIP_REGISTERS or size == 'block':
-                    continue
-                if 0x78 <= cmd_code <= 0x80 or 0x88 <= cmd_code <= 0x97:
-                    continue
+        result = self._read_config(True, page)
+        if self._identified and self.supports(Cmd.WRITE_PROTECT, "byte"):
+            raw = self.read_register(0, Cmd.WRITE_PROTECT)
+            result["WRITE_PROTECT"] = {
+                "raw": raw,
+                "value": raw,
+                "cmd": Cmd.WRITE_PROTECT,
+                "fmt": "BYTE",
+                "writable": self.can_write_register(Cmd.WRITE_PROTECT),
+            }
+        return result
 
-                r = self._rw(cmd_code) if size == 'word' else self._rb(cmd_code)
-                if r is None or (size == 'word' and r == 0xFFFF) or (size == 'byte' and r == 0xFF):
-                    cfg[name] = {'raw': None, 'value': None, 'cmd': cmd_code, 'fmt': fmt}
-                else:
-                    val = l11_to_float(r) if fmt == 'L11' else (l16_to_float(r, exp) if fmt == 'L16' else r)
-                    cfg[name] = {'raw': r, 'value': val, 'cmd': cmd_code, 'fmt': fmt}
-        return cfg
-
-    def write_val(self, page, cmd, value, fmt):
+    def _read_named_telemetry(self, names, page):
+        result = dict.fromkeys(names)
         with self._lock:
-            self.set_page(page)
-            time.sleep(0.01)
-            if fmt == 'BYTE':
-                return self._wb(cmd, int(value) & 0xFF)
-            if fmt == 'L16':
-                exp = self.vout_exp.get(page, -13)
-                return self._ww(cmd, float_to_l16(value, exp))
-            elif fmt == 'L11':
-                return self._ww(cmd, float_to_l11(value))
-        return False
+            if not self._identified or not self.set_page(page):
+                return result
+
+            for label, name in names.items():
+                cmd = self.command_code(name)
+                if cmd is None or not self.can_read_register(cmd):
+                    continue
+                raw = self._read_scalar(cmd)
+                result[label] = self._decode(
+                    cmd, raw, page, custom=True
+                )
+        return result
 
     def read_global_telemetry(self):
-        telem = {}
-        with self._lock:
-            self.set_page(0)
-            time.sleep(0.01)
-
-            global_cmds = {
-                0x88: 'VIN',
-                0x89: 'IIN',
-                0x8E: 'TEMP_IC',
-                0x97: 'PIN'
-            }
-            for cmd, key in global_cmds.items():
-                if cmd in [0x89, 0x97]:
-                    time.sleep(0.005)
-
-                r = self._rw(cmd)
-                if r is None or r == 0xFFFF:
-                    telem[key] = None
-                else:
-                    telem[key] = l11_to_float(r)
-        return telem
+        names = {
+            "VIN": "READ_VIN",
+            "IIN": "READ_IIN",
+            "TEMP_IC": "READ_TEMPERATURE_2",
+        }
+        if self.name in {"LTM4673", "LTM4678"}:
+            names["PIN"] = "READ_PIN"
+        result = self._read_named_telemetry(names, 0)
+        result.setdefault("PIN", None)
+        return result
 
     def read_channel_telemetry(self, page=0):
-        telem = {}
-        with self._lock:
-            self.set_page(page)
-            time.sleep(0.01)
+        names = {
+            "VOUT": "READ_VOUT",
+            "IOUT": "READ_IOUT",
+            "POUT": "READ_POUT",
+            "TEMP1": "READ_TEMPERATURE_1",
+        }
+        if self.name == "LTM4677":
+            names["IIN"] = "MFR_READ_IIN"
+            names["DUTY"] = "READ_DUTY_CYCLE"
+        elif self.name == "LTM4678":
+            names["FREQ"] = "READ_FREQUENCY"
 
-            exp = self.vout_exp.get(page, -13)
-            telemetry_cmds = {
-                0x8B: 'VOUT',
-                0x8C: 'IOUT',
-                0x96: 'POUT',
-                0x8D: 'TEMP1',
-            }
-            for cmd, name in telemetry_cmds.items():
-                if name == 'POUT':
-                    time.sleep(0.005)
-
-                r = self._rw(cmd)
-                if r is None or r == 0xFFFF:
-                    telem[name] = None
-                else:
-                    if name == 'VOUT':
-                        val = l16_to_float(r, exp)
-                    else:
-                        val = l11_to_float(r)
-                    telem[name] = val
-        return telem
+        result = self._read_named_telemetry(names, page)
+        for label in ("IIN", "PIN", "DUTY", "FREQ"):
+            result.setdefault(label, None)
+        return result
 
     def read_telemetry(self, page=0):
-        t = {}
         with self._lock:
-            t.update(self.read_global_telemetry())
-            t.update(self.read_channel_telemetry(page))
-        return t
+            result = self.read_global_telemetry()
+            for label, value in self.read_channel_telemetry(page).items():
+                if label not in result or value is not None:
+                    result[label] = value
+            return result
 
     def read_global_status(self):
-        with self._lock:
-            self.set_page(0)
-            time.sleep(0.01)
-            status_input = self._rb(Cmd.STATUS_INPUT)
-            status_cml = self._rb(Cmd.STATUS_CML)
-        return {
-            'STATUS_INPUT': status_input,
-            'STATUS_CML':   status_cml,
+        result = {
+            "STATUS_INPUT": None,
+            "STATUS_CML": None,
         }
+
+        with self._lock:
+            global_commands = (
+                ("MFR_COMMON", Cmd.MFR_COMMON, "byte"),
+                ("MFR_PADS", Cmd.MFR_PADS, "word"),
+            )
+
+            available = {}
+            for name, cmd, size in global_commands:
+                info = self._regmap.get(cmd)
+                if (
+                    info is not None
+                    and info[1] == size
+                    and not info[3]
+                    and self.can_read_register(cmd, size)
+                ):
+                    result[name] = None
+                    available[name] = cmd
+
+            if not self._identified:
+                return result
+
+            if "MFR_COMMON" in available:
+                common = self._read_scalar(
+                    available["MFR_COMMON"]
+                )
+                result["MFR_COMMON"] = common
+
+                if self.name == "LTM4673":
+                    if common is None or not (common & 0x40):
+                        return result
+
+            if "MFR_PADS" in available:
+                result["MFR_PADS"] = self._read_scalar(
+                    available["MFR_PADS"]
+                )
+
+            if self.can_read_register(Cmd.STATUS_INPUT, "byte"):
+                result["STATUS_INPUT"] = self._rb(
+                    Cmd.STATUS_INPUT
+                )
+
+            if self.can_read_register(Cmd.STATUS_CML, "byte"):
+                result["STATUS_CML"] = self._rb(
+                    Cmd.STATUS_CML
+                )
+
+        return result
 
     def read_channel_status(self, page=0):
-        with self._lock:
-            self.set_page(page)
-            time.sleep(0.01)
-            status_word = self._rw(Cmd.STATUS_WORD)
-            if status_word == 0xFFFF:
-                status_word = None
-            status_vout = self._rb(Cmd.STATUS_VOUT)
-            status_iout = self._rb(Cmd.STATUS_IOUT)
-            status_temp = self._rb(Cmd.STATUS_TEMPERATURE)
-            status_mfr = self._rb(Cmd.STATUS_MFR_SPECIFIC)
-        return {
-            'STATUS_WORD':        status_word,
-            'STATUS_VOUT':        status_vout,
-            'STATUS_IOUT':        status_iout,
-            'STATUS_TEMPERATURE': status_temp,
-            'STATUS_MFR':         status_mfr,
+        commands = {
+            "STATUS_WORD": Cmd.STATUS_WORD,
+            "STATUS_VOUT": Cmd.STATUS_VOUT,
+            "STATUS_IOUT": Cmd.STATUS_IOUT,
+            "STATUS_TEMPERATURE": Cmd.STATUS_TEMPERATURE,
+            "STATUS_MFR": Cmd.STATUS_MFR_SPECIFIC,
         }
+        result = dict.fromkeys(commands)
+        with self._lock:
+            if not self._identified or not self.set_page(page):
+                return result
+            for name, cmd in commands.items():
+                result[name] = self._read_scalar(cmd)
+        return result
 
     def read_status(self, page=0):
-        s = {}
         with self._lock:
-            s.update(self.read_global_status())
-            s.update(self.read_channel_status(page))
-        return s
-
-    def clear_faults(self):
-        self._rb(0x7E)
-        return self._send(Cmd.CLEAR_FAULTS)
-
-    def store_user_all(self):
-        return self._send(Cmd.STORE_USER_ALL)
-
-    def restore_user_all(self):
-        return self._send(Cmd.RESTORE_USER_ALL)
-
-    def read_full_dump(self, page=0):
-        exp = self.vout_exp.get(page, -13)
-        regmap = self._regmap
-        ro = self._read_only
-        dump = []
-        with self._lock:
-            self.set_page(page)
-            time.sleep(0.01)
-            for cmd_code in sorted(regmap.keys()):
-                if cmd_code in SKIP_REGISTERS:
-                    continue
-                rname, size, fmt, is_paged = regmap[cmd_code]
-                if size == 'block':
-                    continue
-
-                if cmd_code in [0x89, 0x96, 0x97]:
-                    time.sleep(0.005)
-
-                raw = self._rb(cmd_code) if size == 'byte' else self._rw(cmd_code)
-                dump.append({
-                    'page': page, 'cmd': cmd_code, 'name': rname,
-                    'size': size, 'format': fmt, 'is_paged': is_paged,
-                    'raw': raw,
-                    'decoded': (decode_value(raw, fmt, exp)
-                            if raw is not None else None),
-                    'readonly': cmd_code in ro,
-                })
-        return dump
+            result = self.read_global_status()
+            result.update(self.read_channel_status(page))
+            return result
 
     def write_register(self, page, cmd_code, raw_value, size):
-        if cmd_code in self._read_only or cmd_code in SKIP_REGISTERS:
-            return False
         with self._lock:
-            self.set_page(page)
-            time.sleep(0.01)
-            if size == 'byte':
-                return self._wb(cmd_code, int(raw_value) & 0xFF)
-            elif size == 'word':
-                return self._ww(cmd_code, int(raw_value) & 0xFFFF)
+            if not self.can_write_register(cmd_code, size):
+                self._error("write_register", cmd_code, "Write blocked")
+                return False
+            if self._regmap[cmd_code][3]:
+                if not self.set_page(page):
+                    return False
+            return self._write_checked(cmd_code, raw_value, size)
+
+    def write_val(self, page, cmd, value, fmt):
+        info = self._regmap.get(cmd)
+        if info is None or not self.can_write_register(cmd):
+            self._error("write_val", cmd, "Write blocked")
+            return False
+
+        try:
+            if fmt != info[2]:
+                raise ValueError("Register format mismatch")
+
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError("Value must be finite")
+
+            if fmt in {"BYTE", "RAW"}:
+                if not number.is_integer():
+                    raise ValueError("Raw value must be integral")
+                raw = int(number)
+
+            elif fmt == "L16":
+                exponent = self.vout_exp.get(page)
+                if exponent is None:
+                    raise ValueError("VOUT exponent unavailable")
+                if not 0 <= number <= 0xFFFF * (2.0 ** exponent):
+                    raise ValueError("L16 value out of range")
+                raw = encode_value(number, fmt, exponent)
+
+            elif fmt == "L11":
+                # The existing encoder uses a symmetric mantissa limit.
+                if not -(1023 * 2 ** 15) <= number <= 1023 * 2 ** 15:
+                    raise ValueError("L11 value out of range")
+                raw = encode_value(number, fmt)
+
+            else:
+                raise ValueError(f"Unsupported format {fmt}")
+
+            return self.write_register(page, cmd, raw, info[1])
+
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._error("write_val", cmd, exc)
+            return False
+
+    def _send_named(self, name):
+        for cmd, action in self._metadata["send_commands"].items():
+            if action[0] == name:
+                return self.send_byte(cmd)
+        self._error("send_named", 0, f"Unsupported action {name}")
         return False
+
+    def clear_faults(self, page=None):
+        with self._lock:
+            if not self._identified:
+                return False
+            action = self._metadata["send_commands"].get(Cmd.CLEAR_FAULTS)
+            if action is None:
+                return False
+            if page is not None and not self._valid_page(page):
+                return False
+            if not action[1]:
+                return self.send_byte(Cmd.CLEAR_FAULTS)
+
+            previous = self._page
+            success = True
+            pages = range(self.num_pages) if page is None else [page]
+            for selected in pages:
+                if not self.set_page(selected):
+                    success = False
+                    break
+                if not self.send_byte(Cmd.CLEAR_FAULTS):
+                    success = False
+                    break
+
+            if previous is not None and not self.set_page(previous):
+                success = False
+            return success
+
+    def store_user_all(self):
+        return self._send_named("STORE_USER_ALL")
+
+    def restore_user_all(self):
+        with self._lock:
+            if not self._send_named("RESTORE_USER_ALL"):
+                return False
+            return self.identify()
+
+    def read_full_dump(self, page=0):
+        with self._lock:
+            if not self._identified:
+                raise RuntimeError("Device is not identified")
+            if not self.set_page(page):
+                raise OSError(f"Cannot select PAGE {page}")
+
+            result = []
+            for cmd, info in sorted(self._regmap.items()):
+                if not self.can_read_register(cmd):
+                    continue
+
+                name, size, fmt, paged = info
+                raw = self._read_scalar(cmd)
+                result.append({
+                    "page": page,
+                    "cmd": cmd,
+                    "name": name,
+                    "size": size,
+                    "format": fmt,
+                    "is_paged": paged,
+                    "raw": raw,
+                    "decoded": self._decode(cmd, raw, page),
+                    "readonly": not self.can_write_register(cmd, size),
+                })
+            return result
