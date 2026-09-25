@@ -1,4 +1,3 @@
-# core/ftdi_i2c.py
 """FTDI I2C transport using PyFtdi.
 
 Scalar SMBus-compatible operations:
@@ -21,12 +20,15 @@ from contextlib import contextmanager
 from .base_driver import I2CDriverBase
 
 try:
-    from pyftdi.i2c import I2cController
     from pyftdi.ftdi import Ftdi
+    from pyftdi.i2c import I2cController
+    from pyftdi.usbtools import UsbTools
+
     HAS_PYFTDI = True
 except ImportError:
-    I2cController = None
     Ftdi = None
+    I2cController = None
+    UsbTools = None
     HAS_PYFTDI = False
 
 
@@ -44,20 +46,37 @@ MAX_I2C_BLOCK_LENGTH = 32
 
 
 def find_ftdi_devices():
-    """Return supported devices in PyFtdi enumeration order."""
     if not HAS_PYFTDI:
         return []
 
     try:
-        return [
-            desc
-            for desc, _interfaces in Ftdi.list_devices()
-            if desc.pid in I2C_PIDS
-        ]
+        UsbTools.flush_cache()
+
+        result = []
+
+        for item in Ftdi.list_devices():
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+            ):
+                desc, _interfaces = item
+            else:
+                desc = item
+
+            if not hasattr(desc, "vid") or not hasattr(desc, "pid"):
+                logger.warning(
+                    "Ignoring invalid FTDI descriptor: %r",
+                    desc,
+                )
+                continue
+
+            result.append(desc)
+
+        return result
+
     except Exception:
         logger.exception("FTDI enumeration failed")
         return []
-
 
 def _url_for(desc, devices):
     """Select interface 1 without silently choosing another device."""
