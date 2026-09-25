@@ -15,7 +15,7 @@ from gui.status_defs import (
     render_mfr_pads,
     set_status_indicator,
 )
-
+from core.pmbus_device import TransportDisconnectedError
 
 class DeviceTab(ttk.Frame):
 
@@ -24,6 +24,8 @@ class DeviceTab(ttk.Frame):
         self.device = device
         self.channels = []
         self.monitoring = False
+        self._monitor_after_id = None
+        self._disconnected = False
         self._dump_data = {}
 
         self.global_telem_lbl = {}
@@ -34,6 +36,7 @@ class DeviceTab(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
+        self.device_info_vars = {}
         self._build_top()
         self._build_channels()
         self._build_buttons()
@@ -49,28 +52,57 @@ class DeviceTab(ttk.Frame):
         left.pack(side='left', fill='y', padx=(0, 4))
 
         info = ttk.LabelFrame(left, text=" Device ")
-        info.pack(fill='x', padx=2, pady=(0, 2))
-        n_ch = f"{self.device.num_pages} channel(s)"
-        for i, (lb, val) in enumerate([
-            ("IC:",      self.device.name),
-            ("Address:", f"0x{self.device.address:02X}"),
-            ("ID:",      f"0x{self.device.special_id:04X}"
-                         if self.device.special_id else "N/A"),
-            ("Revision:", self.device.revision),
-            ("Pages:",   n_ch),
+        info.pack(fill="x", padx=2, pady=(0, 2))
+
+        info_items = [
+            ("IC", self.device.name),
+            ("Address", f"0x{self.device.address:02X}"),
             (
-                "Capability:",
-                f"0x{self.device.capability:02X}"
-                if getattr(self.device, 'capability', None) is not None
-                else "N/A"
+                "ID",
+                f"0x{self.device.special_id:04X}"
+                if self.device.special_id is not None
+                else "N/A",
             ),
-        ]):
-            ttk.Label(info, text=lb,
-                      font=('Segoe UI', 8, 'bold')).grid(
-                row=i, column=0, sticky='w', padx=3, pady=0)
-            ttk.Label(info, text=val,
-                      font=('Segoe UI', 8)).grid(
-                row=i, column=1, sticky='w', padx=3, pady=0)
+            ("Revision", self.device.revision),
+            ("Pages", str(self.device.num_pages)),
+            (
+                "Capability",
+                f"0x{self.device.capability:02X}"
+                if self.device.capability is not None
+                else "N/A",
+            ),
+            ("VOUT_MODE", self.device.get_vout_mode_text()),
+        ]
+
+        for row, (label, value) in enumerate(info_items):
+            ttk.Label(
+                info,
+                text=label,
+                font=("Segoe UI", 8, "bold"),
+            ).grid(
+                row=row,
+                column=0,
+                sticky="nw",
+                padx=3,
+                pady=0,
+            )
+
+            variable = tk.StringVar(value=str(value))
+            self.device_info_vars[label] = variable
+
+            ttk.Label(
+                info,
+                textvariable=variable,
+                font=("Segoe UI", 8),
+                justify="left",
+                anchor="w",
+            ).grid(
+                row=row,
+                column=1,
+                sticky="w",
+                padx=3,
+                pady=0,
+            )
 
         gt_fr = ttk.LabelFrame(left, text=" Global Telemetry ")
         gt_fr.pack(fill='x', padx=2, pady=(0, 2))
@@ -95,42 +127,122 @@ class DeviceTab(ttk.Frame):
                       font=('Segoe UI', 8)).pack(side='left')
             self.global_telem_lbl[key] = vl
 
-        # -- middle: VIN config --
-        gc = ttk.LabelFrame(top, text=" VIN Config (global) ")
-        gc.pack(side='left', fill='y', padx=4)
-        for i, (key, label, unit) in enumerate([
-            ('VIN_ON',             'VIN On',        'V'),
-            ('VIN_OFF',            'VIN Off',       'V'),
-            ('VIN_OV_FAULT_LIMIT', 'VIN OV Fault',  'V'),
-            ('VIN_OV_WARN_LIMIT',  'VIN OV Warn',   'V'),
-            ('VIN_UV_WARN_LIMIT',  'VIN UV Warn',   'V'),
-            ('VIN_UV_FAULT_LIMIT', 'VIN UV Fault',  'V'),
-        ]):
-            ttk.Label(gc, text=label, width=12, anchor='w',
-                      font=('Segoe UI', 8)).grid(
-                row=i, column=0, padx=2, pady=0, sticky='w')
-            v = tk.StringVar(value="---")
-            ttk.Entry(gc, textvariable=v, width=9,
-                      justify='right',
-                      font=('Consolas', 9)).grid(
-                row=i, column=1, padx=1, pady=0)
-            ttk.Label(gc, text=unit, width=2,
-                      font=('Segoe UI', 8)).grid(
-                row=i, column=2, padx=1, pady=0)
-            self.global_cfg_vars[key] = v
-            _c = tk.Canvas(gc, width=14, height=14,
-                          highlightthickness=0, bd=0, cursor='hand2')
-            _c.create_polygon(3, 2, 12, 7, 3, 12,
-                             fill='#4CAF50', outline='#2E7D32',
-                             tags='tri')
-            _c.grid(row=i, column=3, padx=(0, 2), pady=0)
-            _c.bind('<Button-1>',
-                    lambda e, k=key: self._write_single_global(k))
-            _c.bind('<Enter>',
-                    lambda e, c=_c: c.itemconfig('tri', fill='#66BB6A'))
-            _c.bind('<Leave>',
-                    lambda e, c=_c: c.itemconfig('tri', fill='#4CAF50'))
-            self._global_wr_btns[key] = _c
+        # -- middle: global configuration --
+        gc = ttk.LabelFrame(top, text=" Global Config ")
+        gc.pack(side="left", fill="y", padx=4)
+
+        global_config_items = [
+            ("VIN_ON", "VIN On", "V"),
+            ("VIN_OFF", "VIN Off", "V"),
+            ("VIN_OV_FAULT_LIMIT", "VIN OV Fault", "V"),
+            ("VIN_OV_WARN_LIMIT", "VIN OV Warn", "V"),
+            ("VIN_UV_WARN_LIMIT", "VIN UV Warn", "V"),
+            ("VIN_UV_FAULT_LIMIT", "VIN UV Fault", "V"),
+            ("FREQUENCY_SWITCH", "Frequency", "kHz"),
+        ]
+
+        supported_items = []
+        for key, label, unit in global_config_items:
+            cmd = self.device.command_code(key)
+            if cmd is None:
+                continue
+
+            descriptor = self.device._regmap.get(cmd)
+            if descriptor is None or descriptor[3]:
+                continue
+
+            if not self.device.can_read_register(cmd):
+                continue
+
+            supported_items.append((key, label, unit, cmd))
+
+        for i, (key, label, unit, cmd) in enumerate(supported_items):
+            writable = self.device.can_write_register(cmd)
+
+            ttk.Label(
+                gc,
+                text=label,
+                width=14,
+                anchor="w",
+                font=("Segoe UI", 8),
+            ).grid(
+                row=i,
+                column=0,
+                padx=2,
+                pady=0,
+                sticky="w",
+            )
+
+            variable = tk.StringVar(value="---")
+            self.global_cfg_vars[key] = variable
+
+            ttk.Entry(
+                gc,
+                textvariable=variable,
+                width=9,
+                justify="right",
+                font=("Consolas", 9),
+                state="normal" if writable else "readonly",
+            ).grid(
+                row=i,
+                column=1,
+                padx=1,
+                pady=0,
+            )
+
+            ttk.Label(
+                gc,
+                text=unit,
+                width=4,
+                font=("Segoe UI", 8),
+            ).grid(
+                row=i,
+                column=2,
+                padx=1,
+                pady=0,
+                sticky="w",
+            )
+
+            if not writable:
+                continue
+
+            button = tk.Canvas(
+                gc,
+                width=14,
+                height=14,
+                highlightthickness=0,
+                bd=0,
+                cursor="hand2",
+            )
+            button.create_polygon(
+                3, 2, 12, 7, 3, 12,
+                fill="#4CAF50",
+                outline="#2E7D32",
+                tags="tri",
+            )
+            button.grid(
+                row=i,
+                column=3,
+                padx=(0, 2),
+                pady=0,
+            )
+            button.bind(
+                "<Button-1>",
+                lambda event, k=key: self._write_single_global(k),
+            )
+            button.bind(
+                "<Enter>",
+                lambda event, widget=button: widget.itemconfig(
+                    "tri", fill="#66BB6A"
+                ),
+            )
+            button.bind(
+                "<Leave>",
+                lambda event, widget=button: widget.itemconfig(
+                    "tri", fill="#4CAF50"
+                ),
+            )
+            self._global_wr_btns[key] = button
 
         # -- right: global status TreeView --
         gs = ttk.LabelFrame(top, text=" Global Status ")
@@ -260,8 +372,120 @@ class DeviceTab(ttk.Frame):
             w.itemconfig('tri', fill=color)
             self.after(600, lambda c=w: c.itemconfig('tri', fill='#4CAF50'))
 
+    def update_device_info(self):
+        values = {
+            "IC": self.device.name,
+            "Address": f"0x{self.device.address:02X}",
+            "ID": (
+                f"0x{self.device.special_id:04X}"
+                if self.device.special_id is not None
+                else "N/A"
+            ),
+            "Revision": self.device.revision,
+            "Pages": f"{self.device.num_pages} channel(s)",
+            "Capability": (
+                f"0x{self.device.capability:02X}"
+                if self.device.capability is not None
+                else "N/A"
+            ),
+            "VOUT_MODE": self.device.get_vout_mode_text(),
+        }
+
+        for key, value in values.items():
+            variable = self.device_info_vars.get(key)
+            if variable is not None:
+                variable.set(str(value))
+
+    def _disable_controls(self, parent):
+        for widget in parent.winfo_children():
+            if isinstance(
+                widget,
+                (
+                    ttk.Button,
+                    ttk.Entry,
+                    ttk.Combobox,
+                    ttk.Checkbutton,
+                    ttk.Radiobutton,
+                    ttk.Spinbox,
+                ),
+            ):
+                widget.state(["disabled"])
+
+            elif isinstance(
+                widget,
+                (
+                    tk.Button,
+                    tk.Entry,
+                    tk.Checkbutton,
+                    tk.Radiobutton,
+                    tk.Spinbox,
+                    tk.Scale,
+                ),
+            ):
+                widget.configure(state="disabled")
+
+            elif isinstance(widget, tk.Canvas):
+                # Disable the Canvas write buttons used in this GUI.
+                for sequence in (
+                    "<Button-1>",
+                    "<ButtonRelease-1>",
+                    "<Enter>",
+                    "<Leave>",
+                ):
+                    widget.unbind(sequence)
+
+                widget.configure(cursor="")
+                widget.itemconfigure("all", state="disabled")
+
+            self._disable_controls(widget)
+
+    def _handle_disconnect(self, exc):
+        if self._disconnected:
+            return
+
+        self._disconnected = True
+        self.stop_all()
+
+        self.global_cfg_data = {}
+
+        for variable in self.global_cfg_vars.values():
+            variable.set("STALE")
+
+        for label in self.global_telem_lbl.values():
+            label.configure(text="STALE")
+
+        reset_status_tree(self.global_tree)
+        self.global_tree.insert(
+            "",
+            "end",
+            text="Adapter disconnected; previous data is stale",
+            values=("ERR", "---"),
+            tags=("error",),
+        )
+        self.global_status_ind.configure(
+            text="DISCONNECTED / STALE DATA",
+            fg="#FF8A80",
+        )
+
+        # Channel values may remain visible as historical data.
+        # Disable their controls; do not read the device here.
+        self._disable_controls(self)
+
+        messagebox.showerror(
+            "Adapter disconnected",
+            f"{exc}\n\n"
+            "Current operation stopped. Monitoring stopped.\n"
+            "Previously displayed channel values are stale.\n"
+            "Reconnect the adapter, then use Refresh and Scan.",
+            parent=self,
+        )
+
     def do_read_all(self):
+        if self._disconnected:
+            return
+
         try:
+            self.update_device_info()
             self.global_cfg_data = (
                 self.device.read_global_config()
             )
@@ -302,15 +526,19 @@ class DeviceTab(ttk.Frame):
                     )
                 )
                 channel.update_telemetry(telemetry)
-
                 channel.read_all_reg_groups()
+
+            self._refresh_status()
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(exc)
 
         except Exception as exc:
             messagebox.showerror(
-                "Read error", str(exc)
+                "Read error",
+                str(exc),
+                parent=self,
             )
-        finally:
-            self._refresh_status()
 
     def do_write_all(self):
         errs = []
@@ -365,64 +593,109 @@ class DeviceTab(ttk.Frame):
 
     # monitor
     def toggle_monitor(self):
+        if self._disconnected:
+            return
+
         if self.monitoring:
-            self.monitoring = False
-            self.mon_btn.configure(text="Start Monitor")
-        else:
-            self.monitoring = True
-            self.mon_btn.configure(text="Stop Monitor")
-            self._mon_loop()
+            self.stop_all()
+            return
+
+        self.monitoring = True
+        self.mon_btn.configure(text="Stop Monitor")
+        self._mon_loop()
 
     def _mon_loop(self):
-        if not self.monitoring:
-            return
-        try:
-            gt = self.device.read_global_telemetry()
-            for key in ('VIN', 'IIN', 'PIN', 'TEMP_IC'):
-                v = gt.get(key)
-                lbl = self.global_telem_lbl.get(key)
-                if lbl:
-                    lbl.configure(text=f"{v:.3f}" if v is not None else "N/A")
+        self._monitor_after_id = None
 
-            for ch in self.channels:
-                ct = self.device.read_channel_telemetry(ch.page)
-                ch.update_telemetry(ct)
+        if not self.monitoring or self._disconnected:
+            return
+
+        try:
+            telemetry = self.device.read_global_telemetry()
+
+            for key in ("VIN", "IIN", "PIN", "TEMP_IC"):
+                value = telemetry.get(key)
+                label = self.global_telem_lbl.get(key)
+                if label is not None:
+                    label.configure(
+                        text=(
+                            f"{value:.3f}"
+                            if value is not None
+                            else "N/A"
+                        )
+                    )
+
+            for channel in self.channels:
+                telemetry = (
+                    self.device.read_channel_telemetry(
+                        channel.page
+                    )
+                )
+                channel.update_telemetry(telemetry)
 
             self._refresh_status()
-        except Exception:
-            pass
-        if self.monitoring:
-            self.after(500, self._mon_loop)
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(exc)
+            return
+
+        except Exception as exc:
+            self.stop_all()
+            messagebox.showerror(
+                "Monitor error",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        if self.monitoring and not self._disconnected:
+            self._monitor_after_id = self.after(
+                500,
+                self._mon_loop,
+            )
 
     def _refresh_status(self):
-        for channel in self.channels:
-            try:
-                status = self.device.read_channel_status(
-                    channel.page
-                )
-            except Exception:
-                status = {}
-
-            channel.update_status(status)
+        if self._disconnected:
+            return
 
         try:
-            global_status = self.device.read_global_status()
-        except Exception:
-            global_status = {
-                "STATUS_INPUT": None,
-                "STATUS_CML": None,
-            }
+            for channel in self.channels:
+                try:
+                    status = self.device.read_channel_status(
+                        channel.page
+                    )
+                except TransportDisconnectedError:
+                    raise
+                except Exception:
+                    status = {}
 
-            regmap = getattr(self.device, "_regmap", {})
-            for name, cmd in (
-                ("MFR_PADS", 0xE5),
-                ("MFR_COMMON", 0xEF),
-            ):
-                info = regmap.get(cmd)
-                if info is not None and not info[3]:
-                    global_status[name] = None
+                channel.update_status(status)
 
-        self._update_global_status(global_status)
+            try:
+                global_status = self.device.read_global_status()
+
+            except TransportDisconnectedError:
+                raise
+
+            except Exception:
+                global_status = {
+                    "STATUS_INPUT": None,
+                    "STATUS_CML": None,
+                }
+
+                regmap = getattr(self.device, "_regmap", {})
+                for name, cmd in (
+                    ("MFR_PADS", 0xE5),
+                    ("MFR_COMMON", 0xEF),
+                ):
+                    info = regmap.get(cmd)
+                    if info is not None and not info[3]:
+                        global_status[name] = None
+
+            self._update_global_status(global_status)
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(exc)
 
     def _update_global_status(self, status_data):
         tree = self.global_tree
@@ -568,4 +841,18 @@ class DeviceTab(ttk.Frame):
     def stop_all(self):
         self.monitoring = False
 
+        after_id = self._monitor_after_id
+        self._monitor_after_id = None
 
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
+        if hasattr(self, "mon_btn"):
+            self.mon_btn.configure(text="Start Monitor")
+
+    def destroy(self):
+        self.stop_all()
+        super().destroy()
