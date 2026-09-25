@@ -177,8 +177,13 @@ def build_register_map(special_id=None):
     name, pages, extras = get_device_profile(special_id)
 
     if name is not None:
-        regmap.update(extras.get('register_overrides', {}))
-        read_only.update(extras.get('read_only_extra', set()))
+        regmap.update(extras.get("register_overrides", {}))
+
+        for cmd in extras.get("remove_commands", set()):
+            regmap.pop(cmd, None)
+            read_only.discard(cmd)
+
+        read_only.update(extras.get("read_only_extra", set()))
 
     missing = read_only - regmap.keys()
     if missing:
@@ -236,20 +241,29 @@ def build_device_metadata(special_id=None):
     )
 
     metadata = {
-        'name': name,
-        'pages': pages,
-        'send_commands': send_commands,
-        'special_protocol_commands': special_protocols,
-        'special_access': special_access,
-        'no_generic_write': no_generic_write,
-        'write_one_to_clear': write_one_to_clear,
-        'custom_formats': dict(extras.get('custom_formats', {})),
-        'block_lengths': dict(extras.get('block_lengths', {})),
-        'block_allowed_lengths': dict(
-            extras.get('block_allowed_lengths', {})
+        "name": name,
+        "pages": pages,
+        "send_commands": send_commands,
+        "special_protocols": special_protocols,
+        "special_access": special_access,
+        "no_generic_write": no_generic_write,
+        "write_one_to_clear": write_one_to_clear,
+        "custom_formats": dict(
+            extras.get("custom_formats", {})
         ),
-        'register_units': dict(extras.get('register_units', {})),
-        'vout_exponent': extras.get('vout_exponent'),
+        "block_lengths": dict(
+            extras.get("block_lengths", {})
+        ),
+        "block_allowed_lengths": dict(
+            extras.get("block_allowed_lengths", {})
+        ),
+        "register_units": dict(
+            extras.get("register_units", {})
+        ),
+        "remove_commands": set(
+            extras.get("remove_commands", set())
+        ),
+        "vout_exponent": extras.get("vout_exponent"),
     }
 
     if name is not None:
