@@ -1,4 +1,3 @@
-# drivers/ch341_i2c.py
 """CH341T/CH341A USB-to-I2C transport.
 
 USB failures and incomplete responses raise exceptions.
@@ -136,7 +135,7 @@ class CH341Bus(I2CDriverBase):
             self._write_packet(
                 dev, [CMD_SET | SPEED_100K], timeout=1000
             )
-            self.reset_bus()
+            self._drain(dev)
 
         except Exception:
             self._shared.pop(dev_index, None)
