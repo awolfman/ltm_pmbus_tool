@@ -1,4 +1,3 @@
-# core/pmbus_device.py
 """Profile-aware PMBus access.
 
 Generic access excludes reserved and special-access commands.
@@ -53,6 +52,41 @@ NVM_ACTION_NAMES = EXPLICIT_ACTION_NAMES - {
     "MFR_CLEAR_PEAKS",
 }
 
+class TransportDisconnectedError(RuntimeError):
+    """USB-I2C adapter disappeared during a PMBus transaction."""
+
+
+def _is_device_disconnected(exc):
+    current = exc
+    visited = set()
+
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+
+        if getattr(current, "errno", None) == 19:
+            return True
+
+        text = str(current).lower()
+        if (
+            "no such device" in text
+            or "device has been disconnected" in text
+            or "device disconnected" in text
+            or (
+                "usb device" in text
+                and "disconnected" in text
+            )
+        ):
+            return True
+
+        cause = current.__cause__
+        context = current.__context__
+
+        if cause is not None:
+            current = cause
+        else:
+            current = context
+
+    return False
 
 class PMBusDevice:
     _device_locks = {}
@@ -89,6 +123,7 @@ class PMBusDevice:
         self.capability = None
         self.pmbus_revision = None
         self.vout_exp = {}
+        self.vout_mode = {}
         self._identified = False
         self._identifying = False
         self._page = None
@@ -204,7 +239,9 @@ class PMBusDevice:
         for attempt in range(attempts):
             try:
                 bus = self._get_bus()
-                value = getattr(bus, method)(self.address, cmd)
+                value = getattr(bus, method)(
+                    self.address, cmd
+                )
                 time.sleep(PMBUS_PAUSE)
 
                 if (
@@ -212,10 +249,16 @@ class PMBusDevice:
                     or not isinstance(value, int)
                     or not 0 <= value <= maximum
                 ):
-                    raise OSError(f"Invalid {size} response: {value!r}")
+                    raise OSError(
+                        f"Invalid {size} response: {value!r}"
+                    )
 
                 if (
-                    getattr(bus, "legacy_error_sentinels", True)
+                    getattr(
+                        bus,
+                        "legacy_error_sentinels",
+                        True,
+                    )
                     and value == maximum
                 ):
                     raise OSError(
@@ -223,12 +266,24 @@ class PMBusDevice:
                     )
 
                 return value
+
             except Exception as exc:
+                if _is_device_disconnected(exc):
+                    raise TransportDisconnectedError(
+                        "USB-I2C adapter disconnected during "
+                        f"{method} at 0x{cmd:02X}"
+                    ) from exc
+
                 failure = exc
                 if attempt + 1 < attempts:
                     time.sleep(PMBUS_PAUSE)
 
-        self._error(f"read_{size}", cmd, failure, quiet=quiet)
+        self._error(
+            f"read_{size}",
+            cmd,
+            failure,
+            quiet=quiet,
+        )
         return None
 
     def read_byte_data(self, cmd, quiet=False):
@@ -295,7 +350,14 @@ class PMBusDevice:
                     )
 
                 return list(data)
+
             except Exception as exc:
+                if _is_device_disconnected(exc):
+                    raise TransportDisconnectedError(
+                        "USB-I2C adapter disconnected during "
+                        f"block read at 0x{cmd:02X}"
+                    ) from exc
+
                 self._error("read_block", cmd, exc)
                 return None
 
@@ -326,6 +388,12 @@ class PMBusDevice:
             time.sleep(PMBUS_PAUSE)
             return True
         except Exception as exc:
+            if _is_device_disconnected(exc):
+                raise TransportDisconnectedError(
+                    "USB-I2C adapter disconnected during "
+                    f"write at 0x{cmd:02X}"
+                ) from exc
+
             self._error(f"write_{size}", cmd, exc)
             return False
 
@@ -548,6 +616,8 @@ class PMBusDevice:
                             f"Invalid VOUT_MODE on PAGE {page}: {mode!r}"
                         )
 
+                    self.vout_mode[page] = mode
+
                     exponent = mode & 0x1F
                     if exponent & 0x10:
                         exponent -= 0x20
@@ -569,13 +639,25 @@ class PMBusDevice:
                 self._identified = True
                 return True
 
+            except TransportDisconnectedError:
+                self.name = "Unknown"
+                self._identified = False
+                self._page = None
+                self._generic_write_blocked = set(self._regmap)
+                raise
+
             except Exception as exc:
-                self._error("identify", Cmd.MFR_SPECIAL_ID, exc)
+                self._error(
+                    "identify",
+                    Cmd.MFR_SPECIAL_ID,
+                    exc,
+                )
                 self.name = "Unknown"
                 self._identified = False
                 self._page = None
                 self._generic_write_blocked = set(self._regmap)
                 return False
+
             finally:
                 self._identifying = False
 
@@ -655,6 +737,33 @@ class PMBusDevice:
                 }
             return result
 
+    def get_vout_mode_text(self):
+        modes = getattr(self, "vout_mode", {})
+        if not modes:
+            return "N/A"
+
+        lines = []
+        for page in sorted(modes):
+            mode = modes[page]
+            format_code = (mode >> 5) & 0x07
+
+            if format_code == 0:
+                exponent = mode & 0x1F
+                if exponent & 0x10:
+                    exponent -= 0x20
+
+                lines.append(
+                    f"CH{page}: 0x{mode:02X}, Linear, "
+                    f"exponent {exponent}"
+                )
+            else:
+                lines.append(
+                    f"CH{page}: 0x{mode:02X}, "
+                    f"format code {format_code}"
+                )
+
+        return "\n".join(lines)
+
     def read_global_config(self):
         return self._read_config(False)
 
@@ -706,15 +815,31 @@ class PMBusDevice:
             "POUT": "READ_POUT",
             "TEMP1": "READ_TEMPERATURE_1",
         }
+
         if self.name == "LTM4677":
-            names["IIN"] = "MFR_READ_IIN"
-            names["DUTY"] = "READ_DUTY_CYCLE"
+            if self.command_code("MFR_READ_IIN") is not None:
+                names["IIN"] = "MFR_READ_IIN"
+
+            if self.command_code("READ_DUTY_CYCLE") is not None:
+                names["DUTY"] = "READ_DUTY_CYCLE"
+
         elif self.name == "LTM4678":
-            names["FREQ"] = "READ_FREQUENCY"
+            if self.command_code("READ_FREQUENCY") is not None:
+                names["FREQ"] = "READ_FREQUENCY"
+
+            if self.command_code("READ_DUTY_CYCLE") is not None:
+                names["DUTY"] = "READ_DUTY_CYCLE"
 
         result = self._read_named_telemetry(names, page)
-        for label in ("IIN", "PIN", "DUTY", "FREQ"):
+
+        for label in (
+            "IIN",
+            "PIN",
+            "DUTY",
+            "FREQ",
+        ):
             result.setdefault(label, None)
+
         return result
 
     def read_telemetry(self, page=0):
