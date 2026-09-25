@@ -14,6 +14,7 @@ from gui.status_defs import (
     set_status_indicator,
 )
 from gui.register_group import RegisterGroup
+from core.pmbus_constants import Cmd
 
 OPERATION_OPTS = [
     (0x80, 'On'), (0xA8, 'Margin High'), (0x98, 'Margin Low'),
@@ -46,8 +47,13 @@ STATUS_CMDS = {0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x80}
 TELEM_CMDS = {0x88, 0x89, 0x8B, 0x8C, 0x8D, 0x8E, 0x94, 0x95, 0x96, 0x97}
 # Regs in global panel of device_tab
 GLOBAL_GUI_CMDS = {
-    0x35, 0x36, 0x55, 0x57, 0x58, 0x59,
-    0xE5, 0xEF,
+    0x33,
+    0x35,
+    0x36,
+    0x55,
+    0x58,
+    0xE5,
+    0xEF,
 }
 # Misc already shown or not useful in reg grid
 SKIP_CMDS = {0x00, 0x19, 0x20, 0x98} | STATUS_CMDS | TELEM_CMDS
@@ -111,14 +117,15 @@ class ChannelColumn(ttk.LabelFrame):
             ('TEMP1', 'Temperature', 'C',   '#E91E63'),
         ]
 
-        is_ltm4673 = (getattr(self.device, 'name', '') == 'LTM4673' or
-                      getattr(self.device, 'special_id', 0) == 0x0236)
+        if self.device.command_code("READ_DUTY_CYCLE") is not None:
+            telem_items.append(
+                ("DUTY", "Duty Cycle", "%", "#009688")
+            )
 
-        if not is_ltm4673:
-            telem_items.extend([
-                ('DUTY', 'Duty Cycle', '%',   '#009688'),
-                ('FREQ', 'Frequency',  'kHz', '#607D8B'),
-            ])
+        if self.device.command_code("READ_FREQUENCY") is not None:
+            telem_items.append(
+                ("FREQ", "Frequency", "kHz", "#607D8B")
+            )
 
         for key, label, unit, color in telem_items:
             rf = ttk.Frame(tf); rf.pack(fill='x', padx=2, pady=0)
@@ -168,8 +175,9 @@ class ChannelColumn(ttk.LabelFrame):
             ('UT_WARN_LIMIT','UT Warn','C'),('UT_FAULT_LIMIT','UT Fault','C'),
         ])
         self._sec(inner, "Timing", [
-            ('FREQUENCY_SWITCH','Frequency','kHz'),('TON_DELAY','TON Delay','ms'),
-            ('TON_RISE','TON Rise','ms'),('TOFF_DELAY','TOFF Delay','ms'),
+            ("TON_DELAY", "TON Delay", "ms"),
+            ("TON_RISE", "TON Rise", "ms"),
+            ("TOFF_DELAY", "TOFF Delay", "ms"),
         ])
 
         # ---- Control tab ----
@@ -400,32 +408,58 @@ class ChannelColumn(ttk.LabelFrame):
 
     def update_config(self, cfg_data):
         self.cfg_data = cfg_data
-        for key, sv in self.cfg_vars.items():
-            if key in cfg_data and cfg_data[key]['value'] is not None:
-                sv.set(f"{cfg_data[key]['value']:.4f}")
+
+        for key, variable in self.cfg_vars.items():
+            if key not in cfg_data:
+                variable.set("N/S")
+                continue
+
+            item = cfg_data[key]
+            if item.get("value") is not None:
+                variable.set(
+                    f"{item['value']:.4f}"
+                )
             else:
-                sv.set("ERR")
-        # OPERATION combo
-        op = cfg_data.get('OPERATION',{}).get('raw')
+                variable.set("ERR")
+
+        op = cfg_data.get("OPERATION", {}).get("raw")
         if op is not None and self._op_var:
-            m = False
-            for val, desc in OPERATION_OPTS:
-                if val == op: self._op_var.set(f'0x{val:02X}  {desc}'); m=True; break
-            if not m: self._op_var.set(f'0x{op:02X}  Unknown')
-        # ON_OFF_CONFIG combo
-        ooc = cfg_data.get('ON_OFF_CONFIG',{}).get('raw')
+            for value, description in OPERATION_OPTS:
+                if value == op:
+                    self._op_var.set(
+                        f"0x{value:02X}  {description}"
+                    )
+                    break
+            else:
+                self._op_var.set(
+                    f"0x{op:02X}  Unknown"
+                )
+
+        ooc = cfg_data.get("ON_OFF_CONFIG", {}).get("raw")
         if ooc is not None and self._ooc_var:
-            m = False
-            for val, desc in ON_OFF_CFG_OPTS:
-                if val == ooc: self._ooc_var.set(f'0x{val:02X}  {desc}'); m=True; break
-            if not m: self._ooc_var.set(f'0x{ooc:02X}  Unknown')
-        # WRITE_PROTECT combo
-        wp = cfg_data.get('WRITE_PROTECT',{}).get('raw')
+            for value, description in ON_OFF_CFG_OPTS:
+                if value == ooc:
+                    self._ooc_var.set(
+                        f"0x{value:02X}  {description}"
+                    )
+                    break
+            else:
+                self._ooc_var.set(
+                    f"0x{ooc:02X}  Unknown"
+                )
+
+        wp = cfg_data.get("WRITE_PROTECT", {}).get("raw")
         if wp is not None and self._wp_var:
-            m = False
-            for val, desc in WRITE_PROTECT_OPTS:
-                if val == wp: self._wp_var.set(f'0x{val:02X}  {desc}'); m=True; break
-            if not m: self._wp_var.set(f'0x{wp:02X}  Unknown')
+            for value, description in WRITE_PROTECT_OPTS:
+                if value == wp:
+                    self._wp_var.set(
+                        f"0x{value:02X}  {description}"
+                    )
+                    break
+            else:
+                self._wp_var.set(
+                    f"0x{wp:02X}  Unknown"
+                )
 
     def update_status(self, status_data):
         tree = self.status_tree
