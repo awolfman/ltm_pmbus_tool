@@ -5,9 +5,12 @@ import os
 import sys
 import random
 import time
-
+import traceback
 from .bus_factory import create_bus, CH341_OFFSET, FTDI_OFFSET, CP2112_OFFSET
-from .pmbus_device import PMBusDevice
+from .pmbus_device import (
+    PMBusDevice,
+    TransportDisconnectedError,
+)
 
 GLOBAL_ADDRESSES = {0x5A, 0x5B, 0x7C}
 
@@ -239,32 +242,109 @@ def bus_label(bus_num):
 
 
 def scan_bus(bus_num):
+    if is_sim():
+        return [SimDevice()]
+
     devices = []
+    diagnostic_address = 0x4F
+    status_cml_command = 0x7E
 
     print(f"[scan_bus] scanning {bus_label(bus_num)} ...")
-    print(f"[scan_bus] implementation: {scan_bus.__code__.co_filename}")
+    print(
+        f"[scan_bus] implementation: "
+        f"{scan_bus.__code__.co_filename}"
+    )
 
     try:
-        create_bus(bus_num)
+        bus = create_bus(bus_num)
     except Exception as exc:
         print(f"[scan_bus] cannot open bus: {exc}")
-        return devices
+        traceback.print_exc()
+        return []
 
-    print(f"[scan_bus] PMBusDevice: {PMBusDevice.__module__}")
+    previous_cml_state = None
+
+    def check_cml(stage, force=False):
+        nonlocal previous_cml_state
+
+        try:
+            raw = bus.read_byte_data(
+                diagnostic_address,
+                status_cml_command,
+            )
+
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not 0 <= raw <= 0xFF
+            ):
+                raise OSError(
+                    f"Invalid STATUS_CML response: {raw!r}"
+                )
+
+            state = ("value", raw)
+            message = f"STATUS_CML=0x{raw:02X}"
+
+        except Exception as exc:
+            state = ("error", type(exc).__name__, str(exc))
+            message = (
+                f"STATUS_CML read failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if force or state != previous_cml_state:
+            print(
+                f"[CML diagnostic] "
+                f"target=0x{diagnostic_address:02X}, "
+                f"{stage}: {message}"
+            )
+
+        previous_cml_state = state
+
+    check_cml(
+        "after transport open, before address scan",
+        force=True,
+    )
+
+    print(
+        f"[scan_bus] PMBusDevice: "
+        f"{PMBusDevice.__module__}"
+    )
+
     for addr in range(0x08, 0x78):
         if addr in GLOBAL_ADDRESSES:
             continue
 
-        device = PMBusDevice(bus_num, addr)
+        device = None
+        identified = False
+        disconnected = False
 
         try:
+            device = PMBusDevice(bus_num, addr)
             identified = device.identify()
+
+        except TransportDisconnectedError as exc:
+            disconnected = True
+            print(
+                f"[scan_bus] scan aborted: "
+                f"adapter disconnected at 0x{addr:02X}: {exc}"
+            )
+            return []
+
         except Exception as exc:
             print(
                 f"[scan_bus] 0x{addr:02X}: "
                 f"identification exception: {exc}"
             )
-            continue
+            traceback.print_exc()
+
+        finally:
+            if not disconnected:
+                check_cml(
+                    f"after identification attempt at "
+                    f"0x{addr:02X}",
+                    force=(addr == diagnostic_address),
+                )
 
         if identified:
             devices.append(device)
@@ -274,6 +354,11 @@ def scan_bus(bus_num):
                 f"pages={device.num_pages}, "
                 f"id=0x{device.special_id:04X}"
             )
+
+    check_cml(
+        "scan completed, before GUI tab creation",
+        force=True,
+    )
 
     print(f"[scan_bus] found {len(devices)} device(s)")
     return devices
