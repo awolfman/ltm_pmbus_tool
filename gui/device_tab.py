@@ -16,12 +16,22 @@ from gui.status_defs import (
     set_status_indicator,
 )
 from core.pmbus_device import TransportDisconnectedError
+from gui.profiles import (
+    available_telemetry,
+    get_gui_profile,
+)
+from gui.config_notebook import ConfigNotebook
 
 class DeviceTab(ttk.Frame):
 
     def __init__(self, parent, device, **kw):
         super().__init__(parent, **kw)
         self.device = device
+        self.gui_profile = get_gui_profile(device)
+        self._global_telemetry_fields = available_telemetry(
+            device,
+            self.gui_profile.global_telemetry,
+        )
         self.channels = []
         self.monitoring = False
         self._monitor_after_id = None
@@ -107,12 +117,12 @@ class DeviceTab(ttk.Frame):
         gt_fr = ttk.LabelFrame(left, text=" Global Telemetry ")
         gt_fr.pack(fill='x', padx=2, pady=(0, 2))
 
-        for key, label, unit, color in [
-            ('VIN',     'VIN',              'V', '#2196F3'),
-            ('IIN',     'IIN',              'A', '#FF9800'),
-            ('PIN',     'PIN',              'W', '#E91E63'),
-            ('TEMP_IC', 'IC Temperature',   'C', '#795548'),
-        ]:
+        for field in self._global_telemetry_fields:
+            key = field.key
+            label = field.label
+            unit = field.unit
+            color = field.color
+
             rf = ttk.Frame(gt_fr)
             rf.pack(fill='x', padx=3, pady=1)
             ttk.Label(rf, text=label, width=14, anchor='w',
@@ -128,121 +138,35 @@ class DeviceTab(ttk.Frame):
             self.global_telem_lbl[key] = vl
 
         # -- middle: global configuration --
-        gc = ttk.LabelFrame(top, text=" Global Config ")
-        gc.pack(side="left", fill="y", padx=4)
+        gc = ttk.LabelFrame(
+            top,
+            text=" Global Config ",
+            width=370,
+        )
+        gc.pack(
+            side="left",
+            fill="y",
+            expand=False,
+            padx=4,
+        )
 
-        global_config_items = [
-            ("VIN_ON", "VIN On", "V"),
-            ("VIN_OFF", "VIN Off", "V"),
-            ("VIN_OV_FAULT_LIMIT", "VIN OV Fault", "V"),
-            ("VIN_OV_WARN_LIMIT", "VIN OV Warn", "V"),
-            ("VIN_UV_WARN_LIMIT", "VIN UV Warn", "V"),
-            ("VIN_UV_FAULT_LIMIT", "VIN UV Fault", "V"),
-            ("FREQUENCY_SWITCH", "Frequency", "kHz"),
-        ]
+        # Keep a fixed requested width. Long register names
+        # remain accessible through the editor's scrollbar.
+        gc.pack_propagate(False)
 
-        supported_items = []
-        for key, label, unit in global_config_items:
-            cmd = self.device.command_code(key)
-            if cmd is None:
-                continue
-
-            descriptor = self.device._regmap.get(cmd)
-            if descriptor is None or descriptor[3]:
-                continue
-
-            if not self.device.can_read_register(cmd):
-                continue
-
-            supported_items.append((key, label, unit, cmd))
-
-        for i, (key, label, unit, cmd) in enumerate(supported_items):
-            writable = self.device.can_write_register(cmd)
-
-            ttk.Label(
-                gc,
-                text=label,
-                width=14,
-                anchor="w",
-                font=("Segoe UI", 8),
-            ).grid(
-                row=i,
-                column=0,
-                padx=2,
-                pady=0,
-                sticky="w",
-            )
-
-            variable = tk.StringVar(value="---")
-            self.global_cfg_vars[key] = variable
-
-            ttk.Entry(
-                gc,
-                textvariable=variable,
-                width=9,
-                justify="right",
-                font=("Consolas", 9),
-                state="normal" if writable else "readonly",
-            ).grid(
-                row=i,
-                column=1,
-                padx=1,
-                pady=0,
-            )
-
-            ttk.Label(
-                gc,
-                text=unit,
-                width=4,
-                font=("Segoe UI", 8),
-            ).grid(
-                row=i,
-                column=2,
-                padx=1,
-                pady=0,
-                sticky="w",
-            )
-
-            if not writable:
-                continue
-
-            button = tk.Canvas(
-                gc,
-                width=14,
-                height=14,
-                highlightthickness=0,
-                bd=0,
-                cursor="hand2",
-            )
-            button.create_polygon(
-                3, 2, 12, 7, 3, 12,
-                fill="#4CAF50",
-                outline="#2E7D32",
-                tags="tri",
-            )
-            button.grid(
-                row=i,
-                column=3,
-                padx=(0, 2),
-                pady=0,
-            )
-            button.bind(
-                "<Button-1>",
-                lambda event, k=key: self._write_single_global(k),
-            )
-            button.bind(
-                "<Enter>",
-                lambda event, widget=button: widget.itemconfig(
-                    "tri", fill="#66BB6A"
-                ),
-            )
-            button.bind(
-                "<Leave>",
-                lambda event, widget=button: widget.itemconfig(
-                    "tri", fill="#4CAF50"
-                ),
-            )
-            self._global_wr_btns[key] = button
+        self.global_config_editor = ConfigNotebook(
+            gc,
+            self.device,
+            self.gui_profile,
+            page=0,
+            paged=False,
+        )
+        self.global_config_editor.pack(
+            fill="both",
+            expand=True,
+            padx=2,
+            pady=2,
+        )
 
         # -- right: global status TreeView --
         gs = ttk.LabelFrame(top, text=" Global Status ")
@@ -323,14 +247,31 @@ class DeviceTab(ttk.Frame):
         bf.grid(row=2, column=0, sticky='ew', padx=4, pady=(0, 4))
 
         for text, cmd in [
-            ("Read All",      self.do_read_all),
-            ("Write All",     self.do_write_all),
-            ("Store NVM",     self.do_store),
-            ("Restore NVM",   self.do_restore),
-            ("Clear Faults",  self.do_clear),
+            ("Read All", self.do_read_all),
+            ("Write All", self.do_write_all),
+            ("Store NVM", self.do_store),
+            ("Restore NVM", self.do_restore),
+            ("Clear Faults", self.do_clear),
         ]:
-            ttk.Button(bf, text=text, command=cmd).pack(
-                side='left', padx=2)
+            button = ttk.Button(
+                bf,
+                text=text,
+                command=cmd,
+            )
+            button.pack(side="left", padx=2)
+
+            if text == "Write All":
+                button.state(["disabled"])
+
+            if (
+                getattr(self.device, "is_demo", False)
+                and text in {
+                    "Store NVM",
+                    "Restore NVM",
+                    "Clear Faults",
+                }
+            ):
+                button.state(["disabled"])
 
         ttk.Separator(bf, orient='vertical').pack(
             side='left', fill='y', padx=6)
@@ -446,6 +387,13 @@ class DeviceTab(ttk.Frame):
         self._disconnected = True
         self.stop_all()
 
+        if hasattr(self, "global_config_editor"):
+            self.global_config_editor.mark_stale()
+
+        for channel in self.channels:
+            if hasattr(channel, "config_editor"):
+                channel.config_editor.mark_stale()
+
         self.global_cfg_data = {}
 
         for variable in self.global_cfg_vars.values():
@@ -486,39 +434,24 @@ class DeviceTab(ttk.Frame):
 
         try:
             self.update_device_info()
-            self.global_cfg_data = (
-                self.device.read_global_config()
-            )
 
-            for key, variable in self.global_cfg_vars.items():
-                item = self.global_cfg_data.get(key)
-                if item and item["value"] is not None:
-                    variable.set(f"{item['value']:.4f}")
-                elif item is None:
-                    variable.set("N/S")
-                else:
-                    variable.set("ERR")
+            self.global_config_editor.read_all()
 
             global_telemetry = (
                 self.device.read_global_telemetry()
             )
-            for key in ("VIN", "IIN", "PIN", "TEMP_IC"):
+            for key, label in self.global_telem_lbl.items():
                 value = global_telemetry.get(key)
-                label = self.global_telem_lbl.get(key)
-                if label is not None:
-                    label.configure(
-                        text=(
-                            f"{value:.3f}"
-                            if value is not None
-                            else "N/A"
-                        )
+                label.configure(
+                    text=(
+                        f"{value:.3f}"
+                        if value is not None
+                        else "N/A"
                     )
+                )
 
             for channel in self.channels:
-                config = self.device.read_channel_config(
-                    channel.page
-                )
-                channel.update_config(config)
+                channel.read_all_reg_groups()
 
                 telemetry = (
                     self.device.read_channel_telemetry(
@@ -526,7 +459,6 @@ class DeviceTab(ttk.Frame):
                     )
                 )
                 channel.update_telemetry(telemetry)
-                channel.read_all_reg_groups()
 
             self._refresh_status()
 
@@ -541,36 +473,15 @@ class DeviceTab(ttk.Frame):
             )
 
     def do_write_all(self):
-        errs = []
-        for key, sv in self.global_cfg_vars.items():
-            if key not in self.global_cfg_data:
-                continue
-            try:
-                nv = float(sv.get())
-                c = self.global_cfg_data[key]
-                if not self.device.write_val(0, c['cmd'], nv, c['fmt']):
-                    errs.append(f"Global: {key}")
-            except ValueError:
-                if sv.get() not in ("---", "ERR", "N/A"):
-                    errs.append(f"Global: {key}")
-        for ch in self.channels:
-            for key, val_str in ch.get_write_data():
-                if key not in ch.cfg_data:
-                    continue
-                try:
-                    nv = float(val_str)
-                    c = ch.cfg_data[key]
-                    if not self.device.write_val(
-                            ch.page, c['cmd'], nv, c['fmt']):
-                        errs.append(f"CH{ch.page}: {key}")
-                except ValueError:
-                    if val_str not in ("---", "ERR", "N/A"):
-                        errs.append(f"CH{ch.page}: {key}")
-        if errs:
-            messagebox.showwarning(
-                "Warning", "Not written:\n" + "\n".join(errs))
-        else:
-            messagebox.showinfo("OK", "All values written to RAM.")
+        if self._disconnected:
+            return
+
+        messagebox.showinfo(
+            "Write All unavailable",
+            "Batch writing is disabled during the Config migration.\n"
+            "Use an explicit individual register write.",
+            parent=self,
+        )
 
     def do_store(self):
         if messagebox.askyesno("RAM -> NVM", "Save all to NVM?"):
@@ -613,7 +524,7 @@ class DeviceTab(ttk.Frame):
         try:
             telemetry = self.device.read_global_telemetry()
 
-            for key in ("VIN", "IIN", "PIN", "TEMP_IC"):
+            for key in self.global_telem_lbl:
                 value = telemetry.get(key)
                 label = self.global_telem_lbl.get(key)
                 if label is not None:
