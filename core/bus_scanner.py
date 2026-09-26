@@ -243,7 +243,9 @@ def bus_label(bus_num):
 
 def scan_bus(bus_num):
     if is_sim():
-        return [SimDevice()]
+        from core.demo_device import create_demo_devices
+
+        return create_demo_devices()
 
     devices = []
     diagnostic_address = 0x4F
