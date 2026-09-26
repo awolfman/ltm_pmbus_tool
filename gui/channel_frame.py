@@ -15,6 +15,11 @@ from gui.status_defs import (
 )
 from gui.register_group import RegisterGroup
 from core.pmbus_constants import Cmd
+from gui.profiles import (
+    available_telemetry,
+    get_gui_profile,
+)
+from gui.config_notebook import ConfigNotebook
 
 OPERATION_OPTS = [
     (0x80, 'On'), (0xA8, 'Margin High'), (0x98, 'Margin Low'),
@@ -85,6 +90,11 @@ class ChannelColumn(ttk.LabelFrame):
     def __init__(self, parent, device, page, **kw):
         super().__init__(parent, text=f"  CH{page}  ", **kw)
         self.device = device
+        self.gui_profile = get_gui_profile(device)
+        self._telemetry_fields = available_telemetry(
+            device,
+            self.gui_profile.channel_telemetry,
+        )
         self.page = page
         self.cfg_data = {}
         self.cfg_vars = {}
@@ -107,86 +117,74 @@ class ChannelColumn(ttk.LabelFrame):
 
     #   telemetry
     def _build_telemetry(self):
-        tf = ttk.LabelFrame(self, text=" Telemetry ")
-        tf.grid(row=0, column=0, sticky='ew', padx=3, pady=(2,1))
+        frame = ttk.LabelFrame(self, text=" Telemetry ")
+        frame.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=3,
+            pady=(2, 1),
+        )
 
-        telem_items = [
-            ('VOUT',  'VOUT',        'V',   '#4CAF50'),
-            ('IOUT',  'IOUT',        'A',   '#F44336'),
-            ('POUT',  'POUT',        'W',   '#9C27B0'),
-            ('TEMP1', 'Temperature', 'C',   '#E91E63'),
-        ]
+        for field in self._telemetry_fields:
+            row = ttk.Frame(frame)
+            row.pack(fill="x", padx=2, pady=0)
 
-        if self.device.command_code("READ_DUTY_CYCLE") is not None:
-            telem_items.append(
-                ("DUTY", "Duty Cycle", "%", "#009688")
+            ttk.Label(
+                row,
+                text=field.label,
+                width=12,
+                anchor="w",
+                font=("Segoe UI", 8),
+            ).pack(side="left")
+
+            value_label = tk.Label(
+                row,
+                text="---",
+                font=("Consolas", 10, "bold"),
+                fg=field.color,
+                bg="#1a1a2e",
+                width=9,
+                anchor="e",
+                relief="sunken",
+                padx=3,
             )
+            value_label.pack(side="left", padx=2)
 
-        if self.device.command_code("READ_FREQUENCY") is not None:
-            telem_items.append(
-                ("FREQ", "Frequency", "kHz", "#607D8B")
-            )
+            ttk.Label(
+                row,
+                text=field.unit,
+                width=3,
+                font=("Segoe UI", 8),
+            ).pack(side="left")
 
-        for key, label, unit, color in telem_items:
-            rf = ttk.Frame(tf); rf.pack(fill='x', padx=2, pady=0)
-            ttk.Label(rf, text=label, width=12, anchor='w',
-                      font=('Segoe UI',8)).pack(side='left')
-            vl = tk.Label(rf, text="---", font=('Consolas',10,'bold'),
-                          fg=color, bg='#1a1a2e', width=9, anchor='e',
-                          relief='sunken', padx=3)
-            vl.pack(side='left', padx=2)
-            ttk.Label(rf, text=unit, width=3, font=('Segoe UI',8)).pack(side='left')
-            self.telem_lbl[key] = vl
+            self.telem_lbl[field.key] = value_label
 
     #   config
     def _build_config(self):
-        cf = ttk.LabelFrame(self, text=" Config ")
-        cf.grid(row=1, column=0, sticky='nsew', padx=3, pady=1)
-        self._cfg_nb = ttk.Notebook(cf)
-        self._cfg_nb.pack(fill='both', expand=True)
+        frame = ttk.LabelFrame(self, text=" Config ")
+        frame.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=3,
+            pady=1,
+        )
 
-        # ---- Output tab (manual layout) ----
-        out_tab = ttk.Frame(self._cfg_nb)
-        self._cfg_nb.add(out_tab, text=' Output ')
-        canvas = tk.Canvas(out_tab, highlightthickness=0)
-        sb = ttk.Scrollbar(out_tab, orient='vertical', command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.create_window((0,0), window=inner, anchor='nw')
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side='left', fill='both', expand=True)
-        sb.pack(side='right', fill='y')
-        self._bind_scroll(canvas)
+        self.config_editor = ConfigNotebook(
+            frame,
+            self.device,
+            self.gui_profile,
+            page=self.page,
+            paged=True,
+        )
+        self.config_editor.pack(
+            fill="both",
+            expand=True,
+        )
 
-        self._sec(inner, "VOUT Settings", [
-            ('VOUT_COMMAND','VOUT Command','V'),('VOUT_MAX','VOUT Max','V'),
-            ('VOUT_MARGIN_HIGH','Margin High','V'),('VOUT_MARGIN_LOW','Margin Low','V'),
-        ])
-        self._sec(inner, "VOUT Protection", [
-            ('VOUT_OV_FAULT_LIMIT','OV Fault','V'),('VOUT_OV_WARN_LIMIT','OV Warn','V'),
-            ('VOUT_UV_WARN_LIMIT','UV Warn','V'),('VOUT_UV_FAULT_LIMIT','UV Fault','V'),
-        ])
-        self._sec(inner, "IOUT Protection", [
-            ('IOUT_OC_FAULT_LIMIT','OC Fault','A'),('IOUT_OC_WARN_LIMIT','OC Warn','A'),
-            ('IOUT_UC_FAULT_LIMIT','UC Fault','A'),
-        ])
-        self._sec(inner, "Temperature", [
-            ('OT_FAULT_LIMIT','OT Fault','C'),('OT_WARN_LIMIT','OT Warn','C'),
-            ('UT_WARN_LIMIT','UT Warn','C'),('UT_FAULT_LIMIT','UT Fault','C'),
-        ])
-        self._sec(inner, "Timing", [
-            ("TON_DELAY", "TON Delay", "ms"),
-            ("TON_RISE", "TON Rise", "ms"),
-            ("TOFF_DELAY", "TOFF Delay", "ms"),
-        ])
-
-        # ---- Control tab ----
-        ctrl_tab = ttk.Frame(self._cfg_nb)
-        self._cfg_nb.add(ctrl_tab, text=' Control ')
-        self._build_control_tab(ctrl_tab)
-
-        # ---- Dynamic category tabs for remaining registers ----
-        self._build_reg_tabs()
+        self._cfg_nb = self.config_editor.notebook
+        self._reg_groups = [self.config_editor]
 
     def _build_reg_tabs(self):
         """Build tabs for registers not already in Output/Control."""
@@ -397,14 +395,22 @@ class ChannelColumn(ttk.LabelFrame):
 
     #   public API
     def update_telemetry(self, data):
-        for key in ('VOUT','IOUT','POUT'):
-            v = data.get(key)
-            lbl = self.telem_lbl.get(key)
-            if lbl: lbl.configure(text=f"{v:.3f}" if v is not None else "N/A")
-        for key in ('TEMP1','FREQ','DUTY'):
-            v = data.get(key)
-            lbl = self.telem_lbl.get(key)
-            if lbl: lbl.configure(text=f"{v:.1f}" if v is not None else "N/A")
+        for key, label in self.telem_lbl.items():
+            value = data.get(key)
+
+            if value is None:
+                label.configure(text="N/A")
+                continue
+
+            precision = 1 if key in {
+                "TEMP1",
+                "FREQ",
+                "DUTY",
+            } else 3
+
+            label.configure(
+                text=f"{value:.{precision}f}"
+            )
 
     def update_config(self, cfg_data):
         self.cfg_data = cfg_data
@@ -501,11 +507,12 @@ class ChannelColumn(ttk.LabelFrame):
         )
 
     def read_all_reg_groups(self):
-        for rg in self._reg_groups:
-            rg.read_all()
+        self.config_editor.read_all()
 
     def get_write_data(self):
-        return [(k, v.get()) for k, v in self.cfg_vars.items()]
+        # The new editor uses explicit individual register writes.
+        # Do not expose all registers to the legacy batch writer.
+        return []
 
     def _write_single(self, key):
         if key not in self.cfg_data: return
