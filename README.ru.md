@@ -348,11 +348,20 @@ gui/
     register_tab.py
     register_group.py
     status_defs.py
+    config_notebook.py
+    profiles/
+        __init__.py
+        gui_base.py
+        gui_config.py
+        gui_registry.py
+        ltm4673_gui.py
+        ltm4677_gui.py
+        ltm4678_gui.py
 sim/
     sim_bus.py
 ```
 
-Карты регистров находятся в `core/devices/`. Вынос модельных описаний GUI в `gui/profiles/` запланирован и пока не считается выполненным.
+Карты регистров находятся в `core/devices/`.
 
 ## Выполнено в текущей итерации
 
