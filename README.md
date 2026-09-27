@@ -1,4 +1,4 @@
-
+Language / Язык – [Русский](README.ru.md) | English
 
 LTM PMBus Tool
 A Python/Tkinter application for inspecting and configuring supported Analog Devices LTM power-management devices over PMBus.
