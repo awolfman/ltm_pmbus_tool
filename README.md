@@ -1,3 +1,5 @@
+
+
 LTM PMBus Tool
 A Python/Tkinter application for inspecting and configuring supported Analog Devices LTM power-management devices over PMBus.
 The application provides device scanning, model-specific telemetry, configuration editors, status decoding, and register dump operations. A read-only demo mode allows the interface to be used without a USB adapter or connected hardware.
@@ -91,6 +93,109 @@ Project areas
 • gui/channel_frame.py implements channel panels.
 • gui/device_tab.py implements device-level views and monitoring.
 • gui/status_defs.py implements status rendering.
+
+Adding a USB-to-I2C adapter
+Transport support should be independent of device models. Start with one known working PMBus device and implement the new adapter using an existing transport as the interface reference.
+
+1. 
+Review the existing transport interface
+Inspect an existing adapter implementation, core/bus_factory.py, adapter enumeration in gui/app.py, and transport calls in core/pmbus_device.py.
+Record the required method signatures, return types, bus identifiers, and connection lifecycle. Match the interface used by the current project rather than introducing adapter-specific calls into device drivers.
+
+2. 
+Implement the required bus operations
+Implement the byte, word, block, and command-only transactions required by the project. Follow the existing contract for register addressing, byte order, and block lengths.
+Verify the adapter's handling of repeated START, STOP, ACK/NACK, clock stretching, and bus frequency. Establish whether its API supplies SMBus framing or requires the transport to implement it.
+Handle PEC according to the actual capabilities of the adapter, device, and current application. Do not silently enable an unsupported transaction mode.
+
+3. 
+Define error behavior
+Report USB removal and transfer failures as exceptions that the application can recognize. Keep ordinary address NACKs distinguishable from adapter disconnection.
+Validate returned lengths. Never turn failed transfers into successful reads containing fabricated 0xFF or 0xFFFF values.
+Set transport capability flags, including checks_i2c_ack if used by the implementation, according to actual behavior.
+
+4. 
+Implement connection ownership and cleanup
+Follow the existing bus-factory caching and locking scheme. Several device tabs may share one physical adapter.
+Provide reliable close and release behavior. Do not close the shared transport merely because one device operation failed.
+Do not add automatic bus reset, CLEAR_FAULTS, or device writes during adapter opening unless their necessity and effects have been established.
+
+5. 
+Register adapter enumeration and creation
+Connect the new transport to core/bus_factory.py and the adapter discovery path used by gui/app.py.
+Use identifiers that distinguish multiple attached adapters. Make optional library imports fail gracefully so that a missing adapter dependency does not prevent unrelated transports or demo mode from starting.
+
+6. 
+Test without configuration writes
+Verify enumeration, opening, scanning, device identification, and repeated reads against a known device.
+Confirm byte order and block handling with known register values. Observe STATUS_CML before and after operations where supported, without assuming that reading it clears faults.
+
+7. 
+Test removal and reconnection
+Disconnect the adapter during scanning, Read All, and monitoring. Check that operations stop promptly and that affected tabs show stale data.
+Reconnect, then use Refresh and Scan. Verify that cached handles are released and that multiple devices on the same adapter still work correctly.
+
+8. 
+Validate writes separately and document limitations
+Test an explicitly selected safe RAM parameter, read it back, and restore its original value.
+Test NVM and dump writes only in a separate validation pass. Document dependencies, USB driver requirements, supported transaction types, and known adapter limitations.
+
+
+Adding a PMBus power device
+PMBus command names alone do not establish compatibility. Device support requires a model-specific register map, access rules, data formats, and GUI profile.
+
+1. 
+Collect the device documentation
+Obtain the PMBus command reference and the documentation for the exact device or firmware revision.
+Identify individual and shared addresses, channel count, PAGE behavior, identification commands, supported transaction types, data encodings, and fault semantics.
+Record which commands are safe to read during discovery. Do not assume that every PMBus device supports the identification sequence used by the existing LTM models.
+
+2. 
+Implement identification and model registration
+Use the model-support code under core/drivers as a reference and connect the device to the current identification and driver-selection path.
+If necessary, extend the identification path in core/pmbus_device.py and discovery in core/bus_scanner.py. Unsupported identification commands must not be sent indiscriminately to devices that can latch communication faults.
+Match documented identifiers precisely enough to avoid selecting the driver for another model or revision.
+
+3. 
+Define the register map and access metadata
+For every supported command, specify its code, name, transaction size, format, and global or paged scope.
+Define read and write permissions separately. Identify commands requiring special access and exclude them from generic editors when appropriate.
+Do not expose command-only actions, block transfers, NVM operations, or shared-address writes as ordinary scalar configuration fields.
+
+4. 
+Implement model-specific conversions
+Determine voltage exponents from the device's documented VOUT_MODE behavior rather than copying another model's default.
+Implement custom decoding where needed. Add and validate the matching encoder before permitting engineering-value writes.
+Verify units, signed values, scaling, valid ranges, and reserved encodings. Leave unsupported formats explicitly raw instead of displaying a misleading engineering value.
+
+5. 
+Add the GUI profile
+Add a model profile under gui/profiles and register it in the profile-selection path.
+Define global and channel telemetry, then assign eligible configuration registers to Output, Protection, Timing, and Advanced.
+Keep the register map authoritative for availability and scope. A GUI placement must not grant write permission.
+The current Config candidate builder selects readable scalar registers. Dedicated support is needed for write-only actions and other transaction types.
+
+6. 
+Add status interpretation
+Extend gui/status_defs.py where the model requires different status definitions.
+Distinguish active-low signals, reserved bits, informational states, warnings, and faults. Keep unverified manufacturer-specific registers raw rather than reusing another model's interpretation.
+
+7. 
+Add a read-only demo device and layout checks
+Extend the demo-device factory with synthetic values appropriate to the model and its page count.
+Check profile selection, telemetry, configuration placement, and stale-data behavior. Verify that eligible registers appear once in the correct scope.
+Demo tests validate interface behavior and layout, not electrical behavior or transport compatibility.
+
+8. 
+Validate on hardware in stages
+Start with identification and documented safe reads. Check global settings separately from channel pages and compare selected measurements with independent instruments where practical.
+Next, test a safe RAM write with readback and restoration of the original value. Verify that another channel or device on the bus is not unintentionally changed.
+Validate fault responses, NVM operations, and dump writes separately under controlled conditions.
+
+9. 
+Update support documentation
+Document the tested model and revision, supported adapters, implemented commands, and known limitations.
+Distinguish implemented support, demo-tested behavior, and hardware-validated operations. Keep unvalidated writes explicitly marked as pending.
 
 Safety
 This application can change power-system behavior. Register access permissions are not a substitute for checking the device datasheet and the electrical limits of the connected board.
