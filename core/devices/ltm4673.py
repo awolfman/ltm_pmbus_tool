@@ -133,3 +133,108 @@ GLOBAL_CMDS_EXTRA = {
     for cmd, (_, _, _, paged) in REGISTER_OVERRIDES.items()
     if not paged
 }
+
+def _operation_valid(raw, use_pmbus):
+    """Check the documented OPERATION bit combinations."""
+    if raw & 0x03:
+        return False
+
+    control = (raw >> 6) & 0x03
+    margin = (raw >> 4) & 0x03
+    fault = (raw >> 2) & 0x03
+
+    if control == 0x03:
+        return False
+
+    # With PMBus on/off enabled, immediate off ignores
+    # both the margin and fault fields.
+    if use_pmbus and control == 0:
+        return True
+
+    # Nominal output ignores the fault field.
+    if margin == 0:
+        return True
+
+    return margin in {1, 2} and fault in {1, 2}
+
+
+_OPERATION_WITH_PMBUS = frozenset(
+    raw
+    for raw in range(256)
+    if _operation_valid(raw, True)
+)
+
+_OPERATION_WITHOUT_PMBUS = frozenset(
+    raw
+    for raw in range(256)
+    if _operation_valid(raw, False)
+)
+
+WRITE_VALUE_RULES = {
+    0x01: {
+        "allowed": (
+            _OPERATION_WITH_PMBUS
+            & _OPERATION_WITHOUT_PMBUS
+        ),
+        "requires_context": (
+            _OPERATION_WITH_PMBUS
+            ^ _OPERATION_WITHOUT_PMBUS
+        ),
+        "context_error": (
+            "This OPERATION encoding requires checking the "
+            "current ON_OFF_CONFIG. Context-dependent raw "
+            "writes are not enabled."
+        ),
+        "invalid_error": (
+            "Reserved OPERATION bit combination."
+        ),
+    },
+    0x02: {
+        # Application write policy:
+        # reserved bits 7:5 = 0 and reserved bit 1 = 1.
+        # Do not classify other encodings as hardware CML faults.
+        "allowed": frozenset(
+            raw
+            for raw in range(0x20)
+            if raw & 0x02
+        ),
+        "invalid_error": (
+            "Application policy requires ON_OFF_CONFIG "
+            "bits 7:5 = 0 and bit 1 = 1."
+        ),
+    },
+}
+
+CONTROL_OPTIONS = {
+    "OPERATION": (
+        (0x80, "Sequence on / Nominal"),
+        (0xA8, "Margin High"),
+        (0x98, "Margin Low"),
+        (0x40, "Sequence off / Nominal"),
+        (0x00, "Immediate off / Nominal"),
+        (0x94, "Margin Low / Ignore faults+warnings"),
+        (0xA4, "Margin High / Ignore faults+warnings"),
+        (0x54, "Seq off / Low / Ignore faults+warnings"),
+        (0x58, "Seq off / Margin Low"),
+        (0x64, "Seq off / High / Ignore faults+warnings"),
+        (0x68, "Seq off / Margin High"),
+    ),
+    "ON_OFF_CONFIG": (
+        (0x1E, "CMD+CONTROL / Pin TOFF_DELAY"),
+        (0x1F, "CMD+CONTROL / Pin fast off"),
+        (0x16, "CONTROL only / Pin TOFF_DELAY"),
+        (0x17, "CONTROL only / Pin fast off"),
+        (0x1A, "CMD only / Pin ignored"),
+        (0x1B, "CMD only / Pin ignored"),
+        (0x12, "No start source"),
+        (0x13, "No start source"),
+        (0x02, "Auto startup / CMD=0 CONTROL=0"),
+        (0x03, "Auto startup / CMD=0 CONTROL=0"),
+        (0x06, "Auto startup / CMD=0 CONTROL=1 / Delay"),
+        (0x07, "Auto startup / CMD=0 CONTROL=1 / Fast"),
+        (0x0A, "Auto startup / CMD=1 CONTROL=0"),
+        (0x0B, "Auto startup / CMD=1 CONTROL=0"),
+        (0x0E, "Auto startup / CMD=1 CONTROL=1 / Delay"),
+        (0x0F, "Auto startup / CMD=1 CONTROL=1 / Fast"),
+    ),
+}
