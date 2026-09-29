@@ -1,11 +1,15 @@
 # gui/device_tab.py
 
-"""DeviceTab -- all channels side-by-side, global status TreeView."""
+"""Display a prepared plan with guarded VOUT application."""
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
-from core.dump_csv import dump_to_csv_string, csv_string_to_dump
+from core.dump_csv import (
+    dump_to_csv_string,
+    csv_string_to_dump,
+    save_csv_atomic,
+)
 from gui.channel_frame import ChannelColumn
 from gui.status_defs import (
     configure_status_tree,
@@ -21,6 +25,7 @@ from gui.profiles import (
     get_gui_profile,
 )
 from gui.config_notebook import ConfigNotebook
+from contextlib import contextmanager, nullcontext
 
 class DeviceTab(ttk.Frame):
 
@@ -36,7 +41,9 @@ class DeviceTab(ttk.Frame):
         self.monitoring = False
         self._monitor_after_id = None
         self._disconnected = False
+        self._action_busy = False
         self._dump_data = {}
+        self._dump_metadata = {}
 
         self.global_telem_lbl = {}
         self.global_cfg_vars = {}
@@ -51,6 +58,931 @@ class DeviceTab(ttk.Frame):
         self._build_channels()
         self._build_buttons()
         self.do_read_all()
+
+    @contextmanager
+    def _button_activity(self, button, text):
+        """Disable tab and operation-window buttons during device I/O."""
+        original_text = button.cget("text")
+        saved_states = []
+        seen = set()
+        transport_lost = False
+
+        def collect(parent):
+            for widget in parent.winfo_children():
+                if widget in seen:
+                    continue
+                seen.add(widget)
+
+                if isinstance(widget, ttk.Button):
+                    saved_states.append(
+                        (widget, widget.instate(["disabled"]))
+                    )
+
+                collect(widget)
+
+        collect(self)
+
+        # A preview can be a separate Toplevel.
+        if button not in seen:
+            collect(button.winfo_toplevel())
+
+        try:
+            for widget, _ in saved_states:
+                widget.state(["disabled"])
+
+            button.configure(text=text)
+            self.update_idletasks()
+            yield
+
+        except TransportDisconnectedError:
+            transport_lost = True
+            raise
+
+        finally:
+            try:
+                if button.winfo_exists():
+                    button.configure(text=original_text)
+            except tk.TclError:
+                pass
+
+            if not self._disconnected and not transport_lost:
+                for widget, was_disabled in saved_states:
+                    try:
+                        if widget.winfo_exists():
+                            widget.state(
+                                ["disabled"]
+                                if was_disabled
+                                else ["!disabled"]
+                            )
+                    except tk.TclError:
+                        pass
+
+    def _config_editors(self):
+        """Return existing Config editors for this device."""
+        editors = [self.global_config_editor]
+        editors.extend(
+            channel.config_editor
+            for channel in self.channels
+        )
+        return editors
+
+    def _confirm_config_reload(self):
+        """Ask before replacing unwritten Config input."""
+        has_edits = False
+
+        for editor in self._config_editors():
+            # Do not reload Config while an individual operation
+            # is waiting in a confirmation dialog.
+            if editor._busy:
+                messagebox.showwarning(
+                    "Config operation in progress",
+                    "Finish the current Config operation first.",
+                    parent=self,
+                )
+                return False
+
+            try:
+                if editor.get_pending_changes():
+                    has_edits = True
+
+            except ValueError:
+                # Input exists without a usable baseline.
+                # Reloading would replace that input too.
+                has_edits = True
+
+            except RuntimeError as exc:
+                messagebox.showerror(
+                    "Cannot reload Config",
+                    str(exc),
+                    parent=self,
+                )
+                return False
+
+        if not has_edits:
+            return True
+
+        return messagebox.askyesno(
+            "Discard Config edits?",
+            "Read All will replace Config fields with "
+            "values read from the device.\n\n"
+            "Unwritten input will be lost.\n"
+            "Continue?",
+            parent=self,
+        )
+
+    def do_read_all(self):
+        if (
+            self._disconnected
+            or self._action_busy
+            or self._other_tab_operation_busy()
+        ):
+            return
+
+        self._action_busy = True
+
+        try:
+            if not self._confirm_config_reload():
+                return
+
+            if self._disconnected:
+                return
+
+            self.stop_all()
+
+            with self._button_activity(
+                self.read_all_btn, "Reading..."
+            ):
+                try:
+                    self.update_device_info()
+                    self.global_config_editor.read_all()
+
+                    global_telemetry = (
+                        self.device.read_global_telemetry()
+                    )
+
+                    for key, label in self.global_telem_lbl.items():
+                        value = global_telemetry.get(key)
+                        label.configure(
+                            text=(
+                                f"{value:.3f}"
+                                if value is not None
+                                else "N/A"
+                            )
+                        )
+
+                    for channel in self.channels:
+                        channel.read_all_reg_groups()
+
+                        telemetry = (
+                            self.device.read_channel_telemetry(
+                                channel.page
+                            )
+                        )
+                        channel.update_telemetry(telemetry)
+
+                    self._refresh_status()
+
+                except TransportDisconnectedError as exc:
+                    self._handle_disconnect(exc)
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Read error",
+                str(exc),
+                parent=self,
+            )
+
+        finally:
+            self._action_busy = False
+
+    def do_write_all(self):
+        """Prepare and preview changes without device I/O."""
+        if (
+            self._disconnected
+            or self._action_busy
+            or self._config_operation_busy()
+            or self._other_tab_operation_busy()
+        ):
+            return
+
+        try:
+            changes = []
+            errors = []
+            seen = set()
+
+            for editor in self._config_editors():
+                scope = (
+                    f"CH{editor.page}"
+                    if editor.paged
+                    else "Global"
+                )
+
+                try:
+                    prepared, editor_errors = (
+                        editor.prepare_pending_changes()
+                    )
+
+                except (ValueError, RuntimeError) as exc:
+                    errors.append(f"{scope}: {exc}")
+                    continue
+
+                errors.extend(editor_errors)
+
+                for change in prepared:
+                    identity = (
+                        change["is_paged"],
+                        change["page"],
+                        change["cmd"],
+                    )
+
+                    if identity in seen:
+                        errors.append(
+                            "Duplicate pending register change: "
+                            f"{identity!r}"
+                        )
+                        continue
+
+                    seen.add(identity)
+                    changes.append(change)
+
+            # Do not show a partial plan if any field is invalid.
+            if errors:
+                messagebox.showerror(
+                    "Cannot prepare changes",
+                    "Fix all errors before preparing a write plan.\n"
+                    "No registers were written.\n\n"
+                    + "\n".join(errors),
+                    parent=self,
+                )
+                return
+
+            if not changes:
+                messagebox.showinfo(
+                    "Preview Changes",
+                    "No changes requiring a write.\n"
+                    "Edited values may encode to the "
+                    "last-read raw values.\n\n"
+                    "No registers were written.",
+                    parent=self,
+                )
+                return
+
+            self._show_changes_preview(changes)
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Cannot prepare changes",
+                str(exc),
+                parent=self,
+            )
+
+    def _check_preview_plan(
+        self, changes, window, check_button=None
+    ):
+        return self._run_guarded_action(
+            lambda: self._check_preview_plan_impl(
+                changes, window, check_button
+            )
+        )
+
+    def _check_preview_plan_impl(self, changes, window, check_button=None):
+        """Read current device values without changing Config fields."""
+        if self._disconnected:
+            return
+
+        try:
+            # Do not check an obsolete preview after the user
+            # has edited or reread Config fields.
+            current = []
+
+            for editor in self._config_editors():
+                prepared, errors = (
+                    editor.prepare_pending_changes()
+                )
+
+                if errors:
+                    raise ValueError("\n".join(errors))
+
+                current.extend(prepared)
+
+            def signature(records):
+                return {
+                    (
+                        record["page"],
+                        record["cmd"],
+                    ): (
+                        record["name"],
+                        record["size"],
+                        record["format"],
+                        record["is_paged"],
+                        record["previous_text"],
+                        record["new_text"],
+                        record["previous_raw"],
+                        record["new_raw"],
+                        record["manual_only"],
+                    )
+                    for record in records
+                }
+
+            if (
+                len(current) != len(changes)
+                or signature(current) != signature(changes)
+            ):
+                messagebox.showwarning(
+                    "Preview is outdated",
+                    "Config fields have changed since this "
+                    "preview was opened.\n\n"
+                    "Close this window and use Preview Changes again.",
+                    parent=window,
+                )
+                return
+
+            candidates = [
+                change
+                for change in changes
+                if not change["manual_only"]
+            ]
+
+            if not candidates:
+                messagebox.showinfo(
+                    "Check Device",
+                    "The plan contains only individual-write controls.\n"
+                    "No device check was performed.",
+                    parent=window,
+                )
+                return
+
+            # A synchronous check needs no monitoring interleave.
+            # Restore monitoring state without starting an immediate
+            # extra telemetry read.
+            was_monitoring = self.monitoring
+            self.stop_all()
+
+            activity = (
+                self._button_activity(
+                    check_button, "Checking..."
+                )
+                if check_button is not None
+                else nullcontext()
+            )
+
+            try:
+                with activity:
+                    try:
+                        result = self.device.check_write_plan(
+                            candidates
+                        )
+                    except TransportDisconnectedError as exc:
+                        # Mark stale before leaving the activity
+                        # context or considering monitor restart.
+                        self._handle_disconnect(exc)
+                        return
+            finally:
+                if (
+                    was_monitoring
+                    and not self._disconnected
+                    and self.winfo_exists()
+                ):
+                    self.monitoring = True
+                    self.mon_btn.configure(text="Stop Monitor")
+                    self._monitor_after_id = self.after(
+                        500,
+                        self._mon_loop,
+                    )
+
+            if result["ok"]:
+                messagebox.showinfo(
+                    "Device check passed",
+                    f"Checked registers: {result['checked']}.\n"
+                    "Current raw values match the plan baselines.\n\n"
+                    "No registers were written.\n"
+                    "This check does not validate board-specific "
+                    "limits or the write order.",
+                    parent=window,
+                )
+                return
+
+            details = []
+
+            for item in result["results"]:
+                if item["status"] == "match":
+                    continue
+
+                scope = (
+                    "Global"
+                    if item["page"] is None
+                    else f"CH{item['page']}"
+                )
+                width = 2 if item["size"] == "byte" else 4
+                expected = (
+                    f"0x{item['previous_raw']:0{width}X}"
+                )
+
+                if item["status"] == "read_error":
+                    details.append(
+                        f"{scope} / {item['name']}: read failed"
+                    )
+                else:
+                    actual = (
+                        f"0x{item['actual_raw']:0{width}X}"
+                    )
+                    details.append(
+                        f"{scope} / {item['name']}: "
+                        f"baseline {expected}, device {actual}"
+                    )
+
+            remaining = result["total"] - result["checked"]
+            if remaining:
+                details.append(
+                    f"Not checked after read failure: {remaining}"
+                )
+
+            messagebox.showwarning(
+                "Device check failed",
+                "The plan cannot be used as-is.\n"
+                "Config input has been preserved.\n"
+                "No registers were written.\n\n"
+                + "\n".join(details),
+                parent=window,
+            )
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(exc)
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Cannot check device",
+                str(exc),
+                parent=window,
+            )
+
+    def _apply_vout_preview(
+        self, changes, window, apply_button=None
+    ):
+        return self._run_guarded_action(
+            lambda: self._apply_vout_preview_impl(
+                changes, window, apply_button
+            )
+        )
+
+    def _apply_vout_preview_impl(self, changes, window, apply_button=None):
+        """Apply only VOUT_COMMAND edits from the displayed snapshot."""
+        if self._disconnected:
+            return
+
+        try:
+            if not changes:
+                return
+
+            if getattr(self.device, "is_demo", False):
+                raise ValueError("Demo writes are disabled")
+
+            unsupported = [
+                change["name"]
+                for change in changes
+                if (
+                    change["name"] != "VOUT_COMMAND"
+                    or change["manual_only"]
+                )
+            ]
+
+            if unsupported:
+                raise ValueError(
+                    "This stage permits VOUT_COMMAND only.\n"
+                    "No subset of the plan will be applied.\n\n"
+                    + "\n".join(sorted(set(unsupported)))
+                )
+
+            def ensure_current():
+                current = []
+
+                for editor in self._config_editors():
+                    prepared, errors = (
+                        editor.prepare_pending_changes()
+                    )
+                    if errors:
+                        raise ValueError("\n".join(errors))
+                    current.extend(prepared)
+
+                # The editor traversal order is stable.
+                if current != changes:
+                    raise ValueError(
+                        "Preview is outdated.\n"
+                        "Close this window and use "
+                        "Preview Changes again."
+                    )
+
+            ensure_current()
+
+            lines = []
+            for change in changes:
+                lines.append(
+                    f"CH{change['page']} "
+                    f"{change['previous_text']} -> "
+                    f"{change['new_text']} V "
+                    f"[0x{change['new_raw']:04X}]"
+                )
+
+            confirmed = messagebox.askyesno(
+                "Apply output voltage changes?",
+                f"{self.device.name} at "
+                f"0x{self.device.address:02X}\n\n"
+                + "\n".join(lines)
+                + "\n\n"
+                "This changes the output voltage setting.\n"
+                "Confirm that the values are safe for the load.\n"
+                "Execution stops at the first error.\n"
+                "Earlier writes are not rolled back.\n"
+                "Monitoring will be stopped.\n"
+                "No NVM store will be performed.",
+                parent=window,
+            )
+
+            if not confirmed or self._disconnected:
+                return
+
+            # The confirmation dialog runs a nested Tk loop.
+            ensure_current()
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Cannot apply changes",
+                str(exc),
+                parent=window,
+            )
+            return
+
+        self.stop_all()
+
+        activity = (
+            self._button_activity(apply_button, "Writing...")
+            if apply_button is not None
+            else nullcontext()
+        )
+
+        try:
+            with activity:
+                report = self.device.apply_vout_write_plan(
+                    changes
+                )
+
+                # The executor returns disconnects in its report.
+                # It normally does not raise them here.
+                if report["disconnect"] is not None:
+                    verified = report["verified"]
+                    attempted = report["attempted"]
+
+                    lines = [
+                        f"Plan entries: {len(changes)}",
+                        f"Write attempts: {len(attempted)}",
+                        f"Verified by readback: {len(verified)}",
+                        (
+                            f"Not attempted: "
+                            f"{len(changes) - len(attempted)}"
+                        ),
+                    ]
+
+                    for change in verified:
+                        lines.append(
+                            f"CH{change['page']} "
+                            f"{change['name']}: "
+                            f"0x{change['actual_raw']:04X} verified"
+                        )
+
+                    if report["error"]:
+                        lines.extend(("", report["error"]))
+
+                    window.destroy()
+
+                    # Mark disconnected before leaving the activity
+                    # context, so controls cannot be re-enabled.
+                    self._handle_disconnect(
+                        TransportDisconnectedError(
+                            "\n".join(lines)
+                            + "\n\n"
+                            "An unverified write may have reached "
+                            "the device."
+                        )
+                    )
+                    return
+
+        except TransportDisconnectedError as exc:
+            # Defensive handling if a future executor raises instead
+            # of returning a partial execution report.
+            if window.winfo_exists():
+                window.destroy()
+
+            self._handle_disconnect(
+                TransportDisconnectedError(
+                    f"{exc}\n\n"
+                    "Execution report is unavailable.\n"
+                    "An unverified write may have reached the device."
+                )
+            )
+            return
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Cannot apply changes",
+                str(exc),
+                parent=window,
+            )
+            return
+
+        # Invalidate the preview after an execution attempt.
+        # A new attempt must use a newly prepared preview.
+        window.destroy()
+
+        verified = report["verified"]
+        attempted = report["attempted"]
+
+        lines = [
+            f"Plan entries: {len(changes)}",
+            f"Write attempts: {len(attempted)}",
+            f"Verified by readback: {len(verified)}",
+            f"Not attempted: {len(changes) - len(attempted)}",
+        ]
+
+        for change in verified:
+            lines.append(
+                f"CH{change['page']} "
+                f"{change['name']}: "
+                f"0x{change['actual_raw']:04X} verified"
+            )
+
+        if report["error"]:
+            lines.extend(("", report["error"]))
+
+        # Refresh only successfully verified fields, using the
+        # readback already obtained. Do not perform Read All:
+        # it would discard remaining unwritten input.
+        try:
+            editors = {
+                (
+                    editor.page if editor.paged else None
+                ): editor
+                for editor in self._config_editors()
+            }
+
+            for change in verified:
+                editor = editors[change["page"]]
+                editor._show(
+                    change["cmd"],
+                    change["actual_raw"],
+                )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Config display update failed",
+                "\n".join(lines)
+                + "\n\n"
+                f"Display update error: {exc}\n"
+                "Do not assume the operation was rolled back.",
+                parent=self,
+            )
+            return
+
+        if report["ok"]:
+            messagebox.showinfo(
+                "VOUT changes applied",
+                "\n".join(lines)
+                + "\n\n"
+                "Register readback matched the requested RAW values.\n"
+                "Check telemetry separately.\n"
+                "Monitoring remains stopped. NVM was not stored.",
+                parent=self,
+            )
+        else:
+            messagebox.showwarning(
+                "VOUT changes stopped",
+                "\n".join(lines)
+                + "\n\n"
+                "Earlier writes were not rolled back.\n"
+                "An unverified write may have reached the device.\n"
+                "Review the device state before preparing a new plan.\n"
+                "Monitoring remains stopped.",
+                parent=self,
+            )
+
+    def _other_tab_operation_busy(self):
+        """Ask the application whether another tab is occupied."""
+        widget = self.master
+
+        while widget is not None:
+            check = getattr(
+                widget, "_other_tab_operation_busy", None
+            )
+            if callable(check):
+                return bool(check(self))
+
+            widget = getattr(widget, "master", None)
+
+        return False
+
+    def _config_operation_busy(self):
+        """Return whether any Config editor has an active operation."""
+        return any(
+            editor._busy
+            for editor in self._config_editors()
+        )
+
+    def _run_guarded_action(self, callback):
+        """Reject repeated actions, including during confirmation."""
+        if (
+            self._disconnected
+            or self._action_busy
+            or self._config_operation_busy()
+            or self._other_tab_operation_busy()
+        ):
+            return
+
+        self._action_busy = True
+        try:
+            return callback()
+        finally:
+            self._action_busy = False
+
+    def do_store(self):
+        return self._run_guarded_action(self._do_store_impl)
+
+    def do_restore(self):
+        return self._run_guarded_action(self._do_restore_impl)
+
+    def do_dump_read(self):
+        return self._run_guarded_action(self._do_dump_read_impl)
+
+    def do_dump_write(self):
+        return self._run_guarded_action(self._do_dump_write_impl)
+
+    def _show_changes_preview(self, changes):
+        """Display a prepared snapshot with guarded VOUT application."""
+        window = tk.Toplevel(self)
+        window.title(
+            f"Preview Changes - {self.device.name} "
+            f"0x{self.device.address:02X}"
+        )
+        window.geometry("1000x420")
+        window.transient(self.winfo_toplevel())
+
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        manual_count = sum(
+            change["manual_only"]
+            for change in changes
+        )
+
+        ttk.Label(
+            window,
+            text=(
+                f"Prepared changes: {len(changes)}. "
+                f"Individual-write-only fields: {manual_count}.\n"
+                "Encoding checked, not board-specific safety. "
+                "Opening this preview performs no writes. "
+                "Apply VOUT Changes requires confirmation."
+            ),
+            justify="left",
+            wraplength=940,
+        ).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=8,
+            pady=8,
+        )
+
+        frame = ttk.Frame(window)
+        frame.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=8,
+        )
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        tree = ttk.Treeview(
+            frame,
+            columns=(
+                "scope",
+                "command",
+                "name",
+                "previous",
+                "new",
+                "policy",
+            ),
+            show="headings",
+            selectmode="browse",
+        )
+
+        columns = (
+            ("scope", "Scope", 65),
+            ("command", "Cmd", 55),
+            ("name", "Register", 215),
+            ("previous", "Last read / RAW", 220),
+            ("new", "Entered / encoded RAW", 220),
+            ("policy", "Handling", 155),
+        )
+
+        for name, title, width in columns:
+            tree.heading(name, text=title)
+            tree.column(
+                name,
+                width=width,
+                minwidth=50,
+                stretch=name in {
+                    "name",
+                    "previous",
+                    "new",
+                },
+            )
+
+        vertical = ttk.Scrollbar(
+            frame,
+            orient="vertical",
+            command=tree.yview,
+        )
+        horizontal = ttk.Scrollbar(
+            frame,
+            orient="horizontal",
+            command=tree.xview,
+        )
+        tree.configure(
+            yscrollcommand=vertical.set,
+            xscrollcommand=horizontal.set,
+        )
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+
+        tree.tag_configure(
+            "manual",
+            foreground="#A65E00",
+        )
+
+        for change in changes:
+            scope = (
+                f"CH{change['page']}"
+                if change["is_paged"]
+                else "Global"
+            )
+
+            width = (
+                2 if change["size"] == "byte" else 4
+            )
+            previous_raw = (
+                f"0x{change['previous_raw']:0{width}X}"
+            )
+            new_raw = (
+                f"0x{change['new_raw']:0{width}X}"
+            )
+
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    scope,
+                    f"0x{change['cmd']:02X}",
+                    change["name"],
+                    (
+                        f"{change['previous_text']} "
+                        f"[{previous_raw}]"
+                    ),
+                    (
+                        f"{change['new_text']} "
+                        f"[{new_raw}]"
+                    ),
+                    (
+                        "Individual write"
+                        if change["manual_only"]
+                        else "Encoding checked"
+                    ),
+                ),
+                tags=(
+                    ("manual",)
+                    if change["manual_only"]
+                    else ()
+                ),
+            )
+
+        buttons = ttk.Frame(window)
+        buttons.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=8,
+            pady=8,
+        )
+
+        check_button = ttk.Button(
+            buttons,
+            text="Check Device",
+            width=14,
+            command=lambda: self._check_preview_plan(
+                changes, window, check_button
+            ),
+        )
+        check_button.pack(side="left")
+
+        apply_button = ttk.Button(
+            buttons,
+            text="Apply VOUT Changes",
+            width=20,
+            command=lambda: self._apply_vout_preview(
+                changes, window, apply_button
+            ),
+        )
+        apply_button.pack(side="left", padx=6)
+
+        if getattr(self.device, "is_demo", False):
+            apply_button.state(["disabled"])
+
+        ttk.Button(
+            buttons,
+            text="Close",
+            command=window.destroy,
+        ).pack(side="right")
 
     # top bar
     def _build_top(self):
@@ -248,7 +1180,7 @@ class DeviceTab(ttk.Frame):
 
         for text, cmd in [
             ("Read All", self.do_read_all),
-            ("Write All", self.do_write_all),
+            ("Preview Changes", self.do_write_all),
             ("Store NVM", self.do_store),
             ("Restore NVM", self.do_restore),
             ("Clear Faults", self.do_clear),
@@ -260,8 +1192,17 @@ class DeviceTab(ttk.Frame):
             )
             button.pack(side="left", padx=2)
 
-            if text == "Write All":
-                button.state(["disabled"])
+            button_attributes = {
+                "Read All": "read_all_btn",
+                "Store NVM": "store_nvm_btn",
+                "Restore NVM": "restore_nvm_btn",
+                "Clear Faults": "clear_faults_btn",
+            }
+
+            attribute = button_attributes.get(text)
+            if attribute is not None:
+                setattr(self, attribute, button)
+                button.configure(width=11)
 
             if (
                 getattr(self.device, "is_demo", False)
@@ -287,14 +1228,30 @@ class DeviceTab(ttk.Frame):
         ttk.Combobox(bf, textvariable=self.dump_page_var,
                      values=dv, width=3,
                      state='readonly').pack(side='left', padx=2)
+
         for text, cmd in [
-            ("Read Dump",  self.do_dump_read),
-            ("Save CSV",   self.do_dump_save),
-            ("Load CSV",   self.do_dump_load),
+            ("Read Dump", self.do_dump_read),
+            ("Save CSV", self.do_dump_save),
+            ("Load CSV", self.do_dump_load),
             ("Write Dump", self.do_dump_write),
         ]:
-            ttk.Button(bf, text=text, command=cmd).pack(
-                side='left', padx=2)
+            button = ttk.Button(
+                bf,
+                text=text,
+                command=cmd,
+            )
+            button.pack(side="left", padx=2)
+
+            if text == "Read Dump":
+                self.read_dump_btn = button
+                button.configure(width=11)
+
+            elif text == "Write Dump":
+                self.write_dump_btn = button
+                button.configure(width=11)
+
+                if getattr(self.device, "is_demo", False):
+                    button.state(["disabled"])
 
     # read / write
     def _write_single_global(self, key):
@@ -428,83 +1385,172 @@ class DeviceTab(ttk.Frame):
             parent=self,
         )
 
-    def do_read_all(self):
-        if self._disconnected:
+    def _allow_device_action(self):
+        """Reject hardware actions on a disconnected or demo device."""
+        return (
+            not self._disconnected
+            and not getattr(self.device, "is_demo", False)
+        )
+
+    def _do_store_impl(self):
+        if not self._allow_device_action():
             return
 
+        confirmed = messagebox.askyesno(
+            "Store NVM",
+            "Save the current device configuration to NVM?\n\n"
+            "This stores device settings, not unwritten Config input.\n"
+            "Monitoring will be stopped.",
+            parent=self,
+        )
+
+        # Confirmation dialogs run a nested Tk event loop.
+        if not confirmed or not self._allow_device_action():
+            return
+
+        self.stop_all()
+
         try:
-            self.update_device_info()
+            with self._button_activity(
+                self.store_nvm_btn, "Storing..."
+            ):
+                if not self.device.store_user_all():
+                    raise OSError(
+                        self.device.last_error
+                        or "Device did not confirm NVM store completion."
+                    )
 
-            self.global_config_editor.read_all()
-
-            global_telemetry = (
-                self.device.read_global_telemetry()
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(
+                TransportDisconnectedError(
+                    f"Store NVM\n{exc}\n\n"
+                    "The command may have reached the device.\n"
+                    "NVM store completion is unknown."
+                )
             )
-            for key, label in self.global_telem_lbl.items():
-                value = global_telemetry.get(key)
-                label.configure(
-                    text=(
-                        f"{value:.3f}"
-                        if value is not None
-                        else "N/A"
+            return
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Store NVM failed",
+                f"{exc}\n\n"
+                "NVM store completion is not confirmed.\n"
+                "Do not assume the previous NVM contents are intact.\n"
+                "Monitoring remains stopped.",
+                parent=self,
+            )
+            return
+
+        messagebox.showinfo(
+            "Store NVM completed",
+            "The NVM store command completed and the device "
+            "reported ready.\n\n"
+            "NVM contents were not independently compared.\n"
+            "Monitoring remains stopped.",
+            parent=self,
+        )
+
+    def _do_restore_impl(self):
+        if not self._allow_device_action():
+            return
+
+        confirmed = messagebox.askyesno(
+            "Restore NVM",
+            "Restore the saved NVM configuration into the device?\n\n"
+            "This can change active device settings.\n"
+            "Monitoring will be stopped.\n"
+            "Config fields will not be reloaded automatically.",
+            parent=self,
+        )
+
+        if not confirmed or not self._allow_device_action():
+            return
+
+        self.stop_all()
+
+        try:
+            with self._button_activity(
+                self.restore_nvm_btn, "Restoring..."
+            ):
+                if not self.device.restore_user_all():
+                    raise OSError(
+                        self.device.last_error
+                        or "NVM restore or device identification failed."
                     )
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(
+                TransportDisconnectedError(
+                    f"Restore NVM\n{exc}\n\n"
+                    "The command may have reached the device.\n"
+                    "Active settings may already have changed."
                 )
+            )
+            return
 
-            for channel in self.channels:
-                channel.read_all_reg_groups()
+        except Exception as exc:
+            messagebox.showerror(
+                "Restore NVM failed",
+                f"{exc}\n\n"
+                "Active settings may already have changed.\n"
+                "Displayed Config values are not confirmed current.\n"
+                "Monitoring remains stopped.\n"
+                "If device identification failed, use Refresh "
+                "and Scan before further operations.",
+                parent=self,
+            )
+            return
 
-                telemetry = (
-                    self.device.read_channel_telemetry(
-                        channel.page
+        messagebox.showinfo(
+            "Restore NVM completed",
+            "The restore command completed and the device "
+            "was identified again.\n\n"
+            "Displayed Config values have not been refreshed.\n"
+            "Use Read All to reload them. It will ask before "
+            "replacing unwritten input.\n"
+            "Monitoring remains stopped.",
+            parent=self,
+        )
+
+    def do_clear(self):
+        return self._run_guarded_action(self._do_clear_impl)
+
+    def _do_clear_impl(self):
+        if not self._allow_device_action():
+            return
+
+        self.stop_all()
+
+        try:
+            with self._button_activity(
+                self.clear_faults_btn, "Clearing..."
+            ):
+                if not self.device.clear_faults():
+                    raise OSError(
+                        self.device.last_error
+                        or "Clear Faults did not complete."
                     )
-                )
-                channel.update_telemetry(telemetry)
 
-            self._refresh_status()
+                self._refresh_status()
 
         except TransportDisconnectedError as exc:
             self._handle_disconnect(exc)
 
         except Exception as exc:
             messagebox.showerror(
-                "Read error",
-                str(exc),
+                "Clear Faults failed",
+                f"{exc}\n\nMonitoring remains stopped.",
                 parent=self,
             )
 
-    def do_write_all(self):
-        if self._disconnected:
-            return
-
-        messagebox.showinfo(
-            "Write All unavailable",
-            "Batch writing is disabled during the Config migration.\n"
-            "Use an explicit individual register write.",
-            parent=self,
-        )
-
-    def do_store(self):
-        if messagebox.askyesno("RAM -> NVM", "Save all to NVM?"):
-            if self.device.store_user_all():
-                messagebox.showinfo("OK", "Stored to NVM.")
-            else:
-                messagebox.showerror("Error", "Store failed.")
-
-    def do_restore(self):
-        if messagebox.askyesno("NVM -> RAM", "Restore from NVM?"):
-            if self.device.restore_user_all():
-                messagebox.showinfo("OK", "Restored from NVM.")
-                self.do_read_all()
-            else:
-                messagebox.showerror("Error", "Restore failed.")
-
-    def do_clear(self):
-        self.device.clear_faults()
-        self._refresh_status()
-
     # monitor
     def toggle_monitor(self):
-        if self._disconnected:
+        if (
+            self._disconnected
+            or self._action_busy
+            or self._config_operation_busy()
+            or self._other_tab_operation_busy()
+        ):
             return
 
         if self.monitoring:
@@ -657,91 +1703,352 @@ class DeviceTab(ttk.Frame):
         except ValueError:
             return 0
 
-    def do_dump_read(self):
+    def _do_dump_read_impl(self):
+        # Reading synthetic registers is allowed in demo mode.
+        if self._disconnected:
+            return
+
         page = self._dump_page()
+        self.stop_all()
+
         try:
-            self._dump_data[page] = self.device.read_full_dump(page)
-            ok = sum(1 for r in self._dump_data[page]
-                     if r['raw'] is not None)
-            messagebox.showinfo("Dump",
-                                f"Page {page}: {ok} registers read.")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            with self._button_activity(
+                self.read_dump_btn, "Reading..."
+            ):
+                records = self.device.read_full_dump(page)
+
+            # Replace the previous snapshot only after completion.
+            self._dump_data[page] = records
+            # This snapshot came from the current device, not CSV.
+            self._dump_metadata.pop(page, None)
+            successful = sum(
+                record["raw"] is not None
+                for record in records
+            )
+            failed = len(records) - successful
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(exc)
+            return
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Read Dump failed",
+                f"{exc}\n\n"
+                "No new dump snapshot was saved.\n"
+                "Any previous snapshot remains unchanged.\n"
+                "Monitoring remains stopped.",
+                parent=self,
+            )
+            return
+
+        text = (
+            f"Page {page}\n"
+            f"Registers read: {successful}\n"
+            f"Read errors: {failed}\n\n"
+            "Monitoring remains stopped."
+        )
+
+        if failed:
+            messagebox.showwarning(
+                "Dump read with errors",
+                text,
+                parent=self,
+            )
+        else:
+            messagebox.showinfo(
+                "Dump read completed",
+                text,
+                parent=self,
+            )
 
     def do_dump_save(self):
+        return self._run_guarded_action(self._do_dump_save_impl)
+
+    def _do_dump_save_impl(self):
         page = self._dump_page()
+
         if page not in self._dump_data:
-            if messagebox.askyesno("", "Read dump first?"):
-                self.do_dump_read()
-            if page not in self._dump_data:
+            confirmed = messagebox.askyesno(
+                "Save CSV",
+                "Read dump first?",
+                parent=self,
+            )
+
+            if not confirmed or self._disconnected:
                 return
-        fn = (f"{self.device.name}_0x{self.device.address:02X}"
-              f"_p{page}_{datetime.now():%Y%m%d_%H%M%S}.csv")
+
+            # The outer Save CSV action already holds the guard.
+            self._do_dump_read_impl()
+
+            if self._disconnected or page not in self._dump_data:
+                return
+
+        # Serialize before the file dialog so the export represents
+        # one snapshot and does not depend on later GUI changes.
+        try:
+            if page in self._dump_metadata:
+                csv_text = dump_to_csv_string(
+                    self.device,
+                    self._dump_data[page],
+                    page,
+                    metadata=dict(self._dump_metadata[page]),
+                )
+            else:
+                csv_text = dump_to_csv_string(
+                    self.device,
+                    self._dump_data[page],
+                    page,
+                )
+        except Exception as exc:
+            messagebox.showerror(
+                "CSV export failed",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        filename = (
+            f"{self.device.name}_0x{self.device.address:02X}"
+            f"_p{page}_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        )
+
         path = filedialog.asksaveasfilename(
+            parent=self,
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv")],
-            initialfile=fn)
-        if not path:
+            initialfile=filename,
+        )
+
+        if not path or self._disconnected:
             return
+
         try:
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                f.write(dump_to_csv_string(
-                    self.device, self._dump_data[page], page))
-            messagebox.showinfo("OK", f"Saved: {path}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            save_csv_atomic(path, csv_text)
+        except Exception as exc:
+            messagebox.showerror(
+                "CSV save failed",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        messagebox.showinfo(
+            "CSV saved",
+            f"Saved: {path}",
+            parent=self,
+        )
 
     def do_dump_load(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("CSV", "*.csv")])
-        if not path:
-            return
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                txt = f.read()
-            meta, recs = csv_string_to_dump(txt)
-            if not recs:
-                messagebox.showerror("", "No data in CSV.")
-                return
-            page = self._dump_page()
-            self._dump_data[page] = recs
-            w = sum(1 for r in recs
-                    if not r['readonly'] and r['raw'] is not None)
-            messagebox.showinfo("Loaded",
-                                f"Total: {len(recs)}, writable: {w}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        return self._run_guarded_action(self._do_dump_load_impl)
 
-    def do_dump_write(self):
+    def _do_dump_load_impl(self):
+        # Capture the destination before entering the file dialog.
         page = self._dump_page()
+
+        path = filedialog.askopenfilename(
+            parent=self,
+            filetypes=[("CSV", "*.csv")],
+        )
+
+        if not path or self._disconnected:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                text = stream.read()
+
+            meta, records = csv_string_to_dump(text)
+
+            if not records:
+                messagebox.showerror(
+                    "Load CSV",
+                    "No data in CSV.",
+                    parent=self,
+                )
+                return
+
+            writable = sum(
+                1
+                for record in records
+                if (
+                    not record["readonly"]
+                    and record["raw"] is not None
+                )
+            )
+
+            result_text = (
+                f"Total: {len(records)}, writable: {writable}"
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Error",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        # Commit only after parsing and summary preparation succeed.
+        self._dump_data[page] = records
+        self._dump_metadata[page] = dict(meta)
+
+        messagebox.showinfo(
+            "Loaded",
+            result_text,
+            parent=self,
+        )
+
+    def _do_dump_write_impl(self):
+        if not self._allow_device_action():
+            return
+
+        page = self._dump_page()
+
         if page not in self._dump_data:
-            messagebox.showwarning("", "Load or read dump first.")
-            return
-        wr = [r for r in self._dump_data[page]
-              if not r.get('readonly', True)
-              and r['raw'] is not None]
-        if not wr:
-            messagebox.showwarning("", "No writable registers.")
-            return
-        if not messagebox.askyesno(
-                "Write Dump",
-                f"Write {len(wr)} registers to page {page}?"):
-            return
-        ok = 0
-        fl = []
-        for r in wr:
-            if self.device.write_register(
-                    r.get('page', page),
-                    r['cmd'], r['raw'], r['size']):
-                ok += 1
-            else:
-                fl.append(f"0x{r['cmd']:02X}")
-        if fl:
             messagebox.showwarning(
-                "Done", f"OK: {ok}, Failed: {len(fl)}")
-        else:
-            messagebox.showinfo("Done", f"Written: {ok}")
-        self.do_read_all()
+                "Write Dump",
+                "Load or read a dump first.",
+                parent=self,
+            )
+            return
+
+        # Snapshot and validate all selected writes before confirmation.
+        try:
+            records = [
+                dict(record)
+                for record in self._dump_data[page]
+                if (
+                    not record.get("readonly", True)
+                    and record.get("raw") is not None
+                )
+            ]
+
+            if not records:
+                messagebox.showwarning(
+                    "Write Dump",
+                    "Load or read a dump with writable values first.",
+                    parent=self,
+                )
+                return
+
+            records = self.device.validate_dump_write_records(
+                records,
+                default_page=page,
+            )
+
+            if page in self._dump_metadata:
+                self.device.validate_dump_metadata(
+                    self._dump_metadata[page],
+                    records,
+                )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Cannot prepare dump write",
+                f"{exc}\n\n"
+                "No registers were written.\n"
+                "The dump snapshot has been preserved.",
+                parent=self,
+            )
+            return
+
+        confirmed = messagebox.askyesno(
+            "Write Dump",
+            f"Attempt to write {len(records)} dump records?\n\n"
+            "Selected records passed offline profile validation.\n"
+            "Each record uses its own page value when present.\n"
+            "Board-specific limits and write order are not validated.\n"
+            "Current device values are not checked against baselines.\n"
+            "Exact readback verification is not performed.\n"
+            "Execution stops at the first error.\n"
+            "Earlier writes are not rolled back.\n"
+            "Monitoring will be stopped. NVM will not be stored.",
+            parent=self,
+        )
+
+        if not confirmed or not self._allow_device_action():
+            return
+
+        self.stop_all()
+
+        attempted = 0
+        completed = 0
+        active = "Preparing dump write"
+
+        def summary():
+            return (
+                f"Selected records: {len(records)}\n"
+                f"Write attempts: {attempted}\n"
+                f"Write calls returned success: {completed}\n"
+                f"Not attempted: {len(records) - attempted}\n"
+                "Exact readback verification: not performed"
+            )
+
+        try:
+            with self._button_activity(
+                self.write_dump_btn, "Writing..."
+            ):
+                for record in records:
+                    target_page = record.get("page", page)
+                    cmd = record["cmd"]
+                    size = record["size"]
+                    raw = record["raw"]
+
+                    active = (
+                        f"Record page {target_page}, "
+                        f"command 0x{cmd:02X}"
+                    )
+
+                    if not self.device.can_write_register(cmd, size):
+                        raise ValueError(
+                            "Register write is blocked by the device profile."
+                        )
+
+                    attempted += 1
+
+                    if not self.device.write_register(
+                        target_page, cmd, raw, size
+                    ):
+                        raise OSError(
+                            self.device.last_error
+                            or "Register write failed."
+                        )
+
+                    completed += 1
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(
+                TransportDisconnectedError(
+                    f"{summary()}\n\n{active}\n{exc}\n\n"
+                    "An unverified write may have reached the device.\n"
+                    "Earlier writes were not rolled back."
+                )
+            )
+            return
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Write Dump stopped",
+                f"{summary()}\n\n{active}\n{exc}\n\n"
+                "An unverified write may have reached the device.\n"
+                "Earlier writes were not rolled back.\n"
+                "Config fields were not refreshed.\n"
+                "Monitoring remains stopped.",
+                parent=self,
+            )
+            return
+
+        messagebox.showinfo(
+            "Dump write calls completed",
+            f"{summary()}\n\n"
+            "Successful write calls do not prove that all "
+            "values were accepted by the device.\n"
+            "Config fields were not refreshed.\n"
+            "Review device state separately.\n"
+            "Monitoring remains stopped. NVM was not stored.",
+            parent=self,
+        )
 
     def _do_read_regs(self):
         """Trigger read all in register tab."""
