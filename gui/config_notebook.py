@@ -123,6 +123,7 @@ class ConfigNotebook(ttk.Frame):
         self._rows = {}
         self._stale = False
         self._busy = False
+        self._feedback_after_ids = {}
 
         self.layout = build_config_layout(
             device,
@@ -154,6 +155,125 @@ class ConfigNotebook(ttk.Frame):
             owner is not None
             and getattr(owner, "_disconnected", False)
         )
+
+    def _individual_operation_blocked(self):
+        """Reject individual actions while another operation is active."""
+        if self._busy or self._is_disconnected():
+            return True
+
+        owner = self._owner()
+        if owner is None:
+            return False
+
+        if getattr(owner, "_action_busy", False):
+            return True
+
+        check_local = getattr(
+            owner, "_config_operation_busy", None
+        )
+        if callable(check_local) and check_local():
+            return True
+
+        check_other = getattr(
+            owner, "_other_tab_operation_busy", None
+        )
+        return bool(
+            callable(check_other) and check_other()
+        )
+
+    def prepare_pending_changes(self):
+        """Encode edited fields without reading or writing hardware.
+
+        Return prepared changes and validation errors separately.
+        Manual-only controls remain visible but are not batch targets.
+        """
+        changes = self.get_pending_changes()
+        prepared = []
+        errors = []
+
+        for change in changes:
+            cmd = change["cmd"]
+            item = self._rows[cmd]
+            row = item["row"]
+
+            scope = (
+                f"CH{change['page']}"
+                if change["is_paged"]
+                else "Global"
+            )
+
+            try:
+                baseline_raw = item["baseline_raw"]
+                if baseline_raw is None:
+                    raise ValueError(
+                        "No successful baseline read"
+                    )
+
+                if not self._can_write(row):
+                    raise ValueError("Register write is blocked")
+
+                text = change["new_text"]
+
+                if item["options"]:
+                    if text not in item["options"]:
+                        raise ValueError(
+                            "Select a supported control value"
+                        )
+                    raw = item["options"][text]
+
+                elif item["engineering"]:
+                    raw = self.device.encode_register_value(
+                        self.page,
+                        cmd,
+                        text,
+                        row.fmt,
+                    )
+
+                else:
+                    if not text.lower().startswith("0x"):
+                        raise ValueError(
+                            "Raw value must start with 0x"
+                        )
+                    raw = int(text, 16)
+
+                maximum = (
+                    0xFF if row.size == "byte" else 0xFFFF
+                )
+                if (
+                    isinstance(raw, bool)
+                    or not isinstance(raw, int)
+                    or not 0 <= raw <= maximum
+                ):
+                    raise ValueError(
+                        f"Raw value must be in 0x00..0x{maximum:X}"
+                    )
+
+                validator = getattr(
+                    self.device,
+                    "validate_register_raw",
+                    None,
+                )
+                if callable(validator):
+                    validator(cmd, raw, row.size)
+
+                # Unchanged text was already excluded by
+                # get_pending_changes. Now exclude equivalent
+                # encodings of edited text.
+                if raw == baseline_raw:
+                    continue
+
+                record = dict(change)
+                record["previous_raw"] = baseline_raw
+                record["new_raw"] = raw
+                prepared.append(record)
+
+            except (ValueError, TypeError, OverflowError) as exc:
+                errors.append(
+                    f"{scope} / {row.name} "
+                    f"0x{cmd:02X}: {exc}"
+                )
+
+        return prepared, errors
 
     def _can_read(self, row):
         return (
@@ -253,9 +373,83 @@ class ConfigNotebook(ttk.Frame):
                 pady=5,
             )
 
-        # Canvas children include the inner frame and all fields.
-        # Bind once per widget, without application-wide bindings.
         self._bind_wheel(canvas, canvas)
+
+    def get_pending_changes(self):
+        """Collect edited writable fields without device I/O."""
+        if self._is_disconnected():
+            raise RuntimeError(
+                "Cannot collect changes from stale device data."
+            )
+
+        if self._busy:
+            raise RuntimeError(
+                "A Config operation is still running."
+            )
+
+        changes = []
+        missing_baseline = []
+
+        placeholders = {
+            "",
+            "---",
+            "ERR",
+            "N/A",
+            "N/S",
+            "STALE",
+        }
+
+        for cmd, item in self._rows.items():
+            row = item["row"]
+
+            if not self._can_write(row):
+                continue
+
+            text = item["variable"].get().strip()
+            baseline = item["baseline"]
+
+            if baseline is None:
+                if text not in placeholders:
+                    missing_baseline.append(row.name)
+                continue
+
+            # Compare against the displayed baseline first.
+            # Unedited rounded values must not become write targets.
+            if text == baseline.strip():
+                continue
+
+            if item["options"]:
+                input_kind = "control"
+            elif item["engineering"]:
+                input_kind = "engineering"
+            else:
+                input_kind = "raw"
+
+            changes.append({
+                "page": self.page if self.paged else None,
+                "cmd": cmd,
+                "name": row.name,
+                "size": row.size,
+                "format": row.fmt,
+                "is_paged": self.paged,
+                "previous_text": baseline,
+                "new_text": text,
+                "input_kind": input_kind,
+                "manual_only": row.name in {
+                    "OPERATION",
+                    "ON_OFF_CONFIG",
+                    "WRITE_PROTECT",
+                },
+            })
+
+        if missing_baseline:
+            raise ValueError(
+                "Read these registers before preparing changes.\n"
+                "Reading replaces the current input.\n\n"
+                + "\n".join(missing_baseline)
+            )
+
+        return changes
 
     def _build_row(self, parent, index, row):
         if row.cmd in self._rows:
@@ -269,8 +463,15 @@ class ConfigNotebook(ttk.Frame):
         )
         custom = row.cmd in custom_formats
 
+        profile_options = metadata.get(
+            "control_options", {}
+        )
+
         options = (
-            CONTROL_OPTIONS.get(row.name, ())
+            profile_options.get(
+                row.name,
+                CONTROL_OPTIONS.get(row.name, ()),
+            )
             if not custom
             else ()
         )
@@ -405,6 +606,8 @@ class ConfigNotebook(ttk.Frame):
             "write_button": write_button,
             "engineering": engineering,
             "options": option_values,
+            "baseline": None,
+            "baseline_raw": None,
         }
 
     @staticmethod
@@ -468,6 +671,67 @@ class ConfigNotebook(ttk.Frame):
         for child in widget.winfo_children():
             ConfigNotebook._bind_wheel(child, canvas)
 
+    def _cancel_feedback(self, cmd, name):
+        token = self._feedback_after_ids.pop(
+            (cmd, name), None
+        )
+        if token is not None:
+            try:
+                self.after_cancel(token)
+            except tk.TclError:
+                pass
+
+    def _cancel_all_feedback(self):
+        for cmd, name in tuple(self._feedback_after_ids):
+            self._cancel_feedback(cmd, name)
+
+    def _begin_feedback(self, cmd, name):
+        self._cancel_feedback(cmd, name)
+        self._set_button_color(
+            self._rows[cmd],
+            name,
+            "#FFC107",
+        )
+
+        # Paint the busy color before synchronous I2C access.
+        # Do not start a nested event loop with update().
+        self.update_idletasks()
+
+    def _finish_feedback(self, cmd, name, success):
+        self._cancel_feedback(cmd, name)
+
+        item = self._rows[cmd]
+        if (
+            self._is_disconnected()
+            or item.get(name) is None
+        ):
+            return
+
+        self._set_button_color(
+            item,
+            name,
+            "#00E676" if success else "#FF5252",
+        )
+
+        def restore():
+            self._feedback_after_ids.pop(
+                (cmd, name), None
+            )
+            if self._is_disconnected():
+                return
+
+            self._set_button_color(
+                item,
+                name,
+                "#2196F3"
+                if name == "read_button"
+                else "#4CAF50",
+            )
+
+        self._feedback_after_ids[(cmd, name)] = (
+            self.after(600, restore)
+        )
+
     def _set_button_color(self, item, name, color):
         if self._is_disconnected():
             return
@@ -477,6 +741,25 @@ class ConfigNotebook(ttk.Frame):
             button.itemconfigure("tri", fill=color)
 
     def _show(self, cmd, raw):
+        item = self._rows[cmd]
+
+        item["baseline"] = None
+        item["baseline_raw"] = None
+
+        self._show_value(cmd, raw)
+
+        if self._is_disconnected() or raw is None:
+            return
+
+        text = item["variable"].get()
+
+        if text in {"", "---", "ERR", "N/A", "N/S", "STALE"}:
+            return
+
+        item["baseline"] = text
+        item["baseline_raw"] = raw
+
+    def _show_value(self, cmd, raw):
         item = self._rows[cmd]
         row = item["row"]
         variable = item["variable"]
@@ -495,7 +778,7 @@ class ConfigNotebook(ttk.Frame):
                     variable.set(text)
                     return
 
-            variable.set(f"0x{raw:02X}  Unknown")
+            variable.set(f"0x{raw:02X}  Not in preset list")
             return
 
         if item["engineering"]:
@@ -532,7 +815,7 @@ class ConfigNotebook(ttk.Frame):
             )
 
     def _run_read(self, cmd):
-        if self._busy or self._is_disconnected():
+        if self._individual_operation_blocked():
             return
 
         item = self._rows[cmd]
@@ -544,15 +827,16 @@ class ConfigNotebook(ttk.Frame):
         self._busy = True
 
         try:
+            self._begin_feedback(cmd, "read_button")
+
             raw = self.device.read_register(
                 self.page, cmd
             )
             self._show(cmd, raw)
-
-            self._set_button_color(
-                item,
+            self._finish_feedback(
+                cmd,
                 "read_button",
-                "#2196F3" if raw is not None else "#FF5252",
+                raw is not None,
             )
 
         except TransportDisconnectedError as exc:
@@ -560,12 +844,10 @@ class ConfigNotebook(ttk.Frame):
 
         except Exception as exc:
             if not self._is_disconnected():
-                item["variable"].set("ERR")
+                self._show(cmd, None)
 
-            self._set_button_color(
-                item,
-                "read_button",
-                "#FF5252",
+            self._finish_feedback(
+                cmd, "read_button", False
             )
             messagebox.showerror(
                 "Register read failed",
@@ -577,7 +859,7 @@ class ConfigNotebook(ttk.Frame):
             self._busy = False
 
     def _run_write(self, cmd):
-        if self._busy or self._is_disconnected():
+        if self._individual_operation_blocked():
             return
 
         item = self._rows[cmd]
@@ -595,10 +877,8 @@ class ConfigNotebook(ttk.Frame):
             self._handle_disconnect(exc)
 
         except Exception as exc:
-            self._set_button_color(
-                item,
-                "write_button",
-                "#FF5252",
+            self._finish_feedback(
+                cmd, "write_button", False
             )
             messagebox.showerror(
                 "Register write failed",
@@ -643,16 +923,52 @@ class ConfigNotebook(ttk.Frame):
             maximum = (
                 0xFF if row.size == "byte" else 0xFFFF
             )
-            if not 0 <= raw <= maximum:
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not 0 <= raw <= maximum
+            ):
                 raise ValueError(
                     f"Raw value must be in 0x00..0x{maximum:X}"
                 )
+
+            validator = getattr(
+                self.device,
+                "validate_register_raw",
+                None,
+            )
+            if callable(validator):
+                validator(cmd, raw, row.size)
 
         scope = (
             f"Channel {self.page}"
             if self.paged
             else "Global device setting"
         )
+
+        control_notice = ""
+
+        if row.name == "OPERATION":
+            control_notice = (
+                "\n\nThe effect depends on ON_OFF_CONFIG "
+                "and the external control pin. "
+                "This selection does not indicate output state."
+            )
+
+            if (
+                self.device.name == "LTM4673"
+                and raw in {0x94, 0xA4, 0x54, 0x64}
+            ):
+                control_notice += (
+                    "\n\nWARNING: This mode ignores faults "
+                    "and warnings as described in the datasheet."
+                )
+
+        elif row.name == "ON_OFF_CONFIG":
+            control_notice = (
+                "\n\nThis changes startup and on/off control "
+                "and may affect the output immediately."
+            )
 
         confirmed = messagebox.askyesno(
             "Confirm register write",
@@ -661,7 +977,8 @@ class ConfigNotebook(ttk.Frame):
             f"{scope}\n"
             f"{row.name} at 0x{cmd:02X}\n\n"
             f"Write {text}?\n\n"
-            "This can change device operation.",
+            "This can change device operation."
+            f"{control_notice}",
             parent=self,
         )
 
@@ -670,40 +987,84 @@ class ConfigNotebook(ttk.Frame):
         if not confirmed or not self._can_write(row):
             return
 
-        if raw is not None:
-            ok = self.device.write_register(
-                self.page,
-                cmd,
-                raw,
-                row.size,
-            )
-        else:
-            ok = self.device.write_val(
-                self.page,
-                cmd,
-                value,
-                row.fmt,
-            )
+        self._begin_feedback(cmd, "write_button")
+
+        try:
+            if raw is not None:
+                ok = self.device.write_register(
+                    self.page,
+                    cmd,
+                    raw,
+                    row.size,
+                )
+            else:
+                ok = self.device.write_val(
+                    self.page,
+                    cmd,
+                    value,
+                    row.fmt,
+                )
+
+        except TransportDisconnectedError:
+            item["baseline"] = None
+            item["baseline_raw"] = None
+            raise
+
+        except Exception as exc:
+            # The transaction may have reached the device.
+            # Preserve the requested input, not the old baseline.
+            item["baseline"] = None
+            item["baseline_raw"] = None
+            raise OSError(
+                f"{exc}\n"
+                "The device state is not confirmed. "
+                "Read the register before preparing changes. "
+                "No automatic retry was performed."
+            ) from exc
 
         if not ok:
-            raise OSError(
+            # A failed transaction may still have reached the device.
+            # Keep the requested input, but invalidate the baseline.
+            item["baseline"] = None
+            item["baseline_raw"] = None
+
+            detail = (
                 getattr(self.device, "last_error", None)
-                or "Device rejected the write."
+                or "Register write failed."
+            )
+            raise OSError(
+                f"{detail}\n"
+                "The device state is not confirmed. "
+                "Read the register before preparing changes. "
+                "No automatic retry was performed."
             )
 
-        # Never perform readback for a write-only register.
+        # Write feedback covers both the write and readback.
+        # Canonical OPERATION and ON_OFF_CONFIG writes require
+        # an exact match. Other registers retain existing behavior.
         if self._can_read(row):
-            readback = self.device.read_register(
-                self.page, cmd
-            )
-            self._show(cmd, readback)
+            self._begin_feedback(cmd, "read_button")
 
-            self._set_button_color(
-                item,
+            try:
+                readback = self.device.read_register(
+                    self.page, cmd
+                )
+                self._show(cmd, readback)
+
+            except TransportDisconnectedError:
+                raise
+
+            except Exception:
+                self._show(cmd, None)
+                self._finish_feedback(
+                    cmd, "read_button", False
+                )
+                raise
+
+            self._finish_feedback(
+                cmd,
                 "read_button",
-                "#2196F3"
-                if readback is not None
-                else "#FF5252",
+                readback is not None,
             )
 
             if readback is None:
@@ -711,38 +1072,72 @@ class ConfigNotebook(ttk.Frame):
                     "Write completed, but readback failed."
                 )
 
-        self._set_button_color(
-            item,
-            "write_button",
-            "#00E676",
+            if (
+                row.name in {"OPERATION", "ON_OFF_CONFIG"}
+                and raw is not None
+                and readback != raw
+            ):
+                raise OSError(
+                    "Control readback mismatch: "
+                    f"requested 0x{raw:02X}, "
+                    f"received 0x{readback:02X}. "
+                    "The displayed value is the actual readback. "
+                    "No automatic retry was performed."
+                )
+
+        self._finish_feedback(
+            cmd, "write_button", True
         )
 
     def read_all(self):
         """Propagate errors to the owning DeviceTab."""
-        if self._is_disconnected():
+        if self._busy or self._is_disconnected():
             return
 
-        for cmd, item in self._rows.items():
-            if self._is_disconnected():
-                return
+        self._busy = True
 
-            if not self._can_read(item["row"]):
-                continue
+        try:
+            for cmd, item in self._rows.items():
+                if self._is_disconnected():
+                    return
 
-            raw = self.device.read_register(
-                self.page, cmd
-            )
-            self._show(cmd, raw)
-            self._set_button_color(
-                item,
-                "read_button",
-                "#2196F3" if raw is not None else "#FF5252",
-            )
+                if not self._can_read(item["row"]):
+                    continue
+
+                self._begin_feedback(cmd, "read_button")
+
+                try:
+                    raw = self.device.read_register(
+                        self.page, cmd
+                    )
+                    self._show(cmd, raw)
+
+                except TransportDisconnectedError:
+                    raise
+
+                except Exception:
+                    self._show(cmd, None)
+                    self._finish_feedback(
+                        cmd, "read_button", False
+                    )
+                    raise
+
+                self._finish_feedback(
+                    cmd,
+                    "read_button",
+                    raw is not None,
+                )
+
+        finally:
+            self._busy = False
 
     def mark_stale(self):
         self._stale = True
+        self._cancel_all_feedback()
 
         for item in self._rows.values():
+            item["baseline"] = None
+            item["baseline_raw"] = None
             item["variable"].set("STALE")
             item["field"].state(["disabled"])
 
@@ -756,3 +1151,8 @@ class ConfigNotebook(ttk.Frame):
                 button.itemconfigure(
                     "tri", fill="#AAAAAA"
                 )
+
+    def destroy(self):
+        self._stale = True
+        self._cancel_all_feedback()
+        super().destroy()
