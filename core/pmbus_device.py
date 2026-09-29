@@ -213,6 +213,507 @@ class PMBusDevice:
     def _can_read_register(self, cmd, size):
         return self.can_read_register(cmd, size)
 
+    def apply_vout_write_plan(self, changes):
+        """Apply a VOUT_COMMAND-only plan with readback.
+
+        Returns a partial execution report on transport failure.
+        No automatic rollback or NVM store is performed.
+        """
+        plan = [dict(change) for change in changes]
+
+        if not plan:
+            raise ValueError("The write plan is empty")
+
+        if getattr(self, "is_demo", False):
+            raise ValueError("Demo writes are disabled")
+
+        for change in plan:
+            cmd = change.get("cmd")
+            info = self._regmap.get(cmd)
+
+            if info is None or info[0] != "VOUT_COMMAND":
+                raise ValueError(
+                    "This stage permits VOUT_COMMAND only. "
+                    "Remove other edits from the plan."
+                )
+
+        report = {
+            "ok": False,
+            "verified": [],
+            "attempted": [],
+            "error": None,
+            "disconnect": None,
+        }
+
+        with self._lock:
+            active = "Preflight"
+
+            try:
+                # Validate the entire plan and all baselines before
+                # the first configuration write.
+                checked = self.check_write_plan(plan)
+
+                if not checked["ok"]:
+                    failures = []
+                    for item in checked["results"]:
+                        if item["status"] != "match":
+                            failures.append(
+                                f"CH{item['page']} "
+                                f"{item['name']}: {item['status']}"
+                            )
+
+                    report["error"] = (
+                        "Preflight failed. No configuration "
+                        "writes were attempted.\n"
+                        + "\n".join(failures)
+                    )
+                    return report
+
+                for change in plan:
+                    page = change["page"]
+                    cmd = change["cmd"]
+                    active = (
+                        f"CH{page} {change['name']} "
+                        f"0x{cmd:02X}"
+                    )
+
+                    # Recheck just before this particular write.
+                    current = self.read_register(page, cmd)
+
+                    if current is None:
+                        raise OSError(
+                            "Cannot read the current value"
+                        )
+
+                    if current != change["previous_raw"]:
+                        raise ValueError(
+                            "Baseline changed before write: "
+                            f"expected 0x{change['previous_raw']:04X}, "
+                            f"received 0x{current:04X}"
+                        )
+
+                    if not self.can_write_register(
+                        cmd, change["size"]
+                    ):
+                        raise ValueError("Write is blocked")
+
+                    # A failed transaction may still have reached
+                    # the device. Record the attempt beforehand.
+                    report["attempted"].append(dict(change))
+
+                    if not self.write_register(
+                        page,
+                        cmd,
+                        change["new_raw"],
+                        change["size"],
+                    ):
+                        raise OSError(
+                            self.last_error
+                            or "Register write failed"
+                        )
+
+                    actual = self.read_register(page, cmd)
+
+                    if actual is None:
+                        raise OSError(
+                            "Write attempted, but readback failed"
+                        )
+
+                    if actual != change["new_raw"]:
+                        raise OSError(
+                            "Readback mismatch: "
+                            f"expected 0x{change['new_raw']:04X}, "
+                            f"received 0x{actual:04X}"
+                        )
+
+                    verified = dict(change)
+                    verified["actual_raw"] = actual
+                    report["verified"].append(verified)
+
+                report["ok"] = True
+                return report
+
+            except TransportDisconnectedError as exc:
+                report["disconnect"] = exc
+                report["error"] = f"{active}\n{exc}"
+                return report
+
+            except Exception as exc:
+                report["error"] = f"{active}\n{exc}"
+                return report
+
+    def validate_dump_metadata(self, metadata, records):
+        """Check imported dump compatibility without device I/O.
+
+        Records must already have passed validate_dump_write_records.
+        Metadata is a compatibility declaration, not authentication.
+        """
+        with self._lock:
+            if not self._identified:
+                raise RuntimeError("Device is not identified")
+
+            if getattr(self, "is_demo", False):
+                raise ValueError("Demo writes are disabled")
+
+            if not isinstance(metadata, dict):
+                raise ValueError("CSV metadata must be a dictionary")
+
+            if metadata.get("device") != self.name:
+                raise ValueError(
+                    "CSV device model is missing or does not match"
+                )
+
+            sid_text = metadata.get("special_id")
+            if (
+                not isinstance(sid_text, str)
+                or not sid_text.lower().startswith("0x")
+            ):
+                raise ValueError(
+                    "CSV Special ID must be hexadecimal with 0x prefix"
+                )
+
+            try:
+                sid = int(sid_text, 16)
+            except ValueError as exc:
+                raise ValueError("Invalid CSV Special ID") from exc
+
+            if not 0 <= sid <= 0xFFFF or sid != self.special_id:
+                raise ValueError(
+                    "CSV Special ID does not match the device"
+                )
+
+            # A single exponent in the current CSV format must
+            # match every selected L16 target page.
+            l16_pages = {
+                record["page"]
+                for record in records
+                if self._regmap[record["cmd"]][2] == "L16"
+            }
+
+            if l16_pages:
+                exponent_text = metadata.get("vout_mode_exp")
+                if not isinstance(exponent_text, str):
+                    raise ValueError(
+                        "CSV VOUT exponent is missing"
+                    )
+
+                try:
+                    exponent = int(exponent_text, 10)
+                except ValueError as exc:
+                    raise ValueError(
+                        "Invalid CSV VOUT exponent"
+                    ) from exc
+
+                if not -16 <= exponent <= 15:
+                    raise ValueError(
+                        "CSV VOUT exponent is outside the signed "
+                        "five-bit range"
+                    )
+
+                for page in sorted(l16_pages):
+                    actual = self.vout_exp.get(page)
+                    if actual is None or actual != exponent:
+                        raise ValueError(
+                            f"CSV VOUT exponent does not match "
+                            f"target page {page}"
+                        )
+
+            return True
+
+    def validate_dump_write_records(self, records, default_page=0):
+        """Validate selected dump writes without device I/O.
+
+        Return independent record dictionaries in the original order.
+        This does not validate board safety, baselines or write order.
+        """
+        with self._lock:
+            if not self._identified:
+                raise RuntimeError("Device is not identified")
+
+            if getattr(self, "is_demo", False):
+                raise ValueError("Demo writes are disabled")
+
+            if not self._valid_page(default_page):
+                raise ValueError("Invalid default page")
+
+            validated = []
+            seen = set()
+
+            for index, record in enumerate(records, start=1):
+                prefix = f"Record {index}"
+
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"{prefix}: expected a record dictionary"
+                    )
+
+                cmd = record.get("cmd")
+                if (
+                    isinstance(cmd, bool)
+                    or not isinstance(cmd, int)
+                    or not 0 <= cmd <= 0xFF
+                ):
+                    raise ValueError(
+                        f"{prefix}: invalid command code"
+                    )
+
+                info = self._regmap.get(cmd)
+                if info is None:
+                    raise ValueError(
+                        f"{prefix}: unknown command 0x{cmd:02X}"
+                    )
+
+                name, size, fmt, paged = info
+                prefix = f"{prefix} / {name}"
+
+                if size not in {"byte", "word"}:
+                    raise ValueError(
+                        f"{prefix}: scalar access required"
+                    )
+
+                if record.get("size") != size:
+                    raise ValueError(
+                        f"{prefix}: size mismatch"
+                    )
+
+                # Older in-memory callers may omit descriptive
+                # fields. If present, they must match the profile.
+                if "name" in record and record["name"] != name:
+                    raise ValueError(
+                        f"{prefix}: name mismatch"
+                    )
+
+                if "format" in record and record["format"] != fmt:
+                    raise ValueError(
+                        f"{prefix}: format mismatch"
+                    )
+
+                if "is_paged" in record:
+                    scope = record["is_paged"]
+                    if (
+                        not isinstance(scope, bool)
+                        or scope != bool(paged)
+                    ):
+                        raise ValueError(
+                            f"{prefix}: scope mismatch"
+                        )
+
+                if record.get("readonly") is not False:
+                    raise ValueError(
+                        f"{prefix}: not selected as writable"
+                    )
+
+                if not self.can_write_register(cmd, size):
+                    raise ValueError(
+                        f"{prefix}: write blocked by device profile"
+                    )
+
+                page = record.get("page", default_page)
+                if not self._valid_page(page):
+                    raise ValueError(
+                        f"{prefix}: invalid page {page!r}"
+                    )
+
+                raw = record.get("raw")
+                maximum = 0xFF if size == "byte" else 0xFFFF
+                if (
+                    isinstance(raw, bool)
+                    or not isinstance(raw, int)
+                    or not 0 <= raw <= maximum
+                ):
+                    raise ValueError(
+                        f"{prefix}: invalid raw value"
+                    )
+
+                try:
+                    self.validate_register_raw(
+                        cmd, raw, size
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{prefix}: {exc}"
+                    ) from exc
+
+                identity = (
+                    page if paged else None,
+                    cmd,
+                )
+                if identity in seen:
+                    raise ValueError(
+                        f"{prefix}: duplicate target register"
+                    )
+                seen.add(identity)
+
+                prepared = dict(record)
+                prepared.update(
+                    page=page,
+                    name=name,
+                    format=fmt,
+                    is_paged=bool(paged),
+                )
+                validated.append(prepared)
+
+            if not validated:
+                raise ValueError("No selected dump writes")
+
+            return validated
+
+    def check_write_plan(self, changes):
+        """Validate a scalar write plan and check device baselines.
+
+        Performs reads only. Does not modify the supplied plan.
+        A successful result is a point-in-time check, not a lock
+        against subsequent changes by other software or hardware.
+        """
+        manual_only = {
+            "OPERATION",
+            "ON_OFF_CONFIG",
+            "WRITE_PROTECT",
+        }
+
+        with self._lock:
+            if not self._identified:
+                raise RuntimeError("Device is not identified")
+
+            validated = []
+            seen = set()
+
+            # Validate the entire plan before any device I/O.
+            for change in changes:
+                cmd = change.get("cmd")
+                if (
+                    isinstance(cmd, bool)
+                    or not isinstance(cmd, int)
+                    or not 0 <= cmd <= 0xFF
+                ):
+                    raise ValueError("Invalid command code")
+
+                info = self._regmap.get(cmd)
+                if info is None:
+                    raise ValueError(
+                        f"Unknown command 0x{cmd:02X}"
+                    )
+
+                name, size, fmt, paged = info
+
+                if name in manual_only:
+                    raise ValueError(
+                        f"{name}: individual write required"
+                    )
+
+                if size not in {"byte", "word"}:
+                    raise ValueError(
+                        f"{name}: scalar access required"
+                    )
+
+                if (
+                    change.get("name") != name
+                    or change.get("size") != size
+                    or change.get("format") != fmt
+                ):
+                    raise ValueError(
+                        f"{name}: plan does not match device profile"
+                    )
+
+                plan_paged = change.get("is_paged")
+                if (
+                    not isinstance(plan_paged, bool)
+                    or plan_paged != bool(paged)
+                ):
+                    raise ValueError(
+                        f"{name}: register scope mismatch"
+                    )
+
+                page = change.get("page")
+                if paged:
+                    if not self._valid_page(page):
+                        raise ValueError(
+                            f"{name}: invalid page {page!r}"
+                        )
+                elif page is not None:
+                    raise ValueError(
+                        f"{name}: global register must use page=None"
+                    )
+
+                identity = (page, cmd)
+                if identity in seen:
+                    raise ValueError(
+                        f"{name}: duplicate plan entry"
+                    )
+                seen.add(identity)
+
+                if not self.can_read_register(cmd, size):
+                    raise ValueError(
+                        f"{name}: read unavailable"
+                    )
+
+                if not self.can_write_register(cmd, size):
+                    raise ValueError(
+                        f"{name}: write blocked"
+                    )
+
+                maximum = 0xFF if size == "byte" else 0xFFFF
+
+                for field in ("previous_raw", "new_raw"):
+                    raw = change.get(field)
+                    if (
+                        isinstance(raw, bool)
+                        or not isinstance(raw, int)
+                        or not 0 <= raw <= maximum
+                    ):
+                        raise ValueError(
+                            f"{name}: invalid {field}"
+                        )
+
+                # Copy the fields used during the hardware check.
+                validated.append({
+                    "page": page,
+                    "cmd": cmd,
+                    "name": name,
+                    "size": size,
+                    "previous_raw": change["previous_raw"],
+                    "new_raw": change["new_raw"],
+                })
+
+            results = []
+
+            for entry in validated:
+                page = entry["page"]
+                actual = self.read_register(
+                    page if page is not None else 0,
+                    entry["cmd"],
+                )
+
+                result = dict(entry)
+                result["actual_raw"] = actual
+
+                if actual is None:
+                    result["status"] = "read_error"
+                elif actual != entry["previous_raw"]:
+                    result["status"] = "conflict"
+                else:
+                    result["status"] = "match"
+
+                results.append(result)
+
+                # Stop on the first ordinary read failure.
+                # TransportDisconnectedError propagates immediately.
+                if actual is None:
+                    break
+
+            return {
+                "ok": (
+                    len(results) == len(validated)
+                    and all(
+                        item["status"] == "match"
+                        for item in results
+                    )
+                ),
+                "total": len(validated),
+                "checked": len(results),
+                "results": results,
+            }
+
     def can_write_register(self, cmd, size=None):
         if not self._identified:
             return False
@@ -468,22 +969,85 @@ class PMBusDevice:
             )
             return False
 
+    def validate_register_raw(self, cmd, value, size):
+        """Validate a scalar write value without device I/O.
+
+        Checks access, representation and profile value rules.
+        Does not establish board safety or command effectiveness.
+        Returns the original value without normalization.
+        """
+        if (
+            isinstance(cmd, bool)
+            or not isinstance(cmd, int)
+            or not 0 <= cmd <= 0xFF
+        ):
+            raise ValueError("Invalid command code")
+
+        if size not in {"byte", "word"}:
+            raise ValueError("Scalar size must be byte or word")
+
+        if not self.can_write_register(cmd, size):
+            raise ValueError("Register write is blocked")
+
+        maximum = 0xFF if size == "byte" else 0xFFFF
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= maximum
+        ):
+            raise ValueError(
+                f"Raw value must be in 0x00..0x{maximum:X}"
+            )
+
+        rule = self._metadata.get(
+            "write_value_rules", {}
+        ).get(cmd)
+
+        if rule is None:
+            return value
+
+        name = self._regmap[cmd][0]
+
+        if value in rule.get("requires_context", ()):
+            raise ValueError(
+                f"{name}: "
+                + rule.get(
+                    "context_error",
+                    "Current device configuration is required.",
+                )
+            )
+
+        if value not in rule["allowed"]:
+            raise ValueError(
+                f"{name}: "
+                + rule.get(
+                    "invalid_error",
+                    "Value rejected by device profile.",
+                )
+            )
+
+        return value
+
     def _write_checked(self, cmd, value, size):
         with self._lock:
-            if not self.can_write_register(cmd, size):
-                self._error("write_register", cmd, "Write blocked")
-                return False
-
-            maximum = 0xFF if size == "byte" else 0xFFFF
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 0 <= value <= maximum
-            ):
+            try:
+                self.validate_register_raw(
+                    cmd, value, size
+                )
+            except ValueError as exc:
+                error_cmd = (
+                    cmd
+                    if isinstance(cmd, int)
+                    and not isinstance(cmd, bool)
+                    and 0 <= cmd <= 0xFF
+                    else 0
+                )
                 self._error(
-                    "write_register", cmd, "Value out of range"
+                    "write_register", error_cmd, exc
                 )
                 return False
+
+
 
             if self._regmap[cmd][3]:
                 page = self._page
@@ -928,55 +1492,119 @@ class PMBusDevice:
 
     def write_register(self, page, cmd_code, raw_value, size):
         with self._lock:
-            if not self.can_write_register(cmd_code, size):
-                self._error("write_register", cmd_code, "Write blocked")
+            # Validate before PAGE selection or any device I/O.
+            try:
+                self.validate_register_raw(
+                    cmd_code, raw_value, size
+                )
+            except ValueError as exc:
+                error_cmd = (
+                    cmd_code
+                    if isinstance(cmd_code, int)
+                    and not isinstance(cmd_code, bool)
+                    and 0 <= cmd_code <= 0xFF
+                    else 0
+                )
+                self._error(
+                    "write_register", error_cmd, exc
+                )
                 return False
+
             if self._regmap[cmd_code][3]:
                 if not self.set_page(page):
                     return False
-            return self._write_checked(cmd_code, raw_value, size)
+
+            return self._write_checked(
+                cmd_code, raw_value, size
+            )
+
+    def encode_register_value(self, page, cmd, value, fmt):
+        """Validate and encode a value without device I/O.
+
+        Checks transport representation, not board-specific limits.
+        Custom formats require a separate engineering encoder.
+        """
+        info = self._regmap.get(cmd)
+
+        if info is None or not self.can_write_register(cmd):
+            raise ValueError("Register write is blocked")
+
+        name, size, actual_fmt, paged = info
+
+        if fmt != actual_fmt:
+            raise ValueError("Register format mismatch")
+
+        if paged and not self._valid_page(page):
+            raise ValueError(f"Invalid page {page!r}")
+
+        if cmd in self._metadata.get("custom_formats", {}):
+            raise ValueError(
+                f"{name}: custom engineering encoding is unavailable; "
+                "use an explicit raw write"
+            )
+
+        if isinstance(value, bool):
+            raise ValueError("Boolean values are not accepted")
+
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("Value must be finite")
+
+        if fmt in {"BYTE", "RAW"}:
+            if not number.is_integer():
+                raise ValueError("Raw value must be integral")
+            raw = int(number)
+
+        elif fmt == "L16":
+            exponent = self.vout_exp.get(page)
+            if exponent is None:
+                raise ValueError("VOUT exponent unavailable")
+
+            maximum_value = 0xFFFF * (2.0 ** exponent)
+            if not 0 <= number <= maximum_value:
+                raise ValueError("L16 value out of range")
+
+            raw = encode_value(number, fmt, exponent)
+
+        elif fmt == "L11":
+            maximum_value = 1023 * 2 ** 15
+            if not -maximum_value <= number <= maximum_value:
+                raise ValueError("L11 value out of range")
+
+            raw = encode_value(number, fmt)
+
+        else:
+            raise ValueError(f"Unsupported format {fmt}")
+
+        maximum_raw = 0xFF if size == "byte" else 0xFFFF
+
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, int)
+            or not 0 <= raw <= maximum_raw
+        ):
+            raise ValueError("Encoded value out of range")
+
+        return self.validate_register_raw(
+            cmd, raw, size
+        )
 
     def write_val(self, page, cmd, value, fmt):
-        info = self._regmap.get(cmd)
-        if info is None or not self.can_write_register(cmd):
-            self._error("write_val", cmd, "Write blocked")
-            return False
-
         try:
-            if fmt != info[2]:
-                raise ValueError("Register format mismatch")
-
-            number = float(value)
-            if not math.isfinite(number):
-                raise ValueError("Value must be finite")
-
-            if fmt in {"BYTE", "RAW"}:
-                if not number.is_integer():
-                    raise ValueError("Raw value must be integral")
-                raw = int(number)
-
-            elif fmt == "L16":
-                exponent = self.vout_exp.get(page)
-                if exponent is None:
-                    raise ValueError("VOUT exponent unavailable")
-                if not 0 <= number <= 0xFFFF * (2.0 ** exponent):
-                    raise ValueError("L16 value out of range")
-                raw = encode_value(number, fmt, exponent)
-
-            elif fmt == "L11":
-                # The existing encoder uses a symmetric mantissa limit.
-                if not -(1023 * 2 ** 15) <= number <= 1023 * 2 ** 15:
-                    raise ValueError("L11 value out of range")
-                raw = encode_value(number, fmt)
-
-            else:
-                raise ValueError(f"Unsupported format {fmt}")
-
-            return self.write_register(page, cmd, raw, info[1])
+            raw = self.encode_register_value(
+                page, cmd, value, fmt
+            )
 
         except (ValueError, TypeError, OverflowError) as exc:
             self._error("write_val", cmd, exc)
             return False
+
+        return self.write_register(
+            page,
+            cmd,
+            raw,
+            self._regmap[cmd][1],
+        )
 
     def _send_named(self, name):
         for cmd, action in self._metadata["send_commands"].items():
