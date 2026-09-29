@@ -26,6 +26,9 @@ def get_device_profile(special_id):
                     'register_overrides': getattr(
                         mod, 'REGISTER_OVERRIDES', {}
                     ),
+                    'remove_commands': getattr(
+                        mod, 'REMOVE_COMMANDS', set()
+                    ),
                     'read_only_extra': getattr(
                         mod, 'READ_ONLY_EXTRA', set()
                     ),
@@ -49,6 +52,12 @@ def get_device_profile(special_id):
                     ),
                     'custom_formats': getattr(
                         mod, 'CUSTOM_FORMATS', {}
+                    ),
+                    'write_value_rules': getattr(
+                        mod, 'WRITE_VALUE_RULES', {}
+                    ),
+                    'control_options': getattr(
+                        mod, 'CONTROL_OPTIONS', {}
                     ),
                     'block_lengths': getattr(
                         mod, 'BLOCK_LENGTHS', {}
