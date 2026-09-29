@@ -112,3 +112,38 @@ GLOBAL_CMDS_EXTRA = {
     for cmd, (_, _, _, paged) in REGISTER_OVERRIDES.items()
     if not paged
 }
+
+WRITE_VALUE_RULES = {
+    0x01: {
+        "allowed": frozenset({
+            0x00, 0x40, 0x80, 0x98, 0xA8,
+        }),
+        "invalid_error": (
+            "Unsupported OPERATION value for this device."
+        ),
+    },
+    0x02: {
+        "allowed": frozenset({
+            0x16, 0x17, 0x1E, 0x1F,
+        }),
+        "invalid_error": (
+            "Unsupported ON_OFF_CONFIG value for this device."
+        ),
+    },
+}
+
+CONTROL_OPTIONS = {
+    "OPERATION": (
+        (0x80, "On / Nominal"),
+        (0xA8, "Margin High"),
+        (0x98, "Margin Low"),
+        (0x40, "Sequence off"),
+        (0x00, "Immediate off"),
+    ),
+    "ON_OFF_CONFIG": (
+        (0x1E, "CMD+RUN / TOFF sequence"),
+        (0x1F, "CMD+RUN / Immediate off"),
+        (0x16, "RUN only / TOFF sequence"),
+        (0x17, "RUN only / Immediate off"),
+    ),
+}
