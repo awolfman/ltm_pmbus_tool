@@ -20,7 +20,6 @@ from core.bus_factory import (
 from core.pmbus_device import PMBusDevice
 from gui.device_tab import DeviceTab
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -28,7 +27,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("LTM PMBus Tool v4.8")
+        self.title("LTM PMBus Tool v4.8.8")
         self.geometry("1380x850")
         self.minsize(1100, 700)
 
@@ -152,8 +151,45 @@ class App(tk.Tk):
         # Replace only after successful enumeration.
         self._bus_map = new_map
 
+    def _operation_in_progress(self):
+        """Include tab actions and individual Config operations."""
+        if self._busy:
+            return True
+
+        return any(
+            tab._action_busy or tab._config_operation_busy()
+            for tab in self.tabs
+        )
+
+    def _other_tab_operation_busy(self, requester):
+        """Block manual entry during app or other-tab operations."""
+        if getattr(self, "_closing", False):
+            return True
+
+        registered = any(
+            tab is requester
+            for tab in self.tabs
+        )
+
+        # Existing tabs must not start manual operations while
+        # Scan, Refresh or Connect owns the application.
+        #
+        # A new DeviceTab performs its initial Read All before
+        # _add_device registers it in self.tabs.
+        if getattr(self, "_busy", False) and registered:
+            return True
+
+        return any(
+            tab is not requester
+            and (
+                tab._action_busy
+                or tab._config_operation_busy()
+            )
+            for tab in self.tabs
+        )
+
     def _refresh_buses(self):
-        if self._closing or self._busy:
+        if self._closing or self._operation_in_progress():
             return
 
         self._busy = True
@@ -218,7 +254,7 @@ class App(tk.Tk):
         tk.Label(
             frame,
             text=(
-                "LTM PMBus Tool v4.8\n\n"
+                "LTM PMBus Tool v4.8.8\n\n"
                 "Device profiles\n"
                 "LTM4673 / LTM4677 / LTM4678\n\n"
                 "USB adapters\n"
@@ -279,7 +315,7 @@ class App(tk.Tk):
         )
 
     def scan(self):
-        if self._closing or self._busy:
+        if self._closing or self._operation_in_progress():
             return
 
         bus_num = self._get_bus_num()
@@ -341,7 +377,7 @@ class App(tk.Tk):
             self._busy = False
 
     def connect_manual(self):
-        if self._closing or self._busy:
+        if self._closing or self._operation_in_progress():
             return
 
         try:
@@ -411,6 +447,13 @@ class App(tk.Tk):
 
     def _quit(self):
         if self._closing:
+            return
+
+        if self._operation_in_progress():
+            self._status(
+                "Operation in progress. Finish or cancel it "
+                "before closing the application."
+            )
             return
 
         self._closing = True
