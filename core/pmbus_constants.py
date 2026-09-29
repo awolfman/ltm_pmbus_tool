@@ -264,6 +264,18 @@ def build_device_metadata(special_id=None):
             extras.get("remove_commands", set())
         ),
         "vout_exponent": extras.get("vout_exponent"),
+        "write_value_rules": {
+            cmd: dict(rule)
+            for cmd, rule in extras.get(
+                "write_value_rules", {}
+            ).items()
+        },
+        "control_options": {
+            name: tuple(options)
+            for name, options in extras.get(
+                "control_options", {}
+            ).items()
+        },
     }
 
     if name is not None:
