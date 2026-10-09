@@ -47,12 +47,32 @@ def check_deps(sim_mode=False):
     checks = [
         ("tkinter", ("Tk",), None),
         ("tkinter.ttk", ("Frame",), None),
-        ("usb.core", ("find",), "pyusb"),
-        ("usb.util", ("dispose_resources",), "pyusb"),
-        ("pyftdi.ftdi", ("Ftdi",), "pyftdi"),
-        ("pyftdi.i2c", ("I2cController",), "pyftdi"),
-        ("hid", ("device", "enumerate"), "hidapi"),
     ]
+
+    if not sim_mode:
+        checks.extend([
+            ("usb.core", ("find",), "pyusb"),
+            (
+                "usb.util",
+                ("dispose_resources",),
+                "pyusb",
+            ),
+            (
+                "pyftdi.ftdi",
+                ("Ftdi",),
+                "pyftdi",
+            ),
+            (
+                "pyftdi.i2c",
+                ("I2cController",),
+                "pyftdi",
+            ),
+            (
+                "hid",
+                ("device", "enumerate"),
+                "hidapi",
+            ),
+        ])
 
     tkinter_failed = False
     pyusb_available = True
@@ -182,11 +202,15 @@ def check_deps(sim_mode=False):
             "configure the adapter driver as required by PyUSB.",
         ])
 
+    if not sim_mode:
+        lines.extend([
+            "",
+            "For hid import errors, check that the package is hidapi.",
+            "Do not install both hid and hidapi into the same environment "
+            "without checking for module conflicts.",
+        ])
+
     lines.extend([
-        "",
-        "For hid import errors, check that the package is hidapi.",
-        "Do not install both hid and hidapi into the same environment "
-        "without checking for module conflicts.",
         "",
         "Install or repair the dependencies, then restart.",
         "",
