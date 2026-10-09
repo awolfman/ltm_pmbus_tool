@@ -18,6 +18,7 @@ from core.pmbus_constants import (
     build_device_metadata,
 )
 from core.pmbus_formats import decode_value, encode_value
+from core.drivers import CP2112AddressNackError
 
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,10 @@ NVM_ACTION_NAMES = EXPLICIT_ACTION_NAMES - {
 }
 
 class TransportDisconnectedError(RuntimeError):
-    """USB-I2C adapter disappeared during a PMBus transaction."""
+    """Fatal transport loss handled by legacy disconnect handlers."""
+
+class TransportSessionFailedError(TransportDisconnectedError):
+    """Transport session is unusable; USB removal is not established."""
 
 
 def _is_device_disconnected(exc):
@@ -173,6 +177,42 @@ class PMBusDevice:
             self._raw_bus_instance = create_bus(self.bus_num)
         return self._raw_bus_instance
 
+    def transport_failed(self):
+        """Return whether the active transport session is unusable."""
+        bus = self._raw_bus_instance
+
+        if bus is None:
+            return False
+
+        checker = getattr(bus, "session_failed", None)
+
+        if not callable(checker):
+            return False
+
+        return bool(checker())
+
+    def _raise_if_transport_lost(self, exc, operation, cmd):
+        """Propagate fatal transport errors before any retry."""
+        if isinstance(exc, TransportDisconnectedError):
+            self._page = None
+            raise exc
+
+        if _is_device_disconnected(exc):
+            self._page = None
+            raise TransportDisconnectedError(
+                "USB-I2C adapter disconnected during "
+                f"{operation} at command 0x{cmd:02X}"
+            ) from exc
+
+        if self.transport_failed():
+            self._page = None
+            raise TransportSessionFailedError(
+                "Transport session is unusable during "
+                f"{operation} at command 0x{cmd:02X}. "
+                f"Original error: {exc}. "
+                "Further operations require an explicit reconnect."
+            ) from exc
+
     def reset_bus(self):
         with self._lock:
             self._page = None
@@ -212,6 +252,129 @@ class PMBusDevice:
 
     def _can_read_register(self, cmd, size):
         return self.can_read_register(cmd, size)
+
+    def apply_dump_write_plan(self, records):
+        """Apply a validated dump plan with baseline and readback.
+
+        No rollback and no NVM store are performed.
+        The input records are not modified.
+        """
+        report = {
+            "ok": False,
+            "verified": [],
+            "attempted": [],
+            "error": None,
+            "disconnect": None,
+        }
+
+        with self._lock:
+            active = "Dump preflight"
+
+            try:
+                validated = self.validate_dump_write_records(
+                    records
+                )
+
+                if not validated:
+                    raise ValueError(
+                        "No selected dump writes"
+                    )
+
+                prepared = []
+
+                # Read every baseline before the first write.
+                for record in validated:
+                    page = record["page"]
+                    cmd = record["cmd"]
+                    active = (
+                        f"Record page {page}, "
+                        f"command 0x{cmd:02X}"
+                    )
+
+                    current = self.read_register(page, cmd)
+
+                    if current is None:
+                        raise OSError(
+                            f"Cannot read baseline for "
+                            f"page {page}, command 0x{cmd:02X}"
+                        )
+
+                    item = dict(record)
+                    item["current_raw"] = current
+                    prepared.append(item)
+
+                for item in prepared:
+                    page = item["page"]
+                    cmd = item["cmd"]
+                    size = item["size"]
+                    target = item["raw"]
+                    active = (
+                        f"Record page {page}, "
+                        f"command 0x{cmd:02X}"
+                    )
+
+                    # Recheck immediately before this write.
+                    current = self.read_register(page, cmd)
+
+                    if current is None:
+                        raise OSError(
+                            f"Cannot recheck baseline for "
+                            f"page {page}, command 0x{cmd:02X}"
+                        )
+
+                    if current != item["current_raw"]:
+                        raise ValueError(
+                            "Baseline changed before write: "
+                            f"page {page}, command 0x{cmd:02X}, "
+                            f"expected 0x{item['current_raw']:04X}, "
+                            f"received 0x{current:04X}"
+                        )
+
+                    # A failed transaction may still have reached
+                    # the device. Record the attempt first.
+                    report["attempted"].append(dict(item))
+
+                    if not self.write_register(
+                        page,
+                        cmd,
+                        target,
+                        size,
+                    ):
+                        raise OSError(
+                            self.last_error
+                            or "Register write failed"
+                        )
+
+                    actual = self.read_register(page, cmd)
+
+                    if actual is None:
+                        raise OSError(
+                            "Write attempted, but readback failed"
+                        )
+
+                    if actual != target:
+                        raise OSError(
+                            "Readback mismatch: "
+                            f"page {page}, command 0x{cmd:02X}, "
+                            f"expected 0x{target:04X}, "
+                            f"received 0x{actual:04X}"
+                        )
+
+                    verified = dict(item)
+                    verified["actual_raw"] = actual
+                    report["verified"].append(verified)
+
+                report["ok"] = True
+                return report
+
+            except TransportDisconnectedError as exc:
+                report["disconnect"] = exc
+                report["error"] = f"{active}\n{exc}"
+                return report
+
+            except Exception as exc:
+                report["error"] = f"{active}\n{exc}"
+                return report
 
     def apply_vout_write_plan(self, changes):
         """Apply a VOUT_COMMAND-only plan with readback.
@@ -768,12 +931,23 @@ class PMBusDevice:
 
                 return value
 
+            except CP2112AddressNackError as exc:
+                # The CP2112 returned a complete terminal status
+                # report. The adapter session remains usable, but
+                # this target address did not respond.
+                failure = exc
+                self._error(
+                    f"read_{size}",
+                    cmd,
+                    exc,
+                    quiet=quiet,
+                )
+                return None
+
             except Exception as exc:
-                if _is_device_disconnected(exc):
-                    raise TransportDisconnectedError(
-                        "USB-I2C adapter disconnected during "
-                        f"{method} at 0x{cmd:02X}"
-                    ) from exc
+                self._raise_if_transport_lost(
+                    exc, method, cmd
+                )
 
                 failure = exc
                 if attempt + 1 < attempts:
@@ -853,11 +1027,9 @@ class PMBusDevice:
                 return list(data)
 
             except Exception as exc:
-                if _is_device_disconnected(exc):
-                    raise TransportDisconnectedError(
-                        "USB-I2C adapter disconnected during "
-                        f"block read at 0x{cmd:02X}"
-                    ) from exc
+                self._raise_if_transport_lost(
+                    exc, "block read", cmd
+                )
 
                 self._error("read_block", cmd, exc)
                 return None
@@ -888,12 +1060,11 @@ class PMBusDevice:
 
             time.sleep(PMBUS_PAUSE)
             return True
+
         except Exception as exc:
-            if _is_device_disconnected(exc):
-                raise TransportDisconnectedError(
-                    "USB-I2C adapter disconnected during "
-                    f"write at 0x{cmd:02X}"
-                ) from exc
+            self._raise_if_transport_lost(
+                exc, f"write_{size}", cmd
+            )
 
             self._error(f"write_{size}", cmd, exc)
             return False
@@ -914,10 +1085,12 @@ class PMBusDevice:
 
         while time.monotonic() < deadline:
             value = self._read_transport(
-                Cmd.MFR_COMMON, "byte", attempts=1, quiet=True
+                Cmd.MFR_COMMON,
+                "byte",
+                attempts=1,
+                quiet=True,
             )
-            # Without verified slave ACK, all-ones is not sufficient
-            # evidence that this device is ready.
+
             if value is not None and value != 0xFF:
                 if value & mask == mask:
                     return True
@@ -1675,3 +1848,154 @@ class PMBusDevice:
                     "readonly": not self.can_write_register(cmd, size),
                 })
             return result
+
+def diagnostic_read_ltm4677_current(device):
+    """Read-only LTM4677 current measurement diagnostic."""
+
+    print()
+    print("LTM4677 current diagnostic")
+    print(f"model      = {device.name}")
+    print(f"address    = 0x{device.address:02X}")
+    print(
+        f"special_id = 0x{device.special_id:04X}"
+        if device.special_id is not None
+        else "special_id = None"
+    )
+    print(f"pages      = {device.num_pages}")
+    print()
+
+    registers = (
+        ("READ_VOUT", 0x8B, "word"),
+        ("READ_IOUT", 0x8C, "word"),
+        ("IOUT_CAL_GAIN", 0x38, "word"),
+        ("STATUS_WORD", 0x79, "word"),
+        ("STATUS_MFR_SPECIFIC", 0x80, "byte"),
+    )
+
+    for page in range(device.num_pages):
+        print(f"PAGE {page}")
+        print("-" * 72)
+
+        for name, cmd, size in registers:
+            try:
+                raw = device.read_register(page, cmd)
+
+                if raw is None:
+                    print(
+                        f"{name:22} raw=None"
+                    )
+                    continue
+
+                try:
+                    decoded = device._decode(
+                        cmd,
+                        raw,
+                        page,
+                        custom=True,
+                    )
+                except Exception as exc:
+                    decoded = f"decode error: {exc}"
+
+                width = 2 if size == "byte" else 4
+
+                print(
+                    f"{name:22} "
+                    f"raw=0x{raw:0{width}X}  "
+                    f"decoded={decoded!r}"
+                )
+
+            except Exception as exc:
+                print(
+                    f"{name:22} "
+                    f"READ ERROR: {exc}"
+                )
+
+        try:
+            telemetry = device.read_channel_telemetry(page)
+
+            print()
+            print("public telemetry:")
+            for key in (
+                "VOUT",
+                "IOUT",
+                "POUT",
+                "TEMP1",
+                "IIN",
+                "DUTY",
+            ):
+                print(
+                    f"{key:22} "
+                    f"{telemetry.get(key)!r}"
+                )
+
+        except Exception as exc:
+            print(f"public telemetry ERROR: {exc}")
+
+        print()
+
+def diagnostic_repeat_ltm4677_current(device, count=10):
+    """Repeat read-only LTM4677 current and channel diagnostics."""
+
+    paged_commands = (
+        ("OPERATION", 0x01),
+        ("ON_OFF_CONFIG", 0x02),
+        ("READ_VOUT", 0x8B),
+        ("READ_IOUT", 0x8C),
+        ("IOUT_CAL_GAIN", 0x38),
+        ("MFR_IOUT_CAL_GAIN_TC", 0xF6),
+        ("MFR_CHAN_CONFIG", 0xD0),
+        ("MFR_GPIO_PROPAGATE", 0xD2),
+        ("MFR_PWM_MODE", 0xD4),
+        ("MFR_GPIO_RESPONSE", 0xD5),
+        ("STATUS_WORD", 0x79),
+        ("STATUS_MFR_SPECIFIC", 0x80),
+    )
+
+    global_commands = (
+        ("WRITE_PROTECT", 0x10),
+        ("MFR_CONFIG_ALL", 0xD1),
+    )
+
+    print()
+    print("Repeated LTM4677 current diagnostic")
+    print(f"count={count}")
+
+    print()
+    print("GLOBAL")
+    for name, cmd in global_commands:
+        try:
+            raw = device.read_register(0, cmd)
+
+            if raw is None:
+                print(f"{name:24} raw=None")
+            else:
+                print(f"{name:24} raw=0x{raw:02X}")
+
+        except Exception as exc:
+            print(f"{name:24} ERROR: {exc}")
+
+    for page in range(device.num_pages):
+        print()
+        print(f"PAGE {page}")
+
+        for sample in range(count):
+            values = []
+
+            for name, cmd in paged_commands:
+                try:
+                    raw = device.read_register(page, cmd)
+
+                    if raw is None:
+                        text = "None"
+                    else:
+                        width = 2 if cmd == 0x80 else 4
+                        text = f"0x{raw:0{width}X}"
+
+                    values.append(f"{name}={text}")
+
+                except Exception as exc:
+                    values.append(
+                        f"{name}=ERROR:{exc}"
+                    )
+
+            print(f"{sample + 1:02d}: " + " ".join(values))
