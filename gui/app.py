@@ -17,7 +17,11 @@ from core.bus_factory import (
     CP2112_OFFSET,
     close_all_buses,
 )
-from core.pmbus_device import PMBusDevice
+from core.pmbus_device import (
+    PMBusDevice,
+    TransportSessionFailedError,
+    TransportDisconnectedError,
+)
 from gui.device_tab import DeviceTab
 
 logger = logging.getLogger(__name__)
@@ -364,11 +368,40 @@ class App(tk.Tk):
             if not self.tabs:
                 self._welcome()
 
+        except TransportSessionFailedError as exc:
+            logger.exception("Scan stopped: transport session failed")
+            self._status("Transport session failed")
+            messagebox.showerror(
+                "Transport session failed",
+                f"{label}\n\n"
+                f"{exc}\n\n"
+                "The adapter session is unusable. "
+                "Use Refresh, then Scan.",
+                parent=self,
+            )
+            if not self.tabs:
+                self._welcome()
+
+        except TransportDisconnectedError as exc:
+            logger.exception("Scan stopped: adapter disconnected")
+            self._status("Adapter disconnected")
+            messagebox.showerror(
+                "Adapter disconnected",
+                f"{label}\n\n"
+                f"{exc}\n\n"
+                "Reconnect the adapter, then use Refresh and Scan.",
+                parent=self,
+            )
+            if not self.tabs:
+                self._welcome()
+
         except Exception as exc:
             logger.exception("Scan failed")
             self._status("Scan failed")
             messagebox.showerror(
-                "Scan error", str(exc), parent=self
+                "Scan error",
+                f"{label}\n\n{exc}",
+                parent=self,
             )
             if not self.tabs:
                 self._welcome()
