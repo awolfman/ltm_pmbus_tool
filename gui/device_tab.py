@@ -5,38 +5,45 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
+from contextlib import contextmanager, nullcontext
+
 from core.dump_csv import (
     dump_to_csv_string,
     csv_string_to_dump,
     save_csv_atomic,
 )
+from core.pmbus_device import (
+    TransportDisconnectedError,
+    TransportSessionFailedError,
+)
 from gui.channel_frame import ChannelColumn
+from gui.config_notebook import ConfigNotebook
+from gui.profiles import (
+    available_telemetry,
+    get_gui_profile,
+)
 from gui.status_defs import (
     configure_status_tree,
     reset_status_tree,
     render_standard_status,
     render_mfr_common,
     render_mfr_pads,
-    set_status_indicator,
+    set_global_status_indicator,
 )
-from core.pmbus_device import TransportDisconnectedError
-from gui.profiles import (
-    available_telemetry,
-    get_gui_profile,
-)
-from gui.config_notebook import ConfigNotebook
-from contextlib import contextmanager, nullcontext
+
 
 class DeviceTab(ttk.Frame):
 
     def __init__(self, parent, device, **kw):
         super().__init__(parent, **kw)
+
         self.device = device
         self.gui_profile = get_gui_profile(device)
         self._global_telemetry_fields = available_telemetry(
             device,
             self.gui_profile.global_telemetry,
         )
+
         self.channels = []
         self.monitoring = False
         self._monitor_after_id = None
@@ -71,6 +78,7 @@ class DeviceTab(ttk.Frame):
             for widget in parent.winfo_children():
                 if widget in seen:
                     continue
+
                 seen.add(widget)
 
                 if isinstance(widget, ttk.Button):
@@ -95,6 +103,7 @@ class DeviceTab(ttk.Frame):
             yield
 
         except TransportDisconnectedError:
+            # Includes TransportSessionFailedError.
             transport_lost = True
             raise
 
@@ -223,6 +232,9 @@ class DeviceTab(ttk.Frame):
                     self._refresh_status()
 
                 except TransportDisconnectedError as exc:
+                    # Includes TransportSessionFailedError.
+                    # Mark stale inside the activity context so
+                    # controls cannot be enabled on exit.
                     self._handle_disconnect(exc)
 
         except Exception as exc:
@@ -325,7 +337,9 @@ class DeviceTab(ttk.Frame):
             )
         )
 
-    def _check_preview_plan_impl(self, changes, window, check_button=None):
+    def _check_preview_plan_impl(
+        self, changes, window, check_button=None
+    ):
         """Read current device values without changing Config fields."""
         if self._disconnected:
             return
@@ -392,9 +406,7 @@ class DeviceTab(ttk.Frame):
                 )
                 return
 
-            # A synchronous check needs no monitoring interleave.
-            # Restore monitoring state without starting an immediate
-            # extra telemetry read.
+            # Restore monitoring without an immediate extra read.
             was_monitoring = self.monitoring
             self.stop_all()
 
@@ -412,11 +424,12 @@ class DeviceTab(ttk.Frame):
                         result = self.device.check_write_plan(
                             candidates
                         )
+
                     except TransportDisconnectedError as exc:
-                        # Mark stale before leaving the activity
-                        # context or considering monitor restart.
+                        # Includes a blocked transport session.
                         self._handle_disconnect(exc)
                         return
+
             finally:
                 if (
                     was_monitoring
@@ -505,7 +518,9 @@ class DeviceTab(ttk.Frame):
             )
         )
 
-    def _apply_vout_preview_impl(self, changes, window, apply_button=None):
+    def _apply_vout_preview_impl(
+        self, changes, window, apply_button=None
+    ):
         """Apply only VOUT_COMMAND edits from the displayed snapshot."""
         if self._disconnected:
             return
@@ -542,6 +557,7 @@ class DeviceTab(ttk.Frame):
                     )
                     if errors:
                         raise ValueError("\n".join(errors))
+
                     current.extend(prepared)
 
                 # The editor traversal order is stable.
@@ -606,8 +622,7 @@ class DeviceTab(ttk.Frame):
                     changes
                 )
 
-                # The executor returns disconnects in its report.
-                # It normally does not raise them here.
+                # Fatal transport errors are returned in this report.
                 if report["disconnect"] is not None:
                     verified = report["verified"]
                     attempted = report["attempted"]
@@ -634,10 +649,10 @@ class DeviceTab(ttk.Frame):
 
                     window.destroy()
 
-                    # Mark disconnected before leaving the activity
-                    # context, so controls cannot be re-enabled.
+                    # Preserve the distinction between a failed
+                    # session and a recognized USB disconnection.
                     self._handle_disconnect(
-                        TransportDisconnectedError(
+                        type(report["disconnect"])(
                             "\n".join(lines)
                             + "\n\n"
                             "An unverified write may have reached "
@@ -647,13 +662,13 @@ class DeviceTab(ttk.Frame):
                     return
 
         except TransportDisconnectedError as exc:
-            # Defensive handling if a future executor raises instead
+            # Defensive handling if the executor raises instead
             # of returning a partial execution report.
             if window.winfo_exists():
                 window.destroy()
 
             self._handle_disconnect(
-                TransportDisconnectedError(
+                type(exc)(
                     f"{exc}\n\n"
                     "Execution report is unavailable.\n"
                     "An unverified write may have reached the device."
@@ -669,7 +684,6 @@ class DeviceTab(ttk.Frame):
             )
             return
 
-        # Invalidate the preview after an execution attempt.
         # A new attempt must use a newly prepared preview.
         window.destroy()
 
@@ -693,9 +707,8 @@ class DeviceTab(ttk.Frame):
         if report["error"]:
             lines.extend(("", report["error"]))
 
-        # Refresh only successfully verified fields, using the
-        # readback already obtained. Do not perform Read All:
-        # it would discard remaining unwritten input.
+        # Refresh only verified fields using existing readback.
+        # Read All would discard remaining unwritten input.
         try:
             editors = {
                 (
@@ -752,6 +765,7 @@ class DeviceTab(ttk.Frame):
             check = getattr(
                 widget, "_other_tab_operation_busy", None
             )
+
             if callable(check):
                 return bool(check(self))
 
@@ -777,6 +791,7 @@ class DeviceTab(ttk.Frame):
             return
 
         self._action_busy = True
+
         try:
             return callback()
         finally:
@@ -908,9 +923,7 @@ class DeviceTab(ttk.Frame):
                 else "Global"
             )
 
-            width = (
-                2 if change["size"] == "byte" else 4
-            )
+            width = 2 if change["size"] == "byte" else 4
             previous_raw = (
                 f"0x{change['previous_raw']:0{width}X}"
             )
@@ -984,17 +997,31 @@ class DeviceTab(ttk.Frame):
             command=window.destroy,
         ).pack(side="right")
 
-    # top bar
+    # Top bar.
     def _build_top(self):
         top = ttk.Frame(self)
-        top.grid(row=0, column=0, sticky='ew', padx=4, pady=(3, 0))
+        top.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=4,
+            pady=(3, 0),
+        )
 
-        # -- left: device info + global telemetry --
+        # Left: device info and global telemetry.
         left = ttk.Frame(top)
-        left.pack(side='left', fill='y', padx=(0, 4))
+        left.pack(
+            side="left",
+            fill="y",
+            padx=(0, 4),
+        )
 
         info = ttk.LabelFrame(left, text=" Device ")
-        info.pack(fill="x", padx=2, pady=(0, 2))
+        info.pack(
+            fill="x",
+            padx=2,
+            pady=(0, 2),
+        )
 
         info_items = [
             ("IC", self.device.name),
@@ -1046,8 +1073,15 @@ class DeviceTab(ttk.Frame):
                 pady=0,
             )
 
-        gt_fr = ttk.LabelFrame(left, text=" Global Telemetry ")
-        gt_fr.pack(fill='x', padx=2, pady=(0, 2))
+        gt_fr = ttk.LabelFrame(
+            left,
+            text=" Global Telemetry ",
+        )
+        gt_fr.pack(
+            fill="x",
+            padx=2,
+            pady=(0, 2),
+        )
 
         for field in self._global_telemetry_fields:
             key = field.key
@@ -1055,21 +1089,47 @@ class DeviceTab(ttk.Frame):
             unit = field.unit
             color = field.color
 
-            rf = ttk.Frame(gt_fr)
-            rf.pack(fill='x', padx=3, pady=1)
-            ttk.Label(rf, text=label, width=14, anchor='w',
-                      font=('Segoe UI', 8)).pack(side='left')
-            vl = tk.Label(rf, text="---",
-                          font=('Consolas', 11, 'bold'),
-                          fg=color, bg='#1a1a2e',
-                          width=9, anchor='e',
-                          relief='sunken', padx=3)
-            vl.pack(side='left', padx=3)
-            ttk.Label(rf, text=unit, width=3,
-                      font=('Segoe UI', 8)).pack(side='left')
-            self.global_telem_lbl[key] = vl
+            row_frame = ttk.Frame(gt_fr)
+            row_frame.pack(
+                fill="x",
+                padx=3,
+                pady=1,
+            )
 
-        # -- middle: global configuration --
+            ttk.Label(
+                row_frame,
+                text=label,
+                width=14,
+                anchor="w",
+                font=("Segoe UI", 8),
+            ).pack(side="left")
+
+            value_label = tk.Label(
+                row_frame,
+                text="---",
+                font=("Consolas", 11, "bold"),
+                fg=color,
+                bg="#1a1a2e",
+                width=9,
+                anchor="e",
+                relief="sunken",
+                padx=3,
+            )
+            value_label.pack(
+                side="left",
+                padx=3,
+            )
+
+            ttk.Label(
+                row_frame,
+                text=unit,
+                width=3,
+                font=("Segoe UI", 8),
+            ).pack(side="left")
+
+            self.global_telem_lbl[key] = value_label
+
+        # Middle: global configuration.
         gc = ttk.LabelFrame(
             top,
             text=" Global Config ",
@@ -1082,8 +1142,7 @@ class DeviceTab(ttk.Frame):
             padx=4,
         )
 
-        # Keep a fixed requested width. Long register names
-        # remain accessible through the editor's scrollbar.
+        # Keep a fixed requested width.
         gc.pack_propagate(False)
 
         self.global_config_editor = ConfigNotebook(
@@ -1100,16 +1159,32 @@ class DeviceTab(ttk.Frame):
             pady=2,
         )
 
-        # -- right: global status TreeView --
-        gs = ttk.LabelFrame(top, text=" Global Status ")
-        gs.pack(side='left', fill='both', expand=True, padx=4)
+        # Right: global status.
+        gs = ttk.LabelFrame(
+            top,
+            text=" Global Status ",
+        )
+        gs.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=4,
+        )
 
         self.global_status_ind = tk.Label(
-            gs, text="---",
-            font=('Consolas', 9, 'bold'),
-            bg='#1a1a2e', fg='#00ff00',
-            anchor='center', relief='sunken')
-        self.global_status_ind.pack(fill='x', padx=2, pady=(2, 1))
+            gs,
+            text="---",
+            font=("Consolas", 9, "bold"),
+            bg="#1a1a2e",
+            fg="#00ff00",
+            anchor="center",
+            relief="sunken",
+        )
+        self.global_status_ind.pack(
+            fill="x",
+            padx=2,
+            pady=(2, 1),
+        )
 
         gtf = ttk.Frame(gs)
         gtf.pack(
@@ -1127,7 +1202,8 @@ class DeviceTab(ttk.Frame):
             height=8,
         )
         configure_status_tree(
-            self.global_tree, global_view=True
+            self.global_tree,
+            global_view=True,
         )
 
         vertical = ttk.Scrollbar(
@@ -1146,39 +1222,72 @@ class DeviceTab(ttk.Frame):
         )
 
         self.global_tree.grid(
-            row=0, column=0, sticky="nsew"
+            row=0,
+            column=0,
+            sticky="nsew",
         )
         vertical.grid(
-            row=0, column=1, sticky="ns"
+            row=0,
+            column=1,
+            sticky="ns",
         )
         horizontal.grid(
-            row=1, column=0, sticky="ew"
+            row=1,
+            column=0,
+            sticky="ew",
         )
 
-        for tag in ('fault', 'warn', 'ok'):
-            self.global_tree.tag_configure(tag, foreground={
-                'fault': '#FF4444',
-                'warn':  '#FFD700',
-                'ok':    '#228B22',
-            }[tag])
+        for tag in ("fault", "warn", "ok"):
+            self.global_tree.tag_configure(
+                tag,
+                foreground={
+                    "fault": "#FF4444",
+                    "warn": "#FFD700",
+                    "ok": "#228B22",
+                }[tag],
+            )
 
-    # channel columns
+    # Channel columns.
     def _build_channels(self):
         ch_frame = ttk.Frame(self)
-        ch_frame.grid(row=1, column=0, sticky='nsew', padx=4, pady=2)
+        ch_frame.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=4,
+            pady=2,
+        )
         ch_frame.rowconfigure(0, weight=1)
-        for p in range(self.device.num_pages):
-            ch_frame.columnconfigure(p, weight=1)
-            cc = ChannelColumn(ch_frame, self.device, p)
-            cc.grid(row=0, column=p, sticky='nsew', padx=3, pady=2)
-            self.channels.append(cc)
 
-    # button bar
+        for page in range(self.device.num_pages):
+            ch_frame.columnconfigure(page, weight=1)
+
+            channel = ChannelColumn(
+                ch_frame,
+                self.device,
+                page,
+            )
+            channel.grid(
+                row=0,
+                column=page,
+                sticky="nsew",
+                padx=3,
+                pady=2,
+            )
+            self.channels.append(channel)
+
+    # Button bar.
     def _build_buttons(self):
         bf = ttk.Frame(self)
-        bf.grid(row=2, column=0, sticky='ew', padx=4, pady=(0, 4))
+        bf.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=4,
+            pady=(0, 4),
+        )
 
-        for text, cmd in [
+        for text, command in [
             ("Read All", self.do_read_all),
             ("Preview Changes", self.do_write_all),
             ("Store NVM", self.do_store),
@@ -1188,9 +1297,12 @@ class DeviceTab(ttk.Frame):
             button = ttk.Button(
                 bf,
                 text=text,
-                command=cmd,
+                command=command,
             )
-            button.pack(side="left", padx=2)
+            button.pack(
+                side="left",
+                padx=2,
+            )
 
             button_attributes = {
                 "Read All": "read_all_btn",
@@ -1214,22 +1326,60 @@ class DeviceTab(ttk.Frame):
             ):
                 button.state(["disabled"])
 
-        ttk.Separator(bf, orient='vertical').pack(
-            side='left', fill='y', padx=6)
-        self.mon_btn = ttk.Button(bf, text="Start Monitor",
-                                  command=self.toggle_monitor)
-        self.mon_btn.pack(side='left', padx=2)
+        ttk.Separator(
+            bf,
+            orient="vertical",
+        ).pack(
+            side="left",
+            fill="y",
+            padx=6,
+        )
 
-        ttk.Separator(bf, orient='vertical').pack(
-            side='left', fill='y', padx=6)
-        ttk.Label(bf, text="Dump page:").pack(side='left', padx=(4, 1))
+        self.mon_btn = ttk.Button(
+            bf,
+            text="Start Monitor",
+            command=self.toggle_monitor,
+        )
+        self.mon_btn.pack(
+            side="left",
+            padx=2,
+        )
+
+        ttk.Separator(
+            bf,
+            orient="vertical",
+        ).pack(
+            side="left",
+            fill="y",
+            padx=6,
+        )
+
+        ttk.Label(
+            bf,
+            text="Dump page:",
+        ).pack(
+            side="left",
+            padx=(4, 1),
+        )
+
         self.dump_page_var = tk.StringVar(value="0")
-        dv = [str(p) for p in range(self.device.num_pages)]
-        ttk.Combobox(bf, textvariable=self.dump_page_var,
-                     values=dv, width=3,
-                     state='readonly').pack(side='left', padx=2)
+        page_values = [
+            str(page)
+            for page in range(self.device.num_pages)
+        ]
 
-        for text, cmd in [
+        ttk.Combobox(
+            bf,
+            textvariable=self.dump_page_var,
+            values=page_values,
+            width=3,
+            state="readonly",
+        ).pack(
+            side="left",
+            padx=2,
+        )
+
+        for text, command in [
             ("Read Dump", self.do_dump_read),
             ("Save CSV", self.do_dump_save),
             ("Load CSV", self.do_dump_load),
@@ -1238,9 +1388,12 @@ class DeviceTab(ttk.Frame):
             button = ttk.Button(
                 bf,
                 text=text,
-                command=cmd,
+                command=command,
             )
-            button.pack(side="left", padx=2)
+            button.pack(
+                side="left",
+                padx=2,
+            )
 
             if text == "Read Dump":
                 self.read_dump_btn = button
@@ -1253,22 +1406,36 @@ class DeviceTab(ttk.Frame):
                 if getattr(self.device, "is_demo", False):
                     button.state(["disabled"])
 
-    # read / write
+    # Read and write.
     def _write_single_global(self, key):
         """Write one global parameter to device."""
         if key not in self.global_cfg_data:
             return
+
         try:
-            nv = float(self.global_cfg_vars[key].get())
+            new_value = float(self.global_cfg_vars[key].get())
         except ValueError:
             return
-        c = self.global_cfg_data[key]
-        ok = self.device.write_val(0, c['cmd'], nv, c['fmt'])
-        w = self._global_wr_btns.get(key)
-        if w:
-            color = '#00E676' if ok else '#FF5252'
-            w.itemconfig('tri', fill=color)
-            self.after(600, lambda c=w: c.itemconfig('tri', fill='#4CAF50'))
+
+        config = self.global_cfg_data[key]
+        ok = self.device.write_val(
+            0,
+            config["cmd"],
+            new_value,
+            config["fmt"],
+        )
+
+        widget = self._global_wr_btns.get(key)
+        if widget:
+            color = "#00E676" if ok else "#FF5252"
+            widget.itemconfig("tri", fill=color)
+            self.after(
+                600,
+                lambda current=widget: current.itemconfig(
+                    "tri",
+                    fill="#4CAF50",
+                ),
+            )
 
     def update_device_info(self):
         values = {
@@ -1333,16 +1500,43 @@ class DeviceTab(ttk.Frame):
                     widget.unbind(sequence)
 
                 widget.configure(cursor="")
-                widget.itemconfigure("all", state="disabled")
+                widget.itemconfigure(
+                    "all",
+                    state="disabled",
+                )
 
             self._disable_controls(widget)
 
     def _handle_disconnect(self, exc):
+        """Stop this tab after a fatal transport error."""
         if self._disconnected:
             return
 
+        # This flag means the tab cannot perform further I/O.
+        # It covers both USB removal and an unusable session.
         self._disconnected = True
         self.stop_all()
+
+        session_failed = isinstance(
+            exc,
+            TransportSessionFailedError,
+        )
+
+        title = (
+            "Transport session failed"
+            if session_failed
+            else "Adapter disconnected"
+        )
+        indicator = (
+            "TRANSPORT FAILED / STALE DATA"
+            if session_failed
+            else "DISCONNECTED / STALE DATA"
+        )
+        tree_message = (
+            "Transport session failed; previous data is stale"
+            if session_failed
+            else "Adapter disconnected; previous data is stale"
+        )
 
         if hasattr(self, "global_config_editor"):
             self.global_config_editor.mark_stale()
@@ -1363,30 +1557,30 @@ class DeviceTab(ttk.Frame):
         self.global_tree.insert(
             "",
             "end",
-            text="Adapter disconnected; previous data is stale",
+            text=tree_message,
             values=("ERR", "---"),
             tags=("error",),
         )
         self.global_status_ind.configure(
-            text="DISCONNECTED / STALE DATA",
+            text=indicator,
             fg="#FF8A80",
         )
 
-        # Channel values may remain visible as historical data.
-        # Disable their controls; do not read the device here.
+        # Channel values may remain as historical data.
+        # Disable controls without reading the device.
         self._disable_controls(self)
 
         messagebox.showerror(
-            "Adapter disconnected",
+            title,
             f"{exc}\n\n"
             "Current operation stopped. Monitoring stopped.\n"
             "Previously displayed channel values are stale.\n"
-            "Reconnect the adapter, then use Refresh and Scan.",
+            "Check the adapter connection, then use Refresh and Scan.",
             parent=self,
         )
 
     def _allow_device_action(self):
-        """Reject hardware actions on a disconnected or demo device."""
+        """Reject hardware actions on an unusable or demo device."""
         return (
             not self._disconnected
             and not getattr(self.device, "is_demo", False)
@@ -1422,7 +1616,7 @@ class DeviceTab(ttk.Frame):
 
         except TransportDisconnectedError as exc:
             self._handle_disconnect(
-                TransportDisconnectedError(
+                type(exc)(
                     f"Store NVM\n{exc}\n\n"
                     "The command may have reached the device.\n"
                     "NVM store completion is unknown."
@@ -1480,7 +1674,7 @@ class DeviceTab(ttk.Frame):
 
         except TransportDisconnectedError as exc:
             self._handle_disconnect(
-                TransportDisconnectedError(
+                type(exc)(
                     f"Restore NVM\n{exc}\n\n"
                     "The command may have reached the device.\n"
                     "Active settings may already have changed."
@@ -1543,7 +1737,7 @@ class DeviceTab(ttk.Frame):
                 parent=self,
             )
 
-    # monitor
+    # Monitor.
     def toggle_monitor(self):
         if (
             self._disconnected
@@ -1573,6 +1767,7 @@ class DeviceTab(ttk.Frame):
             for key in self.global_telem_lbl:
                 value = telemetry.get(key)
                 label = self.global_telem_lbl.get(key)
+
                 if label is not None:
                     label.configure(
                         text=(
@@ -1621,8 +1816,10 @@ class DeviceTab(ttk.Frame):
                     status = self.device.read_channel_status(
                         channel.page
                     )
+
                 except TransportDisconnectedError:
                     raise
+
                 except Exception:
                     status = {}
 
@@ -1641,6 +1838,7 @@ class DeviceTab(ttk.Frame):
                 }
 
                 regmap = getattr(self.device, "_regmap", {})
+
                 for name, cmd in (
                     ("MFR_PADS", 0xE5),
                     ("MFR_COMMON", 0xEF),
@@ -1656,7 +1854,10 @@ class DeviceTab(ttk.Frame):
 
     def _update_global_status(self, status_data):
         tree = self.global_tree
-        configure_status_tree(tree, global_view=True)
+        configure_status_tree(
+            tree,
+            global_view=True,
+        )
         expanded = reset_status_tree(tree)
         levels = []
 
@@ -1692,11 +1893,24 @@ class DeviceTab(ttk.Frame):
                 )
             )
 
-        set_status_indicator(
-            self.global_status_ind, levels
+        set_global_status_indicator(
+            self.global_status_ind,
+            levels,
+            self.device,
         )
 
-    # dump
+        if (
+            self.device.name == "LTM4677"
+            and "unknown" in levels
+            and "fault" not in levels
+            and "warn" not in levels
+            and "error" not in levels
+        ):
+            self.global_status_ind.configure(
+                text="GLOBAL STATUS / CHECK RAW",
+            )
+
+    # Dump.
     def _dump_page(self):
         try:
             return int(self.dump_page_var.get())
@@ -1719,8 +1933,8 @@ class DeviceTab(ttk.Frame):
 
             # Replace the previous snapshot only after completion.
             self._dump_data[page] = records
-            # This snapshot came from the current device, not CSV.
             self._dump_metadata.pop(page, None)
+
             successful = sum(
                 record["raw"] is not None
                 for record in records
@@ -1784,8 +1998,7 @@ class DeviceTab(ttk.Frame):
             if self._disconnected or page not in self._dump_data:
                 return
 
-        # Serialize before the file dialog so the export represents
-        # one snapshot and does not depend on later GUI changes.
+        # Serialize before the dialog to preserve one snapshot.
         try:
             if page in self._dump_metadata:
                 csv_text = dump_to_csv_string(
@@ -1800,6 +2013,7 @@ class DeviceTab(ttk.Frame):
                     self._dump_data[page],
                     page,
                 )
+
         except Exception as exc:
             messagebox.showerror(
                 "CSV export failed",
@@ -1825,6 +2039,7 @@ class DeviceTab(ttk.Frame):
 
         try:
             save_csv_atomic(path, csv_text)
+
         except Exception as exc:
             messagebox.showerror(
                 "CSV save failed",
@@ -1913,7 +2128,7 @@ class DeviceTab(ttk.Frame):
             )
             return
 
-        # Snapshot and validate all selected writes before confirmation.
+        # Copy and validate the snapshot before confirmation.
         try:
             records = [
                 dict(record)
@@ -1957,10 +2172,9 @@ class DeviceTab(ttk.Frame):
             "Write Dump",
             f"Attempt to write {len(records)} dump records?\n\n"
             "Selected records passed offline profile validation.\n"
-            "Each record uses its own page value when present.\n"
-            "Board-specific limits and write order are not validated.\n"
-            "Current device values are not checked against baselines.\n"
-            "Exact readback verification is not performed.\n"
+            "Current values will be read before the first write.\n"
+            "Every record will be checked again before its write.\n"
+            "Every successful write will be verified by readback.\n"
             "Execution stops at the first error.\n"
             "Earlier writes are not rolled back.\n"
             "Monitoring will be stopped. NVM will not be stored.",
@@ -1972,56 +2186,21 @@ class DeviceTab(ttk.Frame):
 
         self.stop_all()
 
-        attempted = 0
-        completed = 0
-        active = "Preparing dump write"
-
-        def summary():
-            return (
-                f"Selected records: {len(records)}\n"
-                f"Write attempts: {attempted}\n"
-                f"Write calls returned success: {completed}\n"
-                f"Not attempted: {len(records) - attempted}\n"
-                "Exact readback verification: not performed"
-            )
-
         try:
             with self._button_activity(
-                self.write_dump_btn, "Writing..."
+                self.write_dump_btn,
+                "Writing...",
             ):
-                for record in records:
-                    target_page = record.get("page", page)
-                    cmd = record["cmd"]
-                    size = record["size"]
-                    raw = record["raw"]
-
-                    active = (
-                        f"Record page {target_page}, "
-                        f"command 0x{cmd:02X}"
-                    )
-
-                    if not self.device.can_write_register(cmd, size):
-                        raise ValueError(
-                            "Register write is blocked by the device profile."
-                        )
-
-                    attempted += 1
-
-                    if not self.device.write_register(
-                        target_page, cmd, raw, size
-                    ):
-                        raise OSError(
-                            self.device.last_error
-                            or "Register write failed."
-                        )
-
-                    completed += 1
+                report = self.device.apply_dump_write_plan(
+                    records
+                )
 
         except TransportDisconnectedError as exc:
             self._handle_disconnect(
-                TransportDisconnectedError(
-                    f"{summary()}\n\n{active}\n{exc}\n\n"
-                    "An unverified write may have reached the device.\n"
+                type(exc)(
+                    f"Write Dump\n{exc}\n\n"
+                    "An unverified write may have reached "
+                    "the device.\n"
                     "Earlier writes were not rolled back."
                 )
             )
@@ -2030,8 +2209,9 @@ class DeviceTab(ttk.Frame):
         except Exception as exc:
             messagebox.showerror(
                 "Write Dump stopped",
-                f"{summary()}\n\n{active}\n{exc}\n\n"
-                "An unverified write may have reached the device.\n"
+                f"{exc}\n\n"
+                "An unverified write may have reached "
+                "the device.\n"
                 "Earlier writes were not rolled back.\n"
                 "Config fields were not refreshed.\n"
                 "Monitoring remains stopped.",
@@ -2039,23 +2219,91 @@ class DeviceTab(ttk.Frame):
             )
             return
 
-        messagebox.showinfo(
-            "Dump write calls completed",
-            f"{summary()}\n\n"
-            "Successful write calls do not prove that all "
-            "values were accepted by the device.\n"
+        verified = report.get("verified", [])
+        attempted = report.get("attempted", [])
+        error = report.get("error")
+        disconnect = report.get("disconnect")
+
+        lines = [
+            f"Selected records: {len(records)}",
+            f"Write attempts: {len(attempted)}",
+            f"Verified by readback: {len(verified)}",
+            f"Not attempted: {len(records) - len(attempted)}",
+        ]
+
+        for item in verified:
+            width = (
+                2
+                if item.get("size") == "byte"
+                else 4
+            )
+
+            actual = item.get("actual_raw")
+
+            if actual is None:
+                actual_text = "N/A"
+            else:
+                actual_text = (
+                    f"0x{actual:0{width}X}"
+                )
+
+            lines.append(
+                f"Page {item['page']}, "
+                f"command 0x{item['cmd']:02X}: "
+                f"{actual_text} verified"
+            )
+
+        if error:
+            lines.extend(("", str(error)))
+
+        if disconnect is not None:
+            lines.extend(
+                (
+                    "",
+                    "An unverified write may have reached "
+                    "the device.",
+                    "Earlier writes were not rolled back.",
+                )
+            )
+
+            self._handle_disconnect(
+                type(disconnect)(
+                    "Write Dump\n" + "\n".join(lines)
+                )
+            )
+            return
+
+        if report.get("ok", False):
+            messagebox.showinfo(
+                "Dump write verified",
+                "\n".join(lines)
+                + "\n\n"
+                "All write readbacks matched the requested "
+                "values.\n"
+                "Config fields were not refreshed.\n"
+                "Monitoring remains stopped. NVM was not stored.",
+                parent=self,
+            )
+            return
+
+        messagebox.showwarning(
+            "Dump write stopped",
+            "\n".join(lines)
+            + "\n\n"
+            "Earlier writes were not rolled back.\n"
+            "An unverified write may have reached the device.\n"
+            "Review the device state before another operation.\n"
             "Config fields were not refreshed.\n"
-            "Review device state separately.\n"
-            "Monitoring remains stopped. NVM was not stored.",
+            "Monitoring remains stopped.",
             parent=self,
         )
 
     def _do_read_regs(self):
         """Trigger read all in register tab."""
-        if hasattr(self, '_reg_tab'):
+        if hasattr(self, "_reg_tab"):
             self._reg_tab._do_read_all()
 
-    # cleanup
+    # Cleanup.
     def stop_all(self):
         self.monitoring = False
 

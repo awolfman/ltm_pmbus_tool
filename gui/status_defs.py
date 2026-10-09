@@ -179,6 +179,168 @@ PMBUS_STANDARD_LEVELS["STATUS_CML"].update({
     0: "fault",
 })
 
+LTM4677_STANDARD_BITS = {
+    "STATUS_WORD": {
+        15: "VOUT fault/warning",
+        14: "IOUT fault/warning",
+        13: "Input fault/warning",
+        12: "Manufacturer-specific fault/warning",
+        11: "Power good negated",
+        10: "FANS, not supported",
+        9: "OTHER, not supported",
+        8: "UNKNOWN, not supported",
+        7: "BUSY",
+        6: "OFF",
+        5: "VOUT OV fault",
+        4: "IOUT OC fault",
+        3: "VIN UV, not supported",
+        2: "Temperature fault/warning",
+        1: "CML fault",
+        0: "Fault not listed in bits 7:1",
+    },
+    "STATUS_VOUT": STATUS_VOUT_BITS,
+    "STATUS_IOUT": STATUS_IOUT_BITS,
+    "STATUS_INPUT": STATUS_INPUT_BITS,
+    "STATUS_TEMPERATURE": STATUS_TEMP_BITS,
+    "STATUS_CML": STATUS_CML_BITS,
+}
+
+LTM4677_STATUS_WORD_BITS = {
+    15: "VOUT fault/warning",
+    14: "IOUT fault/warning",
+    13: "SVIN input fault/warning",
+    12: "Manufacturer-specific fault/warning",
+    11: "Power good negated",
+    10: "Fan status, not supported",
+    9: "Other status, not supported",
+    8: "Unknown status, not supported",
+    7: "Busy",
+    6: "OFF",
+    5: "VOUT OV fault",
+    4: "IOUT OC fault",
+    3: "VIN UV, not supported",
+    2: "Temperature fault/warning",
+    1: "CML fault",
+    0: "Fault not listed above",
+}
+
+LTM4677_STATUS_WORD_LEVELS = {
+    15: "warn",
+    14: "warn",
+    13: "warn",
+    12: "warn",
+    11: "info",
+    10: "info",
+    9: "info",
+    8: "info",
+    7: "fault",
+    6: "info",
+    5: "fault",
+    4: "fault",
+    3: "info",
+    2: "warn",
+    1: "fault",
+    0: "warn",
+}
+
+LTM4677_STATUS_MFR_BITS = {
+    7: "Internal temperature fault limit exceeded",
+    6: "Internal temperature warning limit exceeded",
+    5: "NVM CRC fault",
+    4: "PLL unlocked",
+    3: "Fault log present",
+    2: "VDD33 UV or OV fault",
+    1: "Reserved",
+    0: "GPIO pin asserted low by external device",
+}
+
+LTM4677_STATUS_MFR_LEVELS = {
+    7: "fault",
+    6: "warn",
+    5: "fault",
+    4: "fault",
+    3: "info",
+    2: "fault",
+    1: "info",
+    0: "fault",
+}
+
+LTM4677_MFR_COMMON_BITS = {
+    7: "Module not driving ALERT low",
+    6: "Module not busy",
+    5: "Calculations not pending",
+    4: "Output not in transition",
+    3: "NVM initialized",
+    2: "Reserved",
+    1: "SHARE_CLK timeout",
+    0: "WP pin status",
+}
+
+LTM4677_MFR_PADS_BITS = {
+    15: "VDD33 OV fault",
+    14: "VDD33 UV fault",
+    13: "Reserved",
+    12: "Reserved",
+    11: "ADC values invalid during start-up",
+    10: "SYNC output disabled by external clock",
+    9: "PowerGood1",
+    8: "PowerGood0",
+    7: "Device driving RUN1 low",
+    6: "Device driving RUN0 low",
+    5: "RUN1",
+    4: "RUN0",
+    3: "Device driving GPIO1 low",
+    2: "Device driving GPIO0 low",
+    1: "GPIO1",
+    0: "GPIO0",
+}
+
+LTM4677_MFR_PADS_LEVELS = {
+    15: "fault",
+    14: "fault",
+    13: "info",
+    12: "info",
+    11: "warn",
+    10: "warn",
+    9: "info",
+    8: "info",
+    7: "info",
+    6: "info",
+    5: "info",
+    4: "info",
+    3: "info",
+    2: "info",
+    1: "info",
+    0: "info",
+}
+
+LTM4677_STANDARD_LEVELS = {
+    "STATUS_WORD": {
+        15: "warn",
+        14: "warn",
+        13: "warn",
+        12: "warn",
+        11: "info",
+        10: "info",
+        9: "info",
+        8: "info",
+        7: "fault",
+        6: "info",
+        5: "fault",
+        4: "fault",
+        3: "info",
+        2: "warn",
+        1: "fault",
+        0: "warn",
+    },
+    "STATUS_VOUT": dict(LTM4673_STANDARD_LEVELS["STATUS_VOUT"]),
+    "STATUS_IOUT": dict(LTM4673_STANDARD_LEVELS["STATUS_IOUT"]),
+    "STATUS_INPUT": dict(LTM4673_STANDARD_LEVELS["STATUS_INPUT"]),
+    "STATUS_TEMPERATURE": dict(
+        LTM4673_STANDARD_LEVELS["STATUS_TEMPERATURE"]
+    ),
+    "STATUS_CML": dict(LTM4673_STANDARD_LEVELS["STATUS_CML"]),
+}
 
 LTM4673_STATUS_MFR_BITS = {
     7: "VOUT discharge fault",
@@ -441,32 +603,67 @@ def render_bit_register(
 
     return level
 
-
 def render_standard_status(
     tree, expanded, device, name, raw, width=8
 ):
     if is_ltm4673(device):
         labels = LTM4673_STANDARD_BITS.get(name)
         levels = LTM4673_STANDARD_LEVELS.get(name)
-    elif is_ltm4677(device) or is_ltm4678(device):
+
+    elif is_ltm4677(device):
+        if name == "STATUS_WORD":
+            labels = LTM4677_STATUS_WORD_BITS
+            levels = LTM4677_STATUS_WORD_LEVELS
+        else:
+            labels = PMBUS_STANDARD_BITS.get(name)
+            levels = PMBUS_STANDARD_LEVELS.get(name)
+
+    elif is_ltm4678(device):
         labels = PMBUS_STANDARD_BITS.get(name)
         levels = PMBUS_STANDARD_LEVELS.get(name)
+
     else:
         labels = None
         levels = None
 
-    return render_bit_register(
-        tree, expanded, name, raw, width, labels, levels
+    level = render_bit_register(
+        tree,
+        expanded,
+        name,
+        raw,
+        width,
+        labels,
+        levels,
     )
 
+    if (
+        is_ltm4677(device)
+        and name == "STATUS_WORD"
+        and width == 16
+        and _valid_raw(raw, 16)
+        and raw & 0x0040
+        and level == "info"
+    ):
+        tree.item(
+            name,
+            values=("OFF", f"0x{raw:04X}"),
+        )
+
+    return level
 
 def render_mfr_status(tree, expanded, device, raw):
     if is_ltm4673(device):
         labels = LTM4673_STATUS_MFR_BITS
         levels = LTM4673_STATUS_MFR_LEVELS
+
+    elif is_ltm4677(device):
+        labels = LTM4677_STATUS_MFR_BITS
+        levels = LTM4677_STATUS_MFR_LEVELS
+
     elif is_ltm4678(device):
         labels = LTM4678_STATUS_MFR_BITS
         levels = LTM4678_STATUS_MFR_LEVELS
+
     else:
         labels = None
         levels = None
@@ -480,7 +677,6 @@ def render_mfr_status(tree, expanded, device, raw):
         labels,
         levels,
     )
-
 
 def _render_state_rows(
     tree, expanded, name, raw, width, rows, state="STATE"
@@ -523,104 +719,144 @@ def render_mfr_common(tree, expanded, device, raw):
     if not _valid_raw(raw, 8):
         return _error_row(tree, expanded, name)
 
-    if is_ltm4678(device):
+    if is_ltm4677(device):
+        labels = LTM4677_MFR_COMMON_BITS
+    elif is_ltm4678(device):
+        labels = LTM4678_MFR_COMMON_BITS
+    elif is_ltm4673(device):
+        labels = None
+    else:
+        return render_bit_register(
+            tree,
+            expanded,
+            name,
+            raw,
+            8,
+        )
+
+    if labels is not None:
         rows = [
             (
                 7,
-                "Module not driving ALERT low"
-                if raw & 0x80 else "Module driving ALERT low",
+                labels[7]
+                if raw & 0x80
+                else "Module driving ALERT low",
                 "info" if raw & 0x80 else "warn",
             ),
             (
                 6,
-                "Not busy" if raw & 0x40 else "Busy",
+                labels[6]
+                if raw & 0x40
+                else "Module busy",
                 "info",
             ),
             (
                 5,
-                "Calculations not pending"
-                if raw & 0x20 else "Calculations pending",
+                labels[5]
+                if raw & 0x20
+                else "Calculations pending",
                 "info",
             ),
             (
                 4,
-                "Outputs not in transition"
-                if raw & 0x10 else "Outputs in transition",
+                labels[4]
+                if raw & 0x10
+                else "Output in transition",
                 "info",
             ),
             (
                 3,
-                "NVM initialized"
-                if raw & 0x08 else "NVM not initialized",
+                labels[3]
+                if raw & 0x08
+                else "NVM not initialized",
                 "info" if raw & 0x08 else "warn",
             ),
-            (2, "Reserved; raw value only", "info"),
+            (
+                2,
+                labels[2],
+                "info",
+            ),
             (
                 1,
-                "SHARE_CLK timeout"
-                if raw & 0x02 else "No SHARE_CLK timeout",
+                labels[1]
+                if not raw & 0x02
+                else "SHARE_CLK timeout",
                 "warn" if raw & 0x02 else "info",
             ),
             (
                 0,
-                "WP pin high" if raw & 0x01 else "WP pin low",
+                "WP pin high"
+                if raw & 0x01
+                else "WP pin low",
                 "info",
             ),
         ]
 
-        if not (raw & 0x40):
+        if not raw & 0x40:
             state = "BUSY"
-        elif not (raw & 0x20):
+        elif not raw & 0x20:
             state = "PENDING"
-        elif not (raw & 0x10):
+        elif not raw & 0x10:
             state = "TRANS"
         else:
             state = "READY"
 
         return _render_state_rows(
-            tree, expanded, name, raw, 8, rows, state
-        )
-
-    if not is_ltm4673(device):
-        return render_bit_register(
-            tree, expanded, name, raw, 8
+            tree,
+            expanded,
+            name,
+            raw,
+            8,
+            rows,
+            state,
         )
 
     rows = [
         (
             7,
             "ALERT inactive, high"
-            if raw & 0x80 else "ALERT asserted, low",
+            if raw & 0x80
+            else "ALERT asserted, low",
             "info" if raw & 0x80 else "warn",
         ),
         (
             6,
             "Ready for PMBus commands"
-            if raw & 0x40 else "Busy",
+            if raw & 0x40
+            else "Busy",
             "info",
         ),
     ]
 
     for bit in range(5, 1, -1):
-        rows.append((
-            bit,
-            "Reserved; expected 1",
-            "info" if raw & (1 << bit) else "warn",
-        ))
+        rows.append(
+            (
+                bit,
+                "Reserved; expected 1",
+                "info"
+                if raw & (1 << bit)
+                else "warn",
+            )
+        )
 
-    rows.extend([
-        (
-            1,
-            "SHARECLK held low"
-            if raw & 0x02 else "SHARECLK active",
-            "info",
-        ),
-        (
-            0,
-            "WP pin high" if raw & 0x01 else "WP pin low",
-            "info",
-        ),
-    ])
+    rows.extend(
+        [
+            (
+                1,
+                "SHARECLK held low"
+                if raw & 0x02
+                else "SHARECLK active",
+                "info",
+            ),
+            (
+                0,
+                "WP pin high"
+                if raw & 0x01
+                else "WP pin low",
+                "info",
+            ),
+        ]
+    )
 
     return _render_state_rows(
         tree,
@@ -632,9 +868,38 @@ def render_mfr_common(tree, expanded, device, raw):
         "READY" if raw & 0x40 else "BUSY",
     )
 
-
 def render_mfr_pads(tree, expanded, device, raw):
     name = "MFR_PADS"
+
+    if is_ltm4677(device):
+        rows = []
+
+        for bit in range(15, -1, -1):
+            value = (raw >> bit) & 1
+            label = LTM4677_MFR_PADS_BITS[bit]
+
+            if bit in (15, 14):
+                level = "fault" if value else "ok"
+            elif bit in (11, 10):
+                level = "warn" if value else "ok"
+            else:
+                level = "info"
+
+            if bit in (13, 12):
+                label = "Reserved; raw value only"
+            elif bit in (7, 6, 3, 2):
+                label += " active" if value else " inactive"
+
+            rows.append((bit, label, level))
+
+        return _render_state_rows(
+            tree,
+            expanded,
+            name,
+            raw,
+            16,
+            rows,
+        )
 
     if not _valid_raw(raw, 16):
         return _error_row(tree, expanded, name)
@@ -787,3 +1052,71 @@ def set_status_indicator(widget, levels):
         text=text,
         fg=INDICATOR_COLORS[level],
     )
+
+def set_channel_status_indicator(
+    widget, levels, device, status_word
+):
+    """Show output state separately from diagnostic severity."""
+    levels = list(levels)
+
+    if not is_ltm4677(device):
+        set_status_indicator(widget, levels)
+        return
+
+    if not _valid_raw(status_word, 16):
+        # A missing STATUS_WORD must not leave an apparent OK.
+        set_status_indicator(widget, levels + ["error"])
+        return
+
+    if not status_word & 0x0040:
+        set_status_indicator(widget, levels)
+        return
+
+    normalized = [
+        level if level in COLORS else "unknown"
+        for level in levels
+    ]
+
+    parts = ["OUTPUT OFF"]
+
+    if "fault" in normalized:
+        parts.append("FAULT")
+    elif "warn" in normalized:
+        parts.append("WARNING")
+
+    if "error" in normalized:
+        parts.append("READ ERROR")
+
+    if not normalized or "unknown" in normalized:
+        parts.append("CHECK RAW")
+
+    # Match the existing read-error priority of the common indicator.
+    if "error" in normalized:
+        color_level = "error"
+    elif "fault" in normalized:
+        color_level = "fault"
+    elif "warn" in normalized:
+        color_level = "warn"
+    elif not normalized or "unknown" in normalized:
+        color_level = "unknown"
+    else:
+        color_level = "info"
+
+    widget.configure(
+        text=" / ".join(parts),
+        fg=INDICATOR_COLORS[color_level],
+    )
+
+def set_global_status_indicator(widget, levels, device):
+    set_status_indicator(widget, levels)
+
+    if (
+        is_ltm4677(device)
+        and "unknown" in levels
+        and "fault" not in levels
+        and "warn" not in levels
+        and "error" not in levels
+    ):
+        widget.configure(
+            text="GLOBAL STATUS / CHECK RAW",
+        )

@@ -11,7 +11,7 @@ from gui.status_defs import (
     reset_status_tree,
     render_standard_status,
     render_mfr_status,
-    set_status_indicator,
+    set_channel_status_indicator,
 )
 from gui.register_group import RegisterGroup
 from core.pmbus_constants import Cmd
@@ -502,8 +502,11 @@ class ChannelColumn(ttk.LabelFrame):
             )
         )
 
-        set_status_indicator(
-            self.status_ind, levels
+        set_channel_status_indicator(
+            self.status_ind,
+            levels,
+            self.device,
+            status_data.get("STATUS_WORD"),
         )
 
     def read_all_reg_groups(self):
