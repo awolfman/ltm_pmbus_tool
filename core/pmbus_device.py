@@ -8,6 +8,7 @@ import logging
 import math
 import threading
 import time
+from copy import deepcopy
 
 from core.bus_factory import create_bus
 from core.pmbus_constants import (
@@ -119,6 +120,788 @@ class PMBusDevice:
         self.last_error = None
         self.last_errors = {}
         self._reset_profile()
+
+    def apply_ltm4677_frequency(self, target_raw):
+        """Write a supported frequency only after observing both OFF.
+
+        No automatic output control, unlock, rollback or NVM store.
+        PAGE service writes are possible.
+        """
+        report = {
+            "ok": False,
+            "target_raw": target_raw,
+            "previous_raw": None,
+            "actual_raw": None,
+            "attempted": False,
+            "unchanged": False,
+            "protection": None,
+            "transport": None,
+            "outputs": None,
+            "error": None,
+            "disconnect": None,
+        }
+
+        supported = frozenset({
+            0x0000,
+            0xF3E8,
+            0xFABC,
+            0xFB52,
+            0xFBE8,
+            0x023F,
+            0x028A,
+            0x02EE,
+            0x03E8,
+        })
+
+        with self._lock:
+            active = "Frequency offline validation"
+
+            try:
+                if not self._identified:
+                    raise RuntimeError("Device is not identified")
+
+                if getattr(self, "is_demo", False):
+                    raise ValueError("Demo writes are disabled")
+
+                if self.name != "LTM4677":
+                    raise ValueError(
+                        "Frequency executor supports LTM4677 only"
+                    )
+
+                if (
+                    isinstance(target_raw, bool)
+                    or not isinstance(target_raw, int)
+                    or target_raw not in supported
+                ):
+                    raise ValueError(
+                        "Unsupported LTM4677 frequency encoding"
+                    )
+
+                cmd = self.command_code("FREQUENCY_SWITCH")
+                info = self._regmap.get(cmd)
+
+                if (
+                    info is None
+                    or info[1] != "word"
+                    or info[3]
+                    or not self.can_read_register(cmd, "word")
+                ):
+                    raise ValueError(
+                        "FREQUENCY_SWITCH: global word access unavailable"
+                    )
+
+                def accept_stage(field, stage):
+                    report[field] = stage
+                    if stage["ok"]:
+                        return True
+                    report["error"] = stage["error"]
+                    report["disconnect"] = stage["disconnect"]
+                    return False
+
+                active = "Check frequency write protection"
+                protection = self.inspect_ltm4677_restore_protection(
+                    0x00
+                )
+                if not accept_stage("protection", protection):
+                    return report
+
+                if protection["current_raw"] != 0x00:
+                    raise ValueError(
+                        "WRITE_PROTECT must be 0x00 for this operation. "
+                        "No automatic unlock will be performed."
+                    )
+
+                active = "Check non-PEC transport"
+                # This operation does not write MFR_CONFIG_ALL.
+                # Zero here requests inspection for a non-PEC path.
+                transport = self.inspect_ltm4677_restore_transport(
+                    0x00
+                )
+                if not accept_stage("transport", transport):
+                    return report
+
+                active = "Read current frequency"
+                previous = self.read_register(None, cmd)
+
+                if (
+                    isinstance(previous, bool)
+                    or not isinstance(previous, int)
+                    or not 0 <= previous <= 0xFFFF
+                ):
+                    raise OSError("Invalid frequency baseline")
+
+                report["previous_raw"] = previous
+
+                active = "Check both outputs OFF"
+                outputs = self.inspect_ltm4677_outputs_off()
+                if not accept_stage("outputs", outputs):
+                    return report
+
+                if previous == target_raw:
+                    report["actual_raw"] = previous
+                    report["unchanged"] = True
+                    report["ok"] = True
+                    return report
+
+                active = "Wait for frequency write readiness"
+                if not self._wait_ready():
+                    raise OSError(
+                        self.last_error or "Device is not ready"
+                    )
+
+                active = "Recheck frequency baseline"
+                current = self.read_register(None, cmd)
+                if (
+                    isinstance(current, bool)
+                    or not isinstance(current, int)
+                    or not 0 <= current <= 0xFFFF
+                ):
+                    raise OSError("Invalid frequency baseline recheck")
+
+                if current != previous:
+                    raise ValueError(
+                        "Frequency baseline changed before write"
+                    )
+
+                # Recheck after readiness and baseline operations.
+                active = "Recheck frequency write protection"
+                protection = self.inspect_ltm4677_restore_protection(
+                    0x00
+                )
+                if not accept_stage("protection", protection):
+                    return report
+
+                if protection["current_raw"] != 0x00:
+                    raise ValueError(
+                        "WRITE_PROTECT changed before frequency write"
+                    )
+
+                active = "Recheck non-PEC transport"
+                transport = self.inspect_ltm4677_restore_transport(
+                    0x00
+                )
+                if not accept_stage("transport", transport):
+                    return report
+
+                active = "Recheck both outputs OFF"
+                outputs = self.inspect_ltm4677_outputs_off()
+                if not accept_stage("outputs", outputs):
+                    return report
+
+                active = "Write FREQUENCY_SWITCH"
+                report["attempted"] = True
+
+                # Dedicated guarded path. Generic writes stay blocked.
+                if not self._write_transport(
+                    cmd, target_raw, "word"
+                ):
+                    raise OSError(
+                        self.last_error or "Frequency write failed"
+                    )
+
+                active = "Read back FREQUENCY_SWITCH"
+                actual = self.read_register(None, cmd)
+
+                if (
+                    isinstance(actual, bool)
+                    or not isinstance(actual, int)
+                    or not 0 <= actual <= 0xFFFF
+                ):
+                    raise OSError("Invalid frequency readback")
+
+                report["actual_raw"] = actual
+
+                if actual != target_raw:
+                    raise OSError(
+                        "Frequency readback mismatch: "
+                        f"requested 0x{target_raw:04X}, "
+                        f"received 0x{actual:04X}"
+                    )
+
+                report["ok"] = True
+
+            except TransportDisconnectedError as exc:
+                report["disconnect"] = exc
+                report["error"] = f"{active}\n{exc}"
+
+            except Exception as exc:
+                report["error"] = f"{active}\n{exc}"
+
+            return report
+
+    def inspect_ltm4677_outputs_off(self):
+        """Observe OFF status on every LTM4677 channel.
+
+        No output-control, configuration or NVM commands.
+        Reading paged status may perform service PAGE writes.
+
+        Success is a point-in-time observation only.
+        """
+        report = {
+            "ok": False,
+            "execution_ready": False,
+            "channels": [],
+            "reason": None,
+            "error": None,
+            "disconnect": None,
+        }
+
+        with self._lock:
+            active = "Output-state offline validation"
+
+            try:
+                if not self._identified:
+                    raise RuntimeError("Device is not identified")
+
+                if getattr(self, "is_demo", False):
+                    raise ValueError(
+                        "Demo output-state inspection is disabled"
+                    )
+
+                if self.name != "LTM4677":
+                    raise ValueError(
+                        "Output-state inspection supports "
+                        "LTM4677 only"
+                    )
+
+                if self.num_pages != 2:
+                    raise ValueError(
+                        "Expected two LTM4677 pages"
+                    )
+
+                cmd = self.command_code("STATUS_WORD")
+                info = self._regmap.get(cmd)
+
+                if (
+                    info is None
+                    or info[1] != "word"
+                    or not info[3]
+                    or not self.can_read_register(cmd, "word")
+                ):
+                    raise ValueError(
+                        "STATUS_WORD: paged word read unavailable"
+                    )
+
+                for page in range(self.num_pages):
+                    active = f"Check OFF state on PAGE {page}"
+                    raw = self.read_register(page, cmd)
+
+                    if (
+                        isinstance(raw, bool)
+                        or not isinstance(raw, int)
+                        or not 0 <= raw <= 0xFFFF
+                    ):
+                        report["reason"] = "output_state_unknown"
+                        raise OSError(
+                            f"PAGE {page}: invalid STATUS_WORD response"
+                        )
+
+                    off = bool(raw & 0x0040)
+
+                    report["channels"].append({
+                        "page": page,
+                        "status_word_raw": raw,
+                        "off": off,
+                    })
+
+                    if not off:
+                        report["reason"] = "outputs_not_off"
+                        raise ValueError(
+                            f"PAGE {page}: OFF is not asserted. "
+                            "Turn off both LTM4677 outputs "
+                            "before writing configuration. "
+                            "No configuration write was attempted "
+                            "by this check."
+                        )
+
+                report["ok"] = True
+
+            except TransportDisconnectedError as exc:
+                report["reason"] = "output_state_unknown"
+                report["disconnect"] = exc
+                report["error"] = f"{active}\n{exc}"
+
+            except Exception as exc:
+                report["error"] = f"{active}\n{exc}"
+
+            return report
+
+    @staticmethod
+    def validate_ltm4677_operation_target(
+        on_off_config_raw, operation_raw
+    ):
+        """Validate one channel's target pair without hardware I/O.
+
+        This checks final-state compatibility only.
+        It does not authorize writes or define transition ordering.
+        """
+        for name, raw in (
+            ("ON_OFF_CONFIG", on_off_config_raw),
+            ("OPERATION", operation_raw),
+        ):
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not 0 <= raw <= 0xFF
+            ):
+                raise ValueError(
+                    f"{name} must be an integer byte"
+                )
+
+        supported_configs = frozenset({
+            0x16, 0x17, 0x1E, 0x1F,
+        })
+
+        if on_off_config_raw not in supported_configs:
+            raise ValueError(
+                "Unsupported LTM4677 ON_OFF_CONFIG "
+                f"0x{on_off_config_raw:02X}"
+            )
+
+        pmbus_on_off_enabled = bool(on_off_config_raw & 0x08)
+
+        allowed_operations = frozenset({
+            0x80, 0x98, 0xA8,
+        })
+
+        if pmbus_on_off_enabled:
+            allowed_operations = allowed_operations | {
+                0x00, 0x40,
+            }
+
+        if operation_raw not in allowed_operations:
+            raise ValueError(
+                f"LTM4677 OPERATION 0x{operation_raw:02X} "
+                "is incompatible with "
+                f"ON_OFF_CONFIG 0x{on_off_config_raw:02X}"
+            )
+
+        return {
+            "on_off_config_raw": on_off_config_raw,
+            "operation_raw": operation_raw,
+            "pmbus_on_off_enabled": pmbus_on_off_enabled,
+            "execution_ready": False,
+        }
+
+    def inspect_ltm4677_restore_transport(self, target_raw):
+        """Check restore compatibility with a non-PEC transport.
+
+        No configuration writes, PAGE selection or NVM commands.
+        Reject a PEC-requiring target before hardware access.
+
+        This is a point-in-time check, not execution authorization.
+        """
+        report = {
+            "ok": False,
+            "execution_ready": False,
+            "target_raw": target_raw,
+            "current_raw": None,
+            "target_pec_required": None,
+            "current_pec_required": None,
+            "reason": None,
+            "error": None,
+            "disconnect": None,
+        }
+
+        with self._lock:
+            active = "Transport offline validation"
+
+            try:
+                if not self._identified:
+                    raise RuntimeError("Device is not identified")
+
+                if getattr(self, "is_demo", False):
+                    raise ValueError("Demo writes are disabled")
+
+                if self.name != "LTM4677":
+                    raise ValueError(
+                        "Restore transport inspection supports "
+                        "LTM4677 only"
+                    )
+
+                if (
+                    isinstance(target_raw, bool)
+                    or not isinstance(target_raw, int)
+                    or not 0 <= target_raw <= 0xFF
+                ):
+                    raise ValueError(
+                        "Target MFR_CONFIG_ALL must be "
+                        "an integer byte"
+                    )
+
+                cmd = self.command_code("MFR_CONFIG_ALL")
+                info = self._regmap.get(cmd)
+
+                if (
+                    info is None
+                    or info[1] != "byte"
+                    or info[3]
+                    or not self.can_read_register(cmd, "byte")
+                ):
+                    raise ValueError(
+                        "MFR_CONFIG_ALL: global byte read unavailable"
+                    )
+
+                report["target_pec_required"] = bool(
+                    target_raw & 0x04
+                )
+
+                if report["target_pec_required"]:
+                    report["reason"] = "pec_required_but_unsupported"
+                    raise ValueError(
+                        "Target MFR_CONFIG_ALL requires PEC. "
+                        "Full restoration with the current "
+                        "non-PEC transport is blocked."
+                    )
+
+                active = "Read current MFR_CONFIG_ALL"
+                current = self.read_register(None, cmd)
+
+                if (
+                    isinstance(current, bool)
+                    or not isinstance(current, int)
+                    or not 0 <= current <= 0xFF
+                ):
+                    raise OSError(
+                        "Invalid MFR_CONFIG_ALL response"
+                    )
+
+                report["current_raw"] = current
+                report["current_pec_required"] = bool(
+                    current & 0x04
+                )
+
+                if report["current_pec_required"]:
+                    report["reason"] = "pec_required_but_unsupported"
+                    raise ValueError(
+                        "Current MFR_CONFIG_ALL requires PEC. "
+                        "Do not start paged baseline reads "
+                        "with the non-PEC transport."
+                    )
+
+                report["ok"] = True
+
+            except TransportDisconnectedError as exc:
+                report["disconnect"] = exc
+                report["error"] = f"{active}\n{exc}"
+
+            except Exception as exc:
+                report["error"] = f"{active}\n{exc}"
+
+            return report
+
+    def inspect_ltm4677_restore_protection(self, target_raw):
+        """Read protection state without changing configuration.
+
+        Accepted WRITE_PROTECT values are an application policy.
+        A successful check is not authorization to execute a restore.
+        The WP pin and protection must be rechecked before writes.
+        """
+        report = {
+            "ok": False,
+            "execution_ready": False,
+            "target_raw": target_raw,
+            "current_raw": None,
+            "mfr_common_raw": None,
+            "wp_asserted": None,
+            "temporary_unlock_required": None,
+            "error": None,
+            "disconnect": None,
+        }
+
+        accepted_values = frozenset({
+            0x00, 0x20, 0x40, 0x80,
+        })
+
+        with self._lock:
+            active = "Protection offline validation"
+
+            try:
+                if not self._identified:
+                    raise RuntimeError("Device is not identified")
+
+                if getattr(self, "is_demo", False):
+                    raise ValueError("Demo writes are disabled")
+
+                if self.name != "LTM4677":
+                    raise ValueError(
+                        "Protection inspection supports LTM4677 only"
+                    )
+
+                if (
+                    isinstance(target_raw, bool)
+                    or not isinstance(target_raw, int)
+                    or target_raw not in accepted_values
+                ):
+                    raise ValueError(
+                        "Target WRITE_PROTECT is outside "
+                        "the accepted application policy"
+                    )
+
+                commands = {}
+
+                for name in ("MFR_COMMON", "WRITE_PROTECT"):
+                    cmd = self.command_code(name)
+                    info = self._regmap.get(cmd)
+
+                    if (
+                        info is None
+                        or info[1] != "byte"
+                        or info[3]
+                        or not self.can_read_register(cmd, "byte")
+                    ):
+                        raise ValueError(
+                            f"{name}: global byte read unavailable"
+                        )
+
+                    commands[name] = cmd
+
+                active = "Read current MFR_COMMON"
+                common = self.read_register(
+                    None, commands["MFR_COMMON"]
+                )
+
+                if (
+                    isinstance(common, bool)
+                    or not isinstance(common, int)
+                    or not 0 <= common <= 0xFF
+                ):
+                    raise OSError("Invalid MFR_COMMON response")
+
+                report["mfr_common_raw"] = common
+                report["wp_asserted"] = bool(common & 0x01)
+
+                if report["wp_asserted"]:
+                    raise ValueError(
+                        "Hardware WP is asserted. "
+                        "Full restoration is blocked."
+                    )
+
+                active = "Read current WRITE_PROTECT"
+                current = self.read_register(
+                    None, commands["WRITE_PROTECT"]
+                )
+
+                if (
+                    isinstance(current, bool)
+                    or not isinstance(current, int)
+                    or not 0 <= current <= 0xFF
+                ):
+                    raise OSError("Invalid WRITE_PROTECT response")
+
+                report["current_raw"] = current
+
+                if current not in accepted_values:
+                    raise ValueError(
+                        "Current WRITE_PROTECT is outside "
+                        "the accepted application policy"
+                    )
+
+                report["temporary_unlock_required"] = (
+                    current != 0x00
+                )
+                report["ok"] = True
+
+            except TransportDisconnectedError as exc:
+                report["disconnect"] = exc
+                report["error"] = f"{active}\n{exc}"
+
+            except Exception as exc:
+                report["error"] = f"{active}\n{exc}"
+
+            return report
+
+    def preflight_ltm4677_full_restore(self, metadata, records):
+        """Inspect targets, protection, transport and baselines.
+
+        No configuration writes, unlock, rollback or NVM commands.
+        Paged baseline reads may perform service PAGE writes.
+
+        Success is diagnostic only, not execution authorization.
+        External masters are not locked out by these checks.
+        """
+        report = {
+            "ok": False,
+            "execution_ready": False,
+            "inspection": None,
+            "protection_before": None,
+            "transport_before": None,
+            "baseline_report": None,
+            "transport_after": None,
+            "protection_after": None,
+            "reason": None,
+            "error": None,
+            "disconnect": None,
+        }
+
+        with self._lock:
+            active = "Full restore offline inspection"
+
+            try:
+                if not self._identified:
+                    raise RuntimeError("Device is not identified")
+
+                if getattr(self, "is_demo", False):
+                    raise ValueError("Demo writes are disabled")
+
+                if self.name != "LTM4677":
+                    raise ValueError(
+                        "Full restore preflight supports LTM4677 only"
+                    )
+
+                source_metadata = deepcopy(metadata)
+                source_records = deepcopy(list(records))
+
+                inspection = self.inspect_full_dump_restore(
+                    source_metadata,
+                    source_records,
+                )
+                report["inspection"] = inspection
+
+                def global_target(name):
+                    matches = [
+                        item
+                        for item in inspection["candidates"]
+                        if item["name"] == name
+                        and item["page"] is None
+                    ]
+                    if len(matches) != 1:
+                        raise ValueError(
+                            f"Expected one global {name} target"
+                        )
+                    return matches[0]
+
+                protection_target = global_target("WRITE_PROTECT")
+                transport_target = global_target("MFR_CONFIG_ALL")
+
+                # Reject unsupported target transport before any I/O.
+                # The full snapshot remains valid for offline analysis.
+                if transport_target["raw"] & 0x04:
+                    report["reason"] = "pec_required_but_unsupported"
+                    raise ValueError(
+                        "Target MFR_CONFIG_ALL requires PEC. "
+                        "Full restoration with the current "
+                        "non-PEC transport is blocked."
+                    )
+
+                def accept_stage(field, stage):
+                    report[field] = stage
+                    if stage["ok"]:
+                        return True
+                    report["reason"] = stage.get("reason")
+                    report["error"] = stage["error"]
+                    report["disconnect"] = stage["disconnect"]
+                    return False
+
+                active = "Initial protection check"
+                before = self.inspect_ltm4677_restore_protection(
+                    protection_target["raw"]
+                )
+                if not accept_stage("protection_before", before):
+                    return report
+
+                active = "Initial transport check"
+                transport_before = (
+                    self.inspect_ltm4677_restore_transport(
+                        transport_target["raw"]
+                    )
+                )
+                if not accept_stage(
+                    "transport_before", transport_before
+                ):
+                    return report
+
+                active = "Read full restore baselines"
+                baselines = self.read_full_dump_restore_baselines(
+                    source_metadata,
+                    source_records,
+                )
+                if not accept_stage("baseline_report", baselines):
+                    return report
+
+                def baseline_raw(target):
+                    matches = [
+                        item
+                        for item in baselines["baselines"]
+                        if item["cmd"] == target["cmd"]
+                        and item["page"] is None
+                    ]
+                    if len(matches) != 1:
+                        raise ValueError(
+                            f"Expected one {target['name']} baseline"
+                        )
+
+                    raw = matches[0]["current_raw"]
+                    if (
+                        isinstance(raw, bool)
+                        or not isinstance(raw, int)
+                        or not 0 <= raw <= 0xFF
+                    ):
+                        raise ValueError(
+                            f"Invalid {target['name']} baseline"
+                        )
+                    return raw
+
+                active = "Compare protection and transport baselines"
+                protection_baseline = baseline_raw(protection_target)
+                transport_baseline = baseline_raw(transport_target)
+
+                if protection_baseline != before["current_raw"]:
+                    raise ValueError(
+                        "WRITE_PROTECT changed during baseline reads: "
+                        f"initial 0x{before['current_raw']:02X}, "
+                        f"baseline 0x{protection_baseline:02X}"
+                    )
+
+                if transport_baseline != transport_before["current_raw"]:
+                    raise ValueError(
+                        "MFR_CONFIG_ALL changed during baseline reads: "
+                        f"initial 0x{transport_before['current_raw']:02X}, "
+                        f"baseline 0x{transport_baseline:02X}"
+                    )
+
+                active = "Final transport check"
+                transport_after = (
+                    self.inspect_ltm4677_restore_transport(
+                        transport_target["raw"]
+                    )
+                )
+                if not accept_stage(
+                    "transport_after", transport_after
+                ):
+                    return report
+
+                if transport_after["current_raw"] != transport_baseline:
+                    raise ValueError(
+                        "MFR_CONFIG_ALL changed after baseline reads: "
+                        f"baseline 0x{transport_baseline:02X}, "
+                        f"final 0x{transport_after['current_raw']:02X}"
+                    )
+
+                active = "Final protection check"
+                after = self.inspect_ltm4677_restore_protection(
+                    protection_target["raw"]
+                )
+                if not accept_stage("protection_after", after):
+                    return report
+
+                if after["current_raw"] != protection_baseline:
+                    raise ValueError(
+                        "WRITE_PROTECT changed after baseline reads: "
+                        f"baseline 0x{protection_baseline:02X}, "
+                        f"final 0x{after['current_raw']:02X}"
+                    )
+
+                report["ok"] = True
+
+            except TransportDisconnectedError as exc:
+                report["disconnect"] = exc
+                report["error"] = f"{active}\n{exc}"
+
+            except Exception as exc:
+                report["error"] = f"{active}\n{exc}"
+
+            return report
 
     def _reset_profile(self):
         self.name = "Unknown"
@@ -506,10 +1289,13 @@ class PMBusDevice:
                 return report
 
     def validate_dump_metadata(self, metadata, records):
-        """Check imported dump compatibility without device I/O.
+        """Validate source compatibility without device I/O.
 
-        Records must already have passed validate_dump_write_records.
+        Records must have validated identities and scopes.
+        Every command must belong to the scalar register map.
+
         Metadata is a compatibility declaration, not authentication.
+        This method does not authorize writes or check coverage.
         """
         with self._lock:
             if not self._identified:
@@ -545,43 +1331,681 @@ class PMBusDevice:
                     "CSV Special ID does not match the device"
                 )
 
-            # A single exponent in the current CSV format must
-            # match every selected L16 target page.
-            l16_pages = {
-                record["page"]
-                for record in records
-                if self._regmap[record["cmd"]][2] == "L16"
-            }
+            version = metadata.get("dump_format_version")
+            scope = metadata.get("dump_scope")
+            full_dump = version is not None or scope is not None
 
-            if l16_pages:
-                exponent_text = metadata.get("vout_mode_exp")
-                if not isinstance(exponent_text, str):
+            def read_integer(key, description):
+                text = metadata.get(key)
+                if not isinstance(text, str):
                     raise ValueError(
-                        "CSV VOUT exponent is missing"
+                        f"CSV {description} is missing"
                     )
-
                 try:
-                    exponent = int(exponent_text, 10)
+                    return int(text, 10)
                 except ValueError as exc:
                     raise ValueError(
-                        "Invalid CSV VOUT exponent"
+                        f"Invalid CSV {description}"
                     ) from exc
 
+            def check_exponent(page, key):
+                exponent = read_integer(key, "VOUT exponent")
                 if not -16 <= exponent <= 15:
                     raise ValueError(
                         "CSV VOUT exponent is outside the signed "
                         "five-bit range"
                     )
 
-                for page in sorted(l16_pages):
-                    actual = self.vout_exp.get(page)
-                    if actual is None or actual != exponent:
+                actual = self.vout_exp.get(page)
+                if actual is None or actual != exponent:
+                    raise ValueError(
+                        "CSV VOUT exponent does not match "
+                        f"target page {page}"
+                    )
+
+            if full_dump:
+                if version != "2" or scope != "full":
+                    raise ValueError(
+                        "Unsupported CSV dump version or scope"
+                    )
+
+                pages = read_integer("pages", "page count")
+                if pages != self.num_pages:
+                    raise ValueError(
+                        "CSV page count does not match the device"
+                    )
+
+                if (
+                    "page" in metadata
+                    or "vout_mode_exp" in metadata
+                ):
+                    raise ValueError(
+                        "Full dump contains page-dump metadata"
+                    )
+
+                prefix = "vout_mode_exp_page_"
+                expected = {
+                    f"{prefix}{page}"
+                    for page in range(self.num_pages)
+                }
+                supplied = {
+                    key
+                    for key in metadata
+                    if isinstance(key, str)
+                    and key.startswith(prefix)
+                }
+                if supplied != expected:
+                    raise ValueError(
+                        "CSV exponent fields do not match page count"
+                    )
+
+                # Full snapshot compatibility covers every page,
+                # even if the selected write subset contains no L16.
+                for page in range(self.num_pages):
+                    check_exponent(page, f"{prefix}{page}")
+
+                for record in records:
+                    paged = bool(self._regmap[record["cmd"]][3])
+                    page = record["page"]
+
+                    if paged:
+                        if not self._valid_page(page):
+                            raise ValueError(
+                                "Invalid full dump target page"
+                            )
+                    elif page is not None:
                         raise ValueError(
-                            f"CSV VOUT exponent does not match "
-                            f"target page {page}"
+                            "Full dump global register "
+                            "must use page=None"
                         )
 
+                return True
+
+            # Legacy page metadata has one exponent.
+            l16_pages = {
+                record["page"]
+                for record in records
+                if self._regmap[record["cmd"]][2] == "L16"
+            }
+
+            for page in sorted(l16_pages):
+                check_exponent(page, "vout_mode_exp")
+
             return True
+
+    def read_full_dump_restore_baselines(self, metadata, records):
+        """Inspect the full snapshot, then read candidate baselines.
+
+        No configuration writes, rollback or NVM actions.
+        Paged reads may perform service PAGE writes.
+
+        Return partial progress on failure. This report does not
+        authorize execution and must not replace pre-write rechecks.
+        """
+        report = {
+            "ok": False,
+            "execution_ready": False,
+            "inspection": None,
+            "baselines": [],
+            "error": None,
+            "disconnect": None,
+        }
+
+        with self._lock:
+            active = "Full restore offline inspection"
+
+            try:
+                inspection = self.inspect_full_dump_restore(
+                    metadata, records
+                )
+                report["inspection"] = inspection
+
+                for record in inspection["candidates"]:
+                    page = record["page"]
+                    cmd = record["cmd"]
+                    name = record["name"]
+                    scope = (
+                        "GLOBAL"
+                        if page is None
+                        else f"PAGE {page}"
+                    )
+                    active = (
+                        f"Baseline {scope} / {name} "
+                        f"0x{cmd:02X}"
+                    )
+
+                    current = self.read_register(page, cmd)
+                    maximum = (
+                        0xFF
+                        if record["size"] == "byte"
+                        else 0xFFFF
+                    )
+
+                    if (
+                        isinstance(current, bool)
+                        or not isinstance(current, int)
+                        or not 0 <= current <= maximum
+                    ):
+                        raise OSError(
+                            "Invalid baseline response: "
+                            f"{current!r}"
+                        )
+
+                    item = dict(record)
+                    item["current_raw"] = current
+                    item["target_raw"] = record["raw"]
+                    item["matches_target"] = (
+                        current == record["raw"]
+                    )
+                    report["baselines"].append(item)
+
+                report["ok"] = True
+
+            except TransportDisconnectedError as exc:
+                report["disconnect"] = exc
+                report["error"] = f"{active}\n{exc}"
+
+            except Exception as exc:
+                report["error"] = f"{active}\n{exc}"
+
+            return report
+
+    def inspect_full_dump_restore(self, metadata, records):
+        """Inspect full restore targets without hardware access.
+
+        Validate snapshot coverage, compatibility and available
+        profile value rules. Preserve context-dependent candidates.
+
+        The result is not an executable write plan.
+        """
+        with self._lock:
+            classified = self.validate_full_dump_snapshot(
+                metadata, records
+            )
+
+            rules = self._metadata.get("write_value_rules", {})
+            checks = []
+            requirements = []
+
+            for record in classified["candidates"]:
+                cmd = record["cmd"]
+                raw = record["raw"]
+                name = record["name"]
+                page = record["page"]
+                rule = rules.get(cmd)
+
+                check = {
+                    "page": page,
+                    "cmd": cmd,
+                    "name": name,
+                    "raw": raw,
+                    "value_check": "representation_only",
+                }
+
+                if rule is not None:
+                    if "allowed" not in rule:
+                        raise ValueError(
+                            f"{name}: profile value rule "
+                            "has no allowed set"
+                        )
+
+                    if raw in rule.get("requires_context", ()):
+                        check["value_check"] = "requires_context"
+                        requirements.append({
+                            "page": page,
+                            "cmd": cmd,
+                            "name": name,
+                            "kind": "value_context",
+                            "detail": rule.get(
+                                "context_error",
+                                "Device configuration context "
+                                "must be checked before writing.",
+                            ),
+                        })
+
+                    elif raw in rule["allowed"]:
+                        check["value_check"] = "profile_allowed"
+
+                    else:
+                        raise ValueError(
+                            f"PAGE {page} / {name}: "
+                            + rule.get(
+                                "invalid_error",
+                                "Value rejected by device profile.",
+                            )
+                        )
+
+                if name == "WRITE_PROTECT":
+                    requirements.append({
+                        "page": page,
+                        "cmd": cmd,
+                        "name": name,
+                        "kind": "write_protection",
+                        "detail": (
+                            "Validate current and target protection, "
+                            "temporary access and final protection."
+                        ),
+                    })
+
+                elif name in {
+                    "MFR_ADDRESS",
+                    "MFR_I2C_BASE_ADDRESS",
+                    "MFR_RAIL_ADDRESS",
+                }:
+                    requirements.append({
+                        "page": page,
+                        "cmd": cmd,
+                        "name": name,
+                        "kind": "address_handling",
+                        "detail": (
+                            "Validate model-specific address semantics "
+                            "and preserve verified device access."
+                        ),
+                    })
+
+                elif name in {"OPERATION", "ON_OFF_CONFIG"}:
+                    requirements.append({
+                        "page": page,
+                        "cmd": cmd,
+                        "name": name,
+                        "kind": "control_transition",
+                        "detail": (
+                            "Validate current-to-target control "
+                            "transition and intermediate states."
+                        ),
+                    })
+
+                checks.append(check)
+
+            targets = {
+                (record["page"], record["name"]): record
+                for record in classified["candidates"]
+            }
+
+            for check in checks:
+                rule = rules.get(check["cmd"])
+                if rule is None:
+                    continue
+
+                context = rule.get("restore_context")
+                if context is None:
+                    continue
+
+                context_name = context["command_name"]
+                context_cmd = self.command_code(context_name)
+
+                if context_cmd is None:
+                    raise ValueError(
+                        f"{check['name']}: context command "
+                        f"{context_name} is absent from the profile"
+                    )
+
+                context_info = self._regmap[context_cmd]
+                context_page = (
+                    check["page"] if context_info[3] else None
+                )
+
+                target = targets.get(
+                    (context_page, context_name)
+                )
+                if target is None:
+                    raise ValueError(
+                        f"{check['name']}: target context "
+                        f"{context_name} is missing"
+                    )
+
+                context_raw = target["raw"]
+                enabled = bool(context_raw & context["mask"])
+                allowed = context[
+                    "allowed_when_set"
+                    if enabled
+                    else "allowed_when_clear"
+                ]
+
+                if check["raw"] not in allowed:
+                    raise ValueError(
+                        f"PAGE {check['page']} / "
+                        f"{check['name']}: target value "
+                        f"0x{check['raw']:02X} is incompatible "
+                        f"with target {context_name} "
+                        f"0x{context_raw:02X}"
+                    )
+
+                check["target_context_check"] = "compatible"
+                check["target_context"] = {
+                    "page": context_page,
+                    "cmd": context_cmd,
+                    "name": context_name,
+                    "raw": context_raw,
+                }
+
+            return {
+                **classified,
+                "value_checks": checks,
+                "requirements": requirements,
+                "execution_ready": False,
+            }
+
+    def validate_full_dump_snapshot(self, metadata, records):
+        """Validate full snapshot coverage and source compatibility.
+
+        Offline only. No baseline reads or configuration writes.
+        Return classified independent records, not an execution plan.
+
+        Coverage follows read_device_dump:
+        all readable scalar registers, except PAGE, across all pages.
+        """
+        with self._lock:
+            if not self._identified:
+                raise RuntimeError("Device is not identified")
+
+            if getattr(self, "is_demo", False):
+                raise ValueError("Demo writes are disabled")
+
+            if not isinstance(metadata, dict):
+                raise ValueError(
+                    "CSV metadata must be a dictionary"
+                )
+
+            if (
+                metadata.get("dump_format_version") != "2"
+                or metadata.get("dump_scope") != "full"
+            ):
+                raise ValueError(
+                    "Full snapshot requires version 2 "
+                    "and full scope"
+                )
+
+            classified = self.classify_dump_snapshot(records)
+
+            all_records = (
+                classified["candidates"]
+                + classified["excluded"]
+            )
+
+            # Full snapshots require an explicit scope identity.
+            # Do not normalize legacy numeric global pages here.
+            actual = set()
+
+            for record in all_records:
+                cmd = record["cmd"]
+                page = record["page"]
+
+                if not record["is_paged"] and page is not None:
+                    raise ValueError(
+                        "Full dump global register must use "
+                        f"page=None: command 0x{cmd:02X}"
+                    )
+
+                actual.add((page, cmd))
+
+            expected = set()
+
+            for cmd, info in self._regmap.items():
+                if cmd == Cmd.PAGE:
+                    continue
+
+                if not self.can_read_register(cmd):
+                    continue
+
+                if info[3]:
+                    for page in range(self.num_pages):
+                        expected.add((page, cmd))
+                else:
+                    expected.add((None, cmd))
+
+            def describe(targets):
+                ordered = sorted(
+                    targets,
+                    key=lambda target: (
+                        -1 if target[0] is None else target[0],
+                        target[1],
+                    ),
+                )
+                return ", ".join(
+                    (
+                        "GLOBAL"
+                        if page is None
+                        else f"PAGE {page}"
+                    )
+                    + f"/0x{cmd:02X}"
+                    for page, cmd in ordered
+                )
+
+            missing = expected - actual
+            unexpected = actual - expected
+
+            if missing or unexpected:
+                details = []
+
+                if missing:
+                    details.append(
+                        "missing targets: " + describe(missing)
+                    )
+
+                if unexpected:
+                    details.append(
+                        "unexpected targets: "
+                        + describe(unexpected)
+                    )
+
+                raise ValueError(
+                    "Full dump coverage mismatch; "
+                    + "; ".join(details)
+                )
+
+            # Coverage has established that every command belongs
+            # to the scalar register map. Compatibility must cover
+            # the entire snapshot, not just writable candidates.
+            self.validate_dump_metadata(
+                metadata,
+                all_records,
+            )
+
+            return classified
+
+    def classify_dump_snapshot(self, records, default_page=0):
+        """Classify a snapshot without I/O or write authorization.
+
+        Source readonly flags are preserved but do not determine
+        hardware access. Candidates are not an executable plan.
+
+        Validate record identity, scope and scalar representation.
+        Value rules, metadata and execution order are checked later.
+        """
+        with self._lock:
+            if not self._identified:
+                raise RuntimeError("Device is not identified")
+
+            if getattr(self, "is_demo", False):
+                raise ValueError("Demo writes are disabled")
+
+            if not self._valid_page(default_page):
+                raise ValueError("Invalid default page")
+
+            candidates = []
+            excluded = []
+            seen = set()
+
+            send_commands = self._metadata.get(
+                "send_commands", {}
+            )
+            protocols = self._metadata.get(
+                "special_protocols", {}
+            )
+            special_access = self._metadata.get(
+                "special_access", set()
+            )
+            w1c = self._metadata.get(
+                "write_one_to_clear", set()
+            )
+
+            for index, source in enumerate(records, start=1):
+                prefix = f"Record {index}"
+
+                if not isinstance(source, dict):
+                    raise ValueError(
+                        f"{prefix}: expected a record dictionary"
+                    )
+
+                cmd = source.get("cmd")
+                if (
+                    isinstance(cmd, bool)
+                    or not isinstance(cmd, int)
+                    or not 0 <= cmd <= 0xFF
+                ):
+                    raise ValueError(
+                        f"{prefix}: invalid command code"
+                    )
+
+                reason = None
+                info = self._regmap.get(cmd)
+
+                if info is not None:
+                    name, size, fmt, paged = info
+
+                    if cmd == Cmd.PAGE:
+                        reason = "service_page"
+                    elif cmd in special_access:
+                        reason = "special_access"
+                    elif size == "block":
+                        reason = "block"
+                    elif cmd in w1c:
+                        reason = "write_one_to_clear"
+                    elif cmd in self._read_only:
+                        reason = "read_only"
+
+                elif cmd in send_commands:
+                    name, paged = send_commands[cmd]
+                    size = "send"
+                    fmt = None
+                    reason = "action"
+
+                elif cmd in protocols:
+                    name, size, paged = protocols[cmd]
+                    fmt = None
+                    reason = "special_protocol"
+
+                else:
+                    raise ValueError(
+                        f"{prefix}: unknown command 0x{cmd:02X}"
+                    )
+
+                prefix = f"{prefix} / {name}"
+
+                if source.get("size") != size:
+                    raise ValueError(
+                        f"{prefix}: size mismatch"
+                    )
+
+                if (
+                    "name" in source
+                    and source["name"] != name
+                ):
+                    raise ValueError(
+                        f"{prefix}: name mismatch"
+                    )
+
+                if (
+                    fmt is not None
+                    and "format" in source
+                    and source["format"] != fmt
+                ):
+                    raise ValueError(
+                        f"{prefix}: format mismatch"
+                    )
+
+                if "is_paged" in source:
+                    scope = source["is_paged"]
+                    if (
+                        not isinstance(scope, bool)
+                        or scope != bool(paged)
+                    ):
+                        raise ValueError(
+                            f"{prefix}: scope mismatch"
+                        )
+
+                if (
+                    "readonly" in source
+                    and not isinstance(source["readonly"], bool)
+                ):
+                    raise ValueError(
+                        f"{prefix}: readonly must be boolean"
+                    )
+
+                page = source.get("page", default_page)
+
+                if paged:
+                    valid_page = self._valid_page(page)
+                else:
+                    valid_page = (
+                        page is None
+                        or self._valid_page(page)
+                    )
+
+                if not valid_page:
+                    raise ValueError(
+                        f"{prefix}: invalid page {page!r}"
+                    )
+
+                identity = (
+                    page if paged else None,
+                    cmd,
+                )
+                if identity in seen:
+                    raise ValueError(
+                        f"{prefix}: duplicate target register"
+                    )
+                seen.add(identity)
+
+                raw = source.get("raw")
+                if size in {"byte", "word"}:
+                    maximum = (
+                        0xFF if size == "byte" else 0xFFFF
+                    )
+                    if raw is not None and (
+                        isinstance(raw, bool)
+                        or not isinstance(raw, int)
+                        or not 0 <= raw <= maximum
+                    ):
+                        raise ValueError(
+                            f"{prefix}: invalid raw value"
+                        )
+
+                    if reason is None and raw is None:
+                        raise ValueError(
+                            f"{prefix}: writable register "
+                            "has no raw value"
+                        )
+
+                item = dict(source)
+                item.update(
+                    page=page,
+                    name=name,
+                    size=size,
+                    is_paged=bool(paged),
+                )
+                if fmt is not None:
+                    item["format"] = fmt
+
+                if reason is not None:
+                    item["exclude_reason"] = reason
+                    excluded.append(item)
+                else:
+                    if size not in {"byte", "word"}:
+                        raise ValueError(
+                            f"{prefix}: unsupported restore size"
+                        )
+                    candidates.append(item)
+
+            if not seen:
+                raise ValueError("Dump snapshot is empty")
+
+            return {
+                "candidates": candidates,
+                "excluded": excluded,
+                "total": len(seen),
+            }
 
     def validate_dump_write_records(self, records, default_page=0):
         """Validate selected dump writes without device I/O.
@@ -672,7 +2096,18 @@ class PMBusDevice:
                     )
 
                 page = record.get("page", default_page)
-                if not self._valid_page(page):
+
+                if paged:
+                    valid_page = self._valid_page(page)
+                else:
+                    # New full dumps use None for globals.
+                    # Legacy page dumps retain a numeric page.
+                    valid_page = (
+                        page is None
+                        or self._valid_page(page)
+                    )
+
+                if not valid_page:
                     raise ValueError(
                         f"{prefix}: invalid page {page!r}"
                     )
@@ -1611,6 +3046,20 @@ class PMBusDevice:
                     result[name] = None
                     available[name] = cmd
 
+            adc_name = "MFR_ADC_TELEMETRY_STATUS"
+            adc_cmd = self.command_code(adc_name)
+
+            if adc_cmd is not None:
+                info = self._regmap.get(adc_cmd)
+                if (
+                    info is not None
+                    and info[1] == "byte"
+                    and not info[3]
+                    and self.can_read_register(adc_cmd, "byte")
+                ):
+                    result[adc_name] = None
+                    available[adc_name] = adc_cmd
+
             if not self._identified:
                 return result
 
@@ -1637,6 +3086,11 @@ class PMBusDevice:
             if self.can_read_register(Cmd.STATUS_CML, "byte"):
                 result["STATUS_CML"] = self._rb(
                     Cmd.STATUS_CML
+                )
+
+            if adc_name in available:
+                result[adc_name] = self._read_scalar(
+                    available[adc_name]
                 )
 
         return result
@@ -1821,6 +3275,102 @@ class PMBusDevice:
             if not self._send_named("RESTORE_USER_ALL"):
                 return False
             return self.identify()
+
+    def read_device_dump(self):
+        """Read all generic scalar registers across all pages.
+
+        Global registers occur once with page=None.
+        PAGE and special-access commands are excluded.
+
+        Return a complete list or raise on the first read failure.
+        No configuration writes or NVM actions are performed.
+        PAGE selection still requires service writes.
+
+        Restore the previous known page only after successful reads.
+        Never perform cleanup I/O after an error.
+        """
+        with self._lock:
+            if not self._identified:
+                raise RuntimeError("Device is not identified")
+
+            previous_page = self._page
+            result = []
+
+            global_commands = []
+            paged_commands = []
+
+            for cmd, info in sorted(self._regmap.items()):
+                if cmd == Cmd.PAGE:
+                    continue
+
+                if not self.can_read_register(cmd):
+                    continue
+
+                if info[3]:
+                    paged_commands.append(cmd)
+                else:
+                    global_commands.append(cmd)
+
+            def append_record(cmd, page):
+                name, size, fmt, paged = self._regmap[cmd]
+
+                # Generic global reads ignore the supplied page.
+                access_page = 0 if page is None else page
+                raw = self.read_register(access_page, cmd)
+
+                maximum = 0xFF if size == "byte" else 0xFFFF
+                if (
+                    isinstance(raw, bool)
+                    or not isinstance(raw, int)
+                    or not 0 <= raw <= maximum
+                ):
+                    scope = (
+                        "Global" if page is None
+                        else f"PAGE {page}"
+                    )
+                    raise OSError(
+                        f"Full dump read failed: {scope}, "
+                        f"{name}, command 0x{cmd:02X}, "
+                        f"response={raw!r}"
+                    )
+
+                result.append({
+                    "page": page,
+                    "cmd": cmd,
+                    "name": name,
+                    "size": size,
+                    "format": fmt,
+                    "is_paged": bool(paged),
+                    "raw": raw,
+                    "decoded": self._decode(
+                        cmd,
+                        raw,
+                        access_page,
+                        custom=True,
+                    ),
+                    "readonly": not self.can_write_register(
+                        cmd, size
+                    ),
+                })
+
+            for cmd in global_commands:
+                append_record(cmd, None)
+
+            for page in range(self.num_pages):
+                for cmd in paged_commands:
+                    append_record(cmd, page)
+
+            if (
+                self._valid_page(previous_page)
+                and self._page != previous_page
+            ):
+                if not self.set_page(previous_page):
+                    raise OSError(
+                        "Full dump read completed, but restoring "
+                        f"PAGE {previous_page} failed"
+                    )
+
+            return result
 
     def read_full_dump(self, page=0):
         with self._lock:

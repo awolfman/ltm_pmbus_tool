@@ -130,7 +130,7 @@ def dump_to_csv_string(device, dump_data, page, *, metadata=None):
     return add_dump_checksum(out.getvalue())
 
 
-def csv_string_to_dump(csv_text):
+def _page_csv_string_to_dump(csv_text):
     """Parse an entire dump or reject it without returning partial data."""
     csv_text = verify_dump_checksum(csv_text)
     expected_header = [
@@ -299,3 +299,289 @@ def save_csv_atomic(path, text):
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
+
+_FULL_HEADER = [
+    "Page", "CmdHex", "CmdDec", "Name", "Size", "Format",
+    "Paged", "RawHex", "RawDec", "Decoded", "ReadOnly",
+]
+
+
+def _dump_metadata_from_body(body):
+    """Read normalized metadata without accepting duplicate fields."""
+    metadata = {}
+
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#") or ":" not in stripped:
+            continue
+
+        key, value = stripped.lstrip("#").strip().split(":", 1)
+        key = key.strip().lower().replace(" ", "_")
+
+        if not key:
+            raise ValueError("Empty CSV metadata key")
+        if key in metadata:
+            raise ValueError(
+                f"Duplicate CSV metadata field: {key}"
+            )
+
+        metadata[key] = value.strip()
+
+    return metadata
+
+
+def _validate_full_dump_metadata(metadata):
+    if metadata.get("dump_format_version") != "2":
+        raise ValueError("Unsupported full dump format version")
+
+    if metadata.get("dump_scope") != "full":
+        raise ValueError("Full dump scope must be full")
+
+    if not metadata.get("device"):
+        raise ValueError("Full dump device model is missing")
+
+    sid = metadata.get("special_id", "")
+    if not re.fullmatch(r"0[xX][0-9a-fA-F]{1,4}", sid):
+        raise ValueError("Invalid full dump Special ID")
+
+    pages_text = metadata.get("pages", "")
+    if not re.fullmatch(r"[0-9]+", pages_text):
+        raise ValueError("Invalid full dump page count")
+
+    pages = int(pages_text)
+    if not 1 <= pages <= 255:
+        raise ValueError("Full dump page count is outside 1..255")
+
+    for page in range(pages):
+        key = f"vout_mode_exp_page_{page}"
+        value = metadata.get(key, "")
+        if not re.fullmatch(r"-?[0-9]+", value):
+            raise ValueError(
+                f"Missing or invalid exponent for page {page}"
+            )
+
+        exponent = int(value)
+        if not -16 <= exponent <= 15:
+            raise ValueError(
+                f"Exponent outside signed five-bit range "
+                f"for page {page}"
+            )
+
+    if "page" in metadata or "vout_mode_exp" in metadata:
+        raise ValueError(
+            "Full dump contains conflicting page-dump metadata"
+        )
+
+    prefix = "vout_mode_exp_page_"
+    expected = {
+        f"{prefix}{page}" for page in range(pages)
+    }
+    supplied = {
+        key for key in metadata if key.startswith(prefix)
+    }
+    if supplied != expected:
+        raise ValueError(
+            "Full dump exponent fields do not match page count"
+        )
+
+    return pages
+
+
+def _parse_full_dump_body(body, metadata):
+    """Parse v2 using the existing scalar-field parser."""
+    pages = _validate_full_dump_metadata(metadata)
+
+    table_lines = [
+        line
+        for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+    if not table_lines:
+        raise ValueError("CSV header is missing")
+
+    try:
+        rows = list(csv.reader(table_lines, strict=True))
+    except csv.Error as exc:
+        raise ValueError(f"Invalid full dump CSV: {exc}") from exc
+
+    if [cell.strip() for cell in rows[0]] != _FULL_HEADER:
+        raise ValueError("CSV header does not match the dump format")
+
+    translated = []
+    scopes = []
+    seen = set()
+    seen_pages = set()
+
+    for index, source in enumerate(rows[1:], start=1):
+        if len(source) != len(_FULL_HEADER):
+            raise ValueError(
+                f"Full dump record {index}: "
+                f"Expected 11 columns, received {len(source)}"
+            )
+
+        row = [cell.strip() for cell in source]
+        page_text = row[0]
+        paged_text = row[6]
+
+        if paged_text == "Y":
+            if not re.fullmatch(r"[0-9]+", page_text):
+                raise ValueError(
+                    f"Full dump record {index}: "
+                    "paged register requires a numeric page"
+                )
+            page = int(page_text)
+            if not 0 <= page < pages:
+                raise ValueError(
+                    f"Full dump record {index}: page out of range"
+                )
+            seen_pages.add(page)
+
+        elif paged_text == "N":
+            if page_text != "GLOBAL":
+                raise ValueError(
+                    f"Full dump record {index}: "
+                    "global register requires GLOBAL"
+                )
+            page = None
+            # The legacy parser requires a numeric page.
+            row[0] = "0"
+
+        else:
+            raise ValueError(
+                f"Full dump record {index}: Paged must be Y or N"
+            )
+
+        scopes.append(page)
+        translated.append(row)
+
+    # Reuse all existing scalar syntax and range checks.
+    temporary = StringIO()
+    writer = csv.writer(temporary)
+    writer.writerow(_FULL_HEADER)
+    writer.writerows(translated)
+
+    _, records = _page_csv_string_to_dump(
+        add_dump_checksum(temporary.getvalue())
+    )
+
+    for record, page in zip(records, scopes):
+        record["page"] = page
+        identity = (page, record["cmd"])
+
+        if identity in seen:
+            raise ValueError(
+                "Duplicate full dump target: "
+                f"page={page}, command=0x{record['cmd']:02X}"
+            )
+        seen.add(identity)
+
+        if record["cmd"] == 0x00:
+            raise ValueError(
+                "PAGE is excluded from full dump snapshots"
+            )
+
+    if seen_pages != set(range(pages)):
+        raise ValueError(
+            "Full dump does not contain records for every page"
+        )
+
+    return dict(metadata), records
+
+
+def csv_string_to_dump(csv_text):
+    """Dispatch legacy page CSV and versioned full-device CSV."""
+    body = verify_dump_checksum(csv_text)
+    metadata = _dump_metadata_from_body(body)
+
+    version = metadata.get("dump_format_version")
+    scope = metadata.get("dump_scope")
+
+    if version is None and scope is None:
+        return _page_csv_string_to_dump(csv_text)
+
+    if version != "2":
+        raise ValueError("Unsupported dump format version")
+
+    if scope != "full":
+        raise ValueError("Unsupported dump scope")
+
+    return _parse_full_dump_body(body, metadata)
+
+
+def device_dump_to_csv_string(device, dump_data, *, metadata=None):
+    """Export a full scalar snapshot without device I/O.
+
+    Imported metadata is preserved, never filled from the target device.
+    Structural validation does not establish profile compatibility
+    or suitability for writing.
+    """
+    records = [dict(record) for record in dump_data]
+
+    if metadata is None:
+        metadata = {
+            "dump_format_version": "2",
+            "dump_scope": "full",
+            "device": device.name,
+            "address": f"0x{device.address:02X}",
+            "special_id": f"0x{device.special_id:04X}",
+            "revision": str(device.revision),
+            "pages": str(device.num_pages),
+            "date": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+        }
+
+        for page in range(device.num_pages):
+            exponent = device.vout_exp.get(page)
+            if (
+                isinstance(exponent, bool)
+                or not isinstance(exponent, int)
+                or not -16 <= exponent <= 15
+            ):
+                raise ValueError(
+                    f"VOUT exponent unavailable for page {page}"
+                )
+            metadata[f"vout_mode_exp_page_{page}"] = str(exponent)
+
+    elif not isinstance(metadata, dict):
+        raise ValueError("CSV metadata must be a dictionary")
+
+    else:
+        metadata = dict(metadata)
+
+    export_records = []
+
+    for record in records:
+        scope = record.get("is_paged")
+        page = record.get("page")
+
+        if not isinstance(scope, bool):
+            raise ValueError("Full dump scope must be boolean")
+
+        if scope:
+            if (
+                isinstance(page, bool)
+                or not isinstance(page, int)
+                or page < 0
+            ):
+                raise ValueError(
+                    "Paged full dump record requires a numeric page"
+                )
+        else:
+            if page is not None:
+                raise ValueError(
+                    "Global full dump record requires page=None"
+                )
+            record["page"] = "GLOBAL"
+
+        export_records.append(record)
+
+    text = dump_to_csv_string(
+        device,
+        export_records,
+        0,
+        metadata=metadata,
+    )
+
+    # Reject malformed snapshots before returning export text.
+    csv_string_to_dump(text)
+    return text

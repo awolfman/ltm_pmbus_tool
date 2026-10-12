@@ -23,6 +23,13 @@ from .pmbus_device import (
 
 GLOBAL_ADDRESSES = {0x5A, 0x5B, 0x7C}
 
+# Explicit configuration for the currently connected board.
+# Remove or update this mapping when changing the board or adapter.
+# Do not infer these exclusions from Special ID.
+CONFIRMED_RAIL_ADDRESSES_BY_BUS = {
+    300: frozenset({0x30}),
+}
+
 
 class SimDevice:
     """Фиктивное устройство для демо-режима с динамической телеметрией."""
@@ -551,8 +558,22 @@ def scan_bus(bus_num, *, cml_diagnostic=False):
         f"{PMBusDevice.__module__}"
     )
 
+    confirmed_rail_addresses = (
+        CONFIRMED_RAIL_ADDRESSES_BY_BUS.get(
+            bus_num,
+            frozenset(),
+        )
+    )
+
     for address in range(0x08, 0x78):
         if address in GLOBAL_ADDRESSES:
+            continue
+
+        if address in confirmed_rail_addresses:
+            print(
+                f"[scan_bus] skip configured rail address "
+                f"0x{address:02X} on bus {bus_num}"
+            )
             continue
 
         device = PMBusDevice(bus_num, address)
