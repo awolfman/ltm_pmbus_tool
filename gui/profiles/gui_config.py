@@ -248,6 +248,9 @@ def config_candidates(device, paged):
     for cmd, descriptor in sorted(device._regmap.items()):
         name, size, fmt, is_paged = descriptor
 
+        if name == "MFR_ADC_TELEMETRY_STATUS":
+            continue
+
         if bool(is_paged) != bool(paged):
             continue
         if size not in {"byte", "word"}:

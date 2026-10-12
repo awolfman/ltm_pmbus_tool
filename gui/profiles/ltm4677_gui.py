@@ -50,7 +50,6 @@ MODEL_CONFIG_SECTIONS = (
         "Additional diagnostics",
         (
             "MFR_INFO",
-            "MFR_ADC_TELEMETRY_STATUS",
             "MFR_ADDRESS",
             "MFR_RAIL_ADDRESS",
         ),
