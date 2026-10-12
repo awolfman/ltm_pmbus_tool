@@ -31,7 +31,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("LTM PMBus Tool v4.8.8")
+        self.title("LTM PMBus Tool v4.8.11")
         self.geometry("1380x850")
         self.minsize(1100, 700)
 
@@ -258,7 +258,7 @@ class App(tk.Tk):
         tk.Label(
             frame,
             text=(
-                "LTM PMBus Tool v4.8.8\n\n"
+                "LTM PMBus Tool v4.8.11\n\n"
                 "Device profiles\n"
                 "LTM4673 / LTM4677 / LTM4678\n\n"
                 "USB adapters\n"

@@ -137,6 +137,113 @@ class ConfigNotebook(ttk.Frame):
         for title in TAB_TITLES:
             self._build_tab(title)
 
+    def _is_guarded_frequency(self, row):
+        return (
+            self.device.name == "LTM4677"
+            and row.name == "FREQUENCY_SWITCH"
+            and row.size == "word"
+            and not self.paged
+            and callable(
+                getattr(
+                    self.device,
+                    "apply_ltm4677_frequency",
+                    None,
+                )
+            )
+        )
+
+    def _write_frequency_one(self, cmd):
+        item = self._rows[cmd]
+        row = item["row"]
+        text = item["variable"].get().strip()
+
+        if text not in item["options"]:
+            raise ValueError(
+                "Select a supported resulting frequency."
+            )
+
+        target = item["options"][text]
+
+        confirmed = messagebox.askyesno(
+            "Change LTM4677 frequency",
+            f"Target: {text}\n\n"
+            "Both outputs must already be OFF.\n"
+            "The application will check both channel statuses.\n"
+            "If OFF is not confirmed, no frequency write "
+            "will be attempted.\n\n"
+            "No automatic output switching or protection unlock.\n"
+            "Monitoring will stop. NVM will not be stored.\n"
+            "Continue?",
+            parent=self,
+        )
+
+        if not confirmed or not self._can_write(row):
+            return
+
+        owner = self._owner()
+        if owner is not None:
+            owner.stop_all()
+
+        self._begin_feedback(cmd, "write_button")
+
+        report = self.device.apply_ltm4677_frequency(target)
+
+        if report["attempted"]:
+            item["baseline"] = None
+            item["baseline_raw"] = None
+
+        if report["disconnect"] is not None:
+            # The existing _run_write handler marks the tab stale.
+            raise type(report["disconnect"])(
+                f"{report['error']}\n\n"
+                f"Frequency write attempted: {report['attempted']}\n"
+                "No automatic output switching or NVM store.\n"
+                "Monitoring remains stopped."
+            )
+
+        actual = report["actual_raw"]
+        if actual is not None:
+            self._show(cmd, actual)
+
+        self._finish_feedback(
+            cmd, "write_button", report["ok"]
+        )
+
+        if not report["ok"]:
+            detail = (
+                "A frequency write may have reached the device."
+                if report["attempted"]
+                else "No frequency write was attempted."
+            )
+
+            messagebox.showwarning(
+                "Frequency change stopped",
+                f"{report['error']}\n\n"
+                f"{detail}\n"
+                "No automatic output switching or NVM store.\n"
+                "Monitoring remains stopped.",
+                parent=self,
+            )
+            return
+
+        result = (
+            "The frequency register already matches the selection.\n"
+            "No frequency write was needed."
+            if report["unchanged"]
+            else
+            "The frequency register readback matches the selection."
+        )
+
+        messagebox.showinfo(
+            "Frequency setting checked",
+            f"{result}\n\n"
+            "This is register verification, not a measurement "
+            "of the physical switching frequency.\n"
+            "Outputs were not switched by the application.\n"
+            "Monitoring remains stopped. NVM was not stored.",
+            parent=self,
+        )
+
     def _owner(self):
         widget = self.master
 
@@ -284,10 +391,19 @@ class ConfigNotebook(ttk.Frame):
         )
 
     def _can_write(self, row):
+        if (
+            self._is_disconnected()
+            or getattr(self.device, "is_demo", False)
+        ):
+            return False
+
+        if self._is_guarded_frequency(row):
+            return self.device.can_read_register(
+                row.cmd, row.size
+            )
+
         return (
-            not self._is_disconnected()
-            and not getattr(self.device, "is_demo", False)
-            and row.writable
+            row.writable
             and self.device.can_write_register(
                 row.cmd, row.size
             )
@@ -405,6 +521,10 @@ class ConfigNotebook(ttk.Frame):
             if not self._can_write(row):
                 continue
 
+            # Dedicated operation, never part of a generic batch plan.
+            if self._is_guarded_frequency(row):
+                continue
+
             text = item["variable"].get().strip()
             baseline = item["baseline"]
 
@@ -488,6 +608,13 @@ class ConfigNotebook(ttk.Frame):
             row.name,
             row.name.replace("_", " "),
         )
+
+        if (
+            self.device.name == "LTM4677"
+            and row.name == "FREQUENCY_SWITCH"
+        ):
+            label = "Result Frequency"
+
         ttk.Label(
             parent,
             text=label,
@@ -504,8 +631,9 @@ class ConfigNotebook(ttk.Frame):
         )
 
         variable = tk.StringVar(value="---")
+        raw_width = 2 if row.size == "byte" else 4
         option_values = {
-            f"0x{raw:02X}  {description}": raw
+            f"0x{raw:0{raw_width}X}  {description}": raw
             for raw, description in options
         }
 
@@ -778,7 +906,10 @@ class ConfigNotebook(ttk.Frame):
                     variable.set(text)
                     return
 
-            variable.set(f"0x{raw:02X}  Not in preset list")
+            width = 2 if row.size == "byte" else 4
+            variable.set(
+                f"0x{raw:0{width}X}  Not in preset list"
+            )
             return
 
         if item["engineering"]:
@@ -892,6 +1023,10 @@ class ConfigNotebook(ttk.Frame):
     def _write_one(self, cmd):
         item = self._rows[cmd]
         row = item["row"]
+
+        if self._is_guarded_frequency(row):
+            return self._write_frequency_one(cmd)
+
         text = item["variable"].get().strip()
 
         raw = None
@@ -918,6 +1053,24 @@ class ConfigNotebook(ttk.Frame):
                     "starting with 0x."
                 )
             raw = int(text, 16)
+
+        target_raw = raw
+
+        if target_raw is None:
+            target_raw = self.device.encode_register_value(
+                self.page,
+                cmd,
+                value,
+                row.fmt,
+            )
+
+        if not self.device.can_read_register(
+            cmd, row.size
+        ):
+            raise ValueError(
+                "Individual write requires readable "
+                "register data for verification."
+            )
 
         if raw is not None:
             maximum = (
@@ -1039,54 +1192,68 @@ class ConfigNotebook(ttk.Frame):
                 "No automatic retry was performed."
             )
 
-        # Write feedback covers both the write and readback.
-        # Canonical OPERATION and ON_OFF_CONFIG writes require
-        # an exact match. Other registers retain existing behavior.
-        if self._can_read(row):
-            self._begin_feedback(cmd, "read_button")
+        # A completed write is not yet a verified write.
+        item["baseline"] = None
+        item["baseline_raw"] = None
 
-            try:
-                readback = self.device.read_register(
-                    self.page, cmd
-                )
-                self._show(cmd, readback)
+        self._begin_feedback(cmd, "read_button")
 
-            except TransportDisconnectedError:
-                raise
-
-            except Exception:
-                self._show(cmd, None)
-                self._finish_feedback(
-                    cmd, "read_button", False
-                )
-                raise
-
-            self._finish_feedback(
-                cmd,
-                "read_button",
-                readback is not None,
+        try:
+            readback = self.device.read_register(
+                self.page, cmd
             )
 
-            if readback is None:
-                raise OSError(
-                    "Write completed, but readback failed."
-                )
+        except TransportDisconnectedError:
+            raise
 
-            if (
-                row.name in {"OPERATION", "ON_OFF_CONFIG"}
-                and raw is not None
-                and readback != raw
-            ):
-                raise OSError(
-                    "Control readback mismatch: "
-                    f"requested 0x{raw:02X}, "
-                    f"received 0x{readback:02X}. "
-                    "The displayed value is the actual readback. "
-                    "No automatic retry was performed."
-                )
+        except Exception:
+            self._show(cmd, None)
+            self._finish_feedback(
+                cmd, "read_button", False
+            )
+            raise
+
+        self._show(cmd, readback)
 
         self._finish_feedback(
-            cmd, "write_button", True
+            cmd,
+            "read_button",
+            readback is not None,
+        )
+
+        if readback is None:
+            raise OSError(
+                "Write completed, but readback failed. "
+                "The device state is not confirmed. "
+                "No automatic retry was performed."
+            )
+
+        if readback != target_raw:
+            # Keep the successfully read actual baseline,
+            # but report that the write did not match.
+            width = 2 if row.size == "byte" else 4
+
+            prefix = (
+                "Control readback mismatch"
+                if row.name in {
+                    "OPERATION",
+                    "ON_OFF_CONFIG",
+                }
+                else "Register readback mismatch"
+            )
+
+            raise OSError(
+                f"{prefix}: "
+                f"requested 0x{target_raw:0{width}X}, "
+                f"received 0x{readback:0{width}X}. "
+                "The displayed value is the actual readback. "
+                "No automatic retry was performed."
+            )
+
+        self._finish_feedback(
+            cmd,
+            "write_button",
+            True,
         )
 
     def read_all(self):
@@ -1156,3 +1323,4 @@ class ConfigNotebook(ttk.Frame):
         self._stale = True
         self._cancel_all_feedback()
         super().destroy()
+

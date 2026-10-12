@@ -871,6 +871,9 @@ def render_mfr_common(tree, expanded, device, raw):
 def render_mfr_pads(tree, expanded, device, raw):
     name = "MFR_PADS"
 
+    if not _valid_raw(raw, 16):
+        return _error_row(tree, expanded, name)
+
     if is_ltm4677(device):
         rows = []
 
@@ -900,9 +903,6 @@ def render_mfr_pads(tree, expanded, device, raw):
             16,
             rows,
         )
-
-    if not _valid_raw(raw, 16):
-        return _error_row(tree, expanded, name)
 
     if is_ltm4678(device):
         rows = []
@@ -1120,3 +1120,49 @@ def set_global_status_indicator(widget, levels, device):
         widget.configure(
             text="GLOBAL STATUS / CHECK RAW",
         )
+
+def render_mfr_adc_telemetry_status(
+    tree, expanded, device, raw
+):
+    name = "MFR_ADC_TELEMETRY_STATUS"
+
+    if not _valid_raw(raw, 8):
+        return _error_row(tree, expanded, name)
+
+    if not is_ltm4677(device):
+        return render_bit_register(
+            tree, expanded, name, raw, 8
+        )
+
+    labels = {
+        3: "IOUT1",
+        2: "VOUT1",
+        1: "IOUT0",
+        0: "VOUT0",
+    }
+    rows = []
+
+    for bit in range(7, -1, -1):
+        value = (raw >> bit) & 1
+
+        if bit >= 4:
+            description = "Reserved; expected 0"
+            level = "warn" if value else "info"
+        else:
+            description = (
+                f"{labels[bit]} conversion update flag "
+                f"{'set' if value else 'clear'}"
+            )
+            level = "info"
+
+        rows.append((bit, description, level))
+
+    return _render_state_rows(
+        tree,
+        expanded,
+        name,
+        raw,
+        8,
+        rows,
+        state="STATE",
+    )

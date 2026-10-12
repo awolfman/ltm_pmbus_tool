@@ -6,11 +6,13 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 
 from core.dump_csv import (
     dump_to_csv_string,
     csv_string_to_dump,
     save_csv_atomic,
+    device_dump_to_csv_string,
 )
 from core.pmbus_device import (
     TransportDisconnectedError,
@@ -29,8 +31,8 @@ from gui.status_defs import (
     render_mfr_common,
     render_mfr_pads,
     set_global_status_indicator,
+    render_mfr_adc_telemetry_status,
 )
-
 
 class DeviceTab(ttk.Frame):
 
@@ -52,6 +54,10 @@ class DeviceTab(ttk.Frame):
         self._dump_data = {}
         self._dump_metadata = {}
 
+        self._full_dump_data = None
+        self._full_dump_metadata = None
+        self._full_restore_report = None
+
         self.global_telem_lbl = {}
         self.global_cfg_vars = {}
         self._global_wr_btns = {}
@@ -65,6 +71,208 @@ class DeviceTab(ttk.Frame):
         self._build_channels()
         self._build_buttons()
         self.do_read_all()
+
+    def _check_full_restore_impl(self):
+        """Run diagnostic preflight under the existing action guard."""
+        if not self._allow_device_action():
+            return
+
+        self._full_restore_report = None
+
+        try:
+            if self.device.name != "LTM4677":
+                raise ValueError(
+                    "Full Restore preflight currently supports "
+                    "LTM4677 only."
+                )
+
+            if (
+                self._full_dump_data is None
+                or self._full_dump_metadata is None
+            ):
+                raise ValueError(
+                    "Load or read a Full Dump first."
+                )
+
+            # Freeze the complete snapshot before any dialog.
+            # CSV readonly flags must not select a restore subset.
+            metadata = deepcopy(self._full_dump_metadata)
+            records = deepcopy(self._full_dump_data)
+
+            inspection = self.device.inspect_full_dump_restore(
+                metadata, records
+            )
+
+            candidate_count = len(inspection["candidates"])
+            excluded_count = len(inspection["excluded"])
+
+            confirmed = messagebox.askyesno(
+                "Check Full Restore",
+                f"{self.device.name} at "
+                f"0x{self.device.address:02X}\n\n"
+                f"Restore candidates: {candidate_count}\n"
+                f"Automatically excluded: {excluded_count}\n\n"
+                "Check current protection, transport settings "
+                "and candidate baselines?\n\n"
+                "This is a diagnostic check, not restoration.\n"
+                "Paged reads may write the service PAGE register.\n"
+                "No configuration writes or NVM commands.\n"
+                "Config input and dump snapshots are preserved.\n"
+                "Monitoring will be stopped and will remain stopped.",
+                parent=self,
+            )
+
+            # The confirmation dialog runs a nested Tk loop.
+            if not confirmed or not self._allow_device_action():
+                return
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Cannot prepare Full Restore check",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        self.stop_all()
+
+        try:
+            with self._button_activity(
+                self.write_dump_btn, "Checking..."
+            ):
+                try:
+                    report = (
+                        self.device.preflight_ltm4677_full_restore(
+                            metadata, records
+                        )
+                    )
+                    self._full_restore_report = report
+
+                    disconnect = report.get("disconnect")
+                    if disconnect is not None:
+                        # Mark stale before leaving the activity
+                        # context so controls cannot be re-enabled.
+                        self._handle_disconnect(
+                            type(disconnect)(
+                                self._full_restore_report_text(report)
+                            )
+                        )
+                        return
+
+                except TransportDisconnectedError as exc:
+                    self._handle_disconnect(exc)
+                    return
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Full Restore check failed",
+                f"{exc}\n\n"
+                "No configuration writes or NVM commands "
+                "were requested by this check.\n"
+                "Monitoring remains stopped.",
+                parent=self,
+            )
+            return
+
+        text = self._full_restore_report_text(report)
+
+        if report["ok"]:
+            messagebox.showinfo(
+                "Full Restore diagnostic check completed",
+                text,
+                parent=self,
+            )
+        else:
+            messagebox.showwarning(
+                "Full Restore diagnostic check stopped",
+                text,
+                parent=self,
+            )
+
+    @staticmethod
+    def _full_restore_report_text(report):
+        """Format a complete or partial report without device I/O."""
+        inspection = report.get("inspection") or {}
+        baseline_report = report.get("baseline_report") or {}
+        baselines = baseline_report.get("baselines", [])
+
+        candidates = inspection.get("candidates", [])
+        excluded = inspection.get("excluded", [])
+        matching = sum(
+            bool(item.get("matches_target"))
+            for item in baselines
+        )
+
+        lines = [
+            (
+                "Diagnostic preflight completed."
+                if report.get("ok")
+                else "Diagnostic preflight stopped."
+            ),
+            "",
+            f"Restore candidates: {len(candidates)}",
+            f"Automatically excluded: {len(excluded)}",
+            f"Baselines read: {len(baselines)}",
+            f"Read baselines matching targets: {matching}",
+            (
+                "Read baselines differing from targets: "
+                f"{len(baselines) - matching}"
+            ),
+            "",
+        ]
+
+        for field, title in (
+            ("protection_before", "Initial protection"),
+            ("transport_before", "Initial transport"),
+            ("baseline_report", "Baseline collection"),
+            ("transport_after", "Final transport"),
+            ("protection_after", "Final protection"),
+        ):
+            stage = report.get(field)
+            state = (
+                "not reached"
+                if stage is None
+                else "passed" if stage.get("ok") else "failed"
+            )
+            lines.append(f"{title}: {state}")
+
+        for field, title in (
+            ("protection_before", "Initial WRITE_PROTECT"),
+            ("transport_before", "Initial MFR_CONFIG_ALL"),
+            ("transport_after", "Final MFR_CONFIG_ALL"),
+            ("protection_after", "Final WRITE_PROTECT"),
+        ):
+            stage = report.get(field) or {}
+            raw = stage.get("current_raw")
+            if raw is not None:
+                lines.append(f"{title}: 0x{raw:02X}")
+
+        before = report.get("protection_before") or {}
+        if before.get("temporary_unlock_required"):
+            lines.extend((
+                "",
+                "Temporary unlock would be required.",
+                "No unlock was performed.",
+            ))
+
+        if report.get("reason"):
+            lines.extend(("", str(report["reason"])))
+
+        if report.get("error"):
+            lines.extend(("", str(report["error"])))
+
+        lines.extend((
+            "",
+            "Execution is not authorized.",
+            "No configuration writes or NVM commands.",
+            "Service PAGE writes may have occurred.",
+            "Config input and dump snapshots were not replaced.",
+            "Monitoring remains stopped.",
+            "This report is a historical observation, "
+            "not a guarantee of the current device state.",
+        ))
+
+        return "\n".join(lines)
 
     @contextmanager
     def _button_activity(self, button, text):
@@ -140,8 +348,6 @@ class DeviceTab(ttk.Frame):
         has_edits = False
 
         for editor in self._config_editors():
-            # Do not reload Config while an individual operation
-            # is waiting in a confirmation dialog.
             if editor._busy:
                 messagebox.showwarning(
                     "Config operation in progress",
@@ -150,13 +356,29 @@ class DeviceTab(ttk.Frame):
                 )
                 return False
 
+            # Frequency uses a dedicated write path and is excluded
+            # from get_pending_changes. Preserve its edit warning.
+            for item in editor._rows.values():
+                if not editor._is_guarded_frequency(item["row"]):
+                    continue
+
+                text = item["variable"].get().strip()
+                baseline = item["baseline"]
+
+                if baseline is not None:
+                    if text != baseline.strip():
+                        has_edits = True
+
+                elif text not in {
+                    "", "---", "ERR", "N/A", "N/S", "STALE",
+                }:
+                    has_edits = True
+
             try:
                 if editor.get_pending_changes():
                     has_edits = True
 
             except ValueError:
-                # Input exists without a usable baseline.
-                # Reloading would replace that input too.
                 has_edits = True
 
             except RuntimeError as exc:
@@ -1354,27 +1576,45 @@ class DeviceTab(ttk.Frame):
             padx=6,
         )
 
+        self.dump_mode_var = tk.StringVar(value="Page Dump")
+
+        self.dump_mode_combo = ttk.Combobox(
+            bf,
+            textvariable=self.dump_mode_var,
+            values=("Page Dump", "Full Dump"),
+            width=10,
+            state="readonly",
+        )
+        self.dump_mode_combo.pack(
+            side="left",
+            padx=2,
+        )
+        self.dump_mode_combo.bind(
+            "<<ComboboxSelected>>",
+            self._update_dump_mode,
+        )
+
         ttk.Label(
             bf,
-            text="Dump page:",
+            text="Page",
         ).pack(
             side="left",
             padx=(4, 1),
         )
 
         self.dump_page_var = tk.StringVar(value="0")
-        page_values = [
-            str(page)
-            for page in range(self.device.num_pages)
-        ]
 
-        ttk.Combobox(
+        self.dump_page_combo = ttk.Combobox(
             bf,
             textvariable=self.dump_page_var,
-            values=page_values,
+            values=[
+                str(page)
+                for page in range(self.device.num_pages)
+            ],
             width=3,
             state="readonly",
-        ).pack(
+        )
+        self.dump_page_combo.pack(
             side="left",
             padx=2,
         )
@@ -1436,6 +1676,28 @@ class DeviceTab(ttk.Frame):
                     fill="#4CAF50",
                 ),
             )
+
+    def _is_full_dump_mode(self):
+        variable = getattr(self, "dump_mode_var", None)
+        return (
+            variable is not None
+            and variable.get() == "Full Dump"
+        )
+
+    def _update_dump_mode(self, event=None):
+        if self._disconnected:
+            return
+
+        full_mode = self._is_full_dump_mode()
+
+        self.dump_page_combo.configure(
+            state="disabled" if full_mode else "readonly"
+        )
+
+        self.write_dump_btn.configure(
+            text="Check Restore" if full_mode else "Write Dump",
+            width=13 if full_mode else 11,
+        )
 
     def update_device_info(self):
         values = {
@@ -1761,6 +2023,17 @@ class DeviceTab(ttk.Frame):
         if not self.monitoring or self._disconnected:
             return
 
+        if (
+            self._action_busy
+            or self._config_operation_busy()
+            or self._other_tab_operation_busy()
+        ):
+            self._monitor_after_id = self.after(
+                500,
+                self._mon_loop,
+            )
+            return
+
         try:
             telemetry = self.device.read_global_telemetry()
 
@@ -1847,6 +2120,17 @@ class DeviceTab(ttk.Frame):
                     if info is not None and not info[3]:
                         global_status[name] = None
 
+                adc_name = "MFR_ADC_TELEMETRY_STATUS"
+                adc_cmd = self.device.command_code(adc_name)
+                adc_info = regmap.get(adc_cmd)
+
+                if (
+                    adc_info is not None
+                    and adc_info[1] == "byte"
+                    and not adc_info[3]
+                ):
+                    global_status[adc_name] = None
+
             self._update_global_status(global_status)
 
         except TransportDisconnectedError as exc:
@@ -1893,6 +2177,16 @@ class DeviceTab(ttk.Frame):
                 )
             )
 
+        if "MFR_ADC_TELEMETRY_STATUS" in status_data:
+            levels.append(
+                render_mfr_adc_telemetry_status(
+                    tree,
+                    expanded,
+                    self.device,
+                    status_data["MFR_ADC_TELEMETRY_STATUS"],
+                )
+            )
+
         set_global_status_indicator(
             self.global_status_ind,
             levels,
@@ -1918,6 +2212,9 @@ class DeviceTab(ttk.Frame):
             return 0
 
     def _do_dump_read_impl(self):
+        if self._is_full_dump_mode():
+            return self._read_full_dump_impl()
+
         # Reading synthetic registers is allowed in demo mode.
         if self._disconnected:
             return
@@ -1980,6 +2277,9 @@ class DeviceTab(ttk.Frame):
         return self._run_guarded_action(self._do_dump_save_impl)
 
     def _do_dump_save_impl(self):
+        if self._is_full_dump_mode():
+            return self._save_full_dump_impl()
+
         page = self._dump_page()
 
         if page not in self._dump_data:
@@ -2054,6 +2354,129 @@ class DeviceTab(ttk.Frame):
             parent=self,
         )
 
+    def _read_full_dump_impl(self):
+        if self._disconnected:
+            return False
+
+        self.stop_all()
+
+        try:
+            with self._button_activity(
+                self.read_dump_btn, "Reading..."
+            ):
+                records = self.device.read_device_dump()
+
+                snapshot = [
+                    dict(record)
+                    for record in records
+                ]
+
+                # Prepare the summary before publishing anything.
+                globals_count = sum(
+                    not record["is_paged"]
+                    for record in snapshot
+                )
+                channel_count = len(snapshot) - globals_count
+
+                # Capture and validate source metadata now.
+                text = device_dump_to_csv_string(
+                    self.device, snapshot
+                )
+                metadata, _ = csv_string_to_dump(text)
+                source_metadata = dict(metadata)
+
+                summary = (
+                    f"Pages: {self.device.num_pages}\n"
+                    f"Global registers: {globals_count}\n"
+                    f"Channel registers: {channel_count}\n"
+                    f"Total registers: {len(snapshot)}\n\n"
+                    "Monitoring remains stopped."
+                )
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(exc)
+            return False
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Full Dump read failed",
+                f"{exc}\n\n"
+                "The previous full snapshot remains unchanged.\n"
+                "Monitoring remains stopped.",
+                parent=self,
+            )
+            return False
+
+        # No event-loop calls between the two assignments.
+        self._full_dump_data = snapshot
+        self._full_dump_metadata = source_metadata
+
+        messagebox.showinfo(
+            "Full Dump read completed",
+            summary,
+            parent=self,
+        )
+        return True
+
+    def _save_full_dump_impl(self):
+        if self._full_dump_data is None:
+            confirmed = messagebox.askyesno(
+                "Save Full Dump",
+                "Read a full device dump first?",
+                parent=self,
+            )
+            if not confirmed or self._disconnected:
+                return
+
+            if not self._read_full_dump_impl():
+                return
+
+        try:
+            csv_text = device_dump_to_csv_string(
+                self.device,
+                self._full_dump_data,
+                metadata=dict(self._full_dump_metadata),
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Full CSV export failed",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        filename = (
+            f"{self.device.name}_0x{self.device.address:02X}"
+            f"_full_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        )
+
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile=filename,
+        )
+
+        if not path or self._disconnected:
+            return
+
+        try:
+            save_csv_atomic(path, csv_text)
+        except Exception as exc:
+            messagebox.showerror(
+                "Full CSV save failed",
+                str(exc),
+                parent=self,
+            )
+            return
+
+        messagebox.showinfo(
+            "CSV saved",
+            f"Saved: {path}",
+            parent=self,
+        )
+
     def do_dump_load(self):
         return self._run_guarded_action(self._do_dump_load_impl)
 
@@ -2074,6 +2497,16 @@ class DeviceTab(ttk.Frame):
                 text = stream.read()
 
             meta, records = csv_string_to_dump(text)
+
+            if meta.get("dump_scope") == "full":
+                self._accept_full_dump(meta, records)
+                return
+
+            if self._is_full_dump_mode():
+                raise ValueError(
+                    "This CSV is a Page Dump.\n"
+                    "Select Page Dump mode before loading it."
+                )
 
             if not records:
                 messagebox.showerror(
@@ -2114,16 +2547,68 @@ class DeviceTab(ttk.Frame):
             parent=self,
         )
 
+    def _accept_full_dump(self, metadata, records):
+        if not records:
+            raise ValueError("Full CSV contains no records")
+
+        snapshot = [dict(record) for record in records]
+        source_metadata = dict(metadata)
+
+        pages = sorted({
+            record["page"]
+            for record in snapshot
+            if record["is_paged"]
+        })
+        writable = sum(
+            not record["readonly"]
+            and record["raw"] is not None
+            for record in snapshot
+        )
+
+        summary = (
+            f"Source model: {source_metadata.get('device')}\n"
+            f"Pages: {', '.join(map(str, pages))}\n"
+            f"Total records: {len(snapshot)}\n"
+            f"Marked writable in CSV: {writable}\n\n"
+            "Compatibility with the connected device will be "
+            "checked before writing.\n"
+            "Page Dump snapshots have not been changed."
+        )
+
+        self._full_dump_data = snapshot
+        self._full_dump_metadata = source_metadata
+        self.dump_mode_var.set("Full Dump")
+        self._update_dump_mode()
+
+        messagebox.showinfo(
+            "Full Dump loaded",
+            summary,
+            parent=self,
+        )
+
     def _do_dump_write_impl(self):
         if not self._allow_device_action():
             return
 
+        if self._is_full_dump_mode():
+            return self._check_full_restore_impl()
+
+        full_mode = False
         page = self._dump_page()
 
-        if page not in self._dump_data:
+        if full_mode:
+            snapshot = self._full_dump_data
+            source_metadata = self._full_dump_metadata
+            scope_text = "Full Dump"
+        else:
+            snapshot = self._dump_data.get(page)
+            source_metadata = self._dump_metadata.get(page)
+            scope_text = f"Page Dump / page {page}"
+
+        if snapshot is None:
             messagebox.showwarning(
                 "Write Dump",
-                "Load or read a dump first.",
+                "Load or read a dump in the selected mode first.",
                 parent=self,
             )
             return
@@ -2132,7 +2617,7 @@ class DeviceTab(ttk.Frame):
         try:
             records = [
                 dict(record)
-                for record in self._dump_data[page]
+                for record in snapshot
                 if (
                     not record.get("readonly", True)
                     and record.get("raw") is not None
@@ -2152,11 +2637,63 @@ class DeviceTab(ttk.Frame):
                 default_page=page,
             )
 
-            if page in self._dump_metadata:
+            if full_mode and source_metadata is None:
+                raise ValueError(
+                    "Full Dump source metadata is missing"
+                )
+
+            if source_metadata is not None:
                 self.device.validate_dump_metadata(
-                    self._dump_metadata[page],
+                    source_metadata,
                     records,
                 )
+
+            if not full_mode:
+                wrong_pages = {
+                    record["page"]
+                    for record in records
+                    if record["is_paged"]
+                    and record["page"] != page
+                }
+                if wrong_pages:
+                    raise ValueError(
+                        "Page Dump contains channel records "
+                        "for a different page. Select the matching "
+                        "page and load the CSV again."
+                    )
+
+            global_count = sum(
+                not record["is_paged"]
+                for record in records
+            )
+            target_pages = sorted({
+                record["page"]
+                for record in records
+                if record["is_paged"]
+            })
+
+            # A generic dump is not a board-specific startup plan.
+            # Require manual handling instead of silently omitting
+            # controls or writing them in command-code order.
+            if full_mode:
+                manual_controls = [
+                    record["name"]
+                    for record in records
+                    if record["name"] in {
+                        "OPERATION",
+                        "ON_OFF_CONFIG",
+                        "WRITE_PROTECT",
+                    }
+                ]
+                if manual_controls:
+                    raise ValueError(
+                        "Full Dump contains controls requiring "
+                        "an explicit write selection:\n"
+                        + "\n".join(sorted(set(manual_controls)))
+                        + "\n\nFull Dump writing is blocked until "
+                        "the write-selection preview is implemented. "
+                        "No subset was applied."
+                    )
 
         except Exception as exc:
             messagebox.showerror(
@@ -2170,6 +2707,9 @@ class DeviceTab(ttk.Frame):
 
         confirmed = messagebox.askyesno(
             "Write Dump",
+            f"{scope_text}\n"
+            f"Channel pages: {target_pages}\n"
+            f"Global records: {global_count}\n"
             f"Attempt to write {len(records)} dump records?\n\n"
             "Selected records passed offline profile validation.\n"
             "Current values will be read before the first write.\n"
