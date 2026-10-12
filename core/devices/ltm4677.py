@@ -89,6 +89,7 @@ SPECIAL_PROTOCOL_COMMANDS = {
 SPECIAL_ACCESS_EXTRA = set()
 
 NO_GENERIC_WRITE_EXTRA = WRITE_ONE_TO_CLEAR | {
+    0x33,  # FREQUENCY_SWITCH requires verified OFF state.
     0xE6, 0xFA,
 }
 
@@ -121,6 +122,16 @@ WRITE_VALUE_RULES = {
         "invalid_error": (
             "Unsupported OPERATION value for this device."
         ),
+        "restore_context": {
+            "command_name": "ON_OFF_CONFIG",
+            "mask": 0x08,
+            "allowed_when_set": frozenset({
+                0x00, 0x40, 0x80, 0x98, 0xA8,
+            }),
+            "allowed_when_clear": frozenset({
+                0x80, 0x98, 0xA8,
+            }),
+        },
     },
     0x02: {
         "allowed": frozenset({
@@ -145,5 +156,16 @@ CONTROL_OPTIONS = {
         (0x1F, "CMD+RUN / Immediate off"),
         (0x16, "RUN only / TOFF sequence"),
         (0x17, "RUN only / Immediate off"),
+    ),
+    "FREQUENCY_SWITCH": (
+        (0x0000, "External Oscillator"),
+        (0xF3E8, "250 kHz typ"),
+        (0xFABC, "350 kHz typ"),
+        (0xFB52, "425 kHz typ"),
+        (0xFBE8, "500 kHz typ"),
+        (0x023F, "575 kHz typ"),
+        (0x028A, "650 kHz typ"),
+        (0x02EE, "750 kHz typ"),
+        (0x03E8, "1000 kHz typ"),
     ),
 }

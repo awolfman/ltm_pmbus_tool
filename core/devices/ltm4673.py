@@ -180,6 +180,12 @@ WRITE_VALUE_RULES = {
             _OPERATION_WITH_PMBUS
             ^ _OPERATION_WITHOUT_PMBUS
         ),
+        "restore_context": {
+            "command_name": "ON_OFF_CONFIG",
+            "mask": 0x08,
+            "allowed_when_set": _OPERATION_WITH_PMBUS,
+            "allowed_when_clear": _OPERATION_WITHOUT_PMBUS,
+        },
         "context_error": (
             "This OPERATION encoding requires checking the "
             "current ON_OFF_CONFIG. Context-dependent raw "
