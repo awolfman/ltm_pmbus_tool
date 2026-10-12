@@ -390,10 +390,12 @@ class PMBusDevice:
                         isinstance(raw, bool)
                         or not isinstance(raw, int)
                         or not 0 <= raw <= 0xFFFF
+                        or raw == 0xFFFF
                     ):
                         report["reason"] = "output_state_unknown"
                         raise OSError(
-                            f"PAGE {page}: invalid STATUS_WORD response"
+                            f"PAGE {page}: invalid or ambiguous "
+                            f"STATUS_WORD response: {raw!r}"
                         )
 
                     off = bool(raw & 0x0040)
@@ -710,6 +712,296 @@ class PMBusDevice:
                 report["error"] = f"{active}\n{exc}"
 
             return report
+
+    def plan_ltm4677_full_restore(self, metadata, records):
+        """Build an offline restore grouping, never a write sequence.
+
+        Every candidate is preserved exactly once in groups.
+        Group order and record order are for display only.
+        Unknown restore policies remain unresolved.
+        """
+        with self._lock:
+            if not self._identified:
+                raise RuntimeError("Device is not identified")
+
+            if getattr(self, "is_demo", False):
+                raise ValueError("Demo writes are disabled")
+
+            if self.name != "LTM4677" or self.num_pages != 2:
+                raise ValueError(
+                    "Restore grouping supports two-page LTM4677 only"
+                )
+
+            source_metadata = deepcopy(metadata)
+            source_records = deepcopy(list(records))
+            inspection = self.inspect_full_dump_restore(
+                source_metadata, source_records
+            )
+
+            def record_order(item):
+                page = item["page"]
+                return (
+                    -1 if page is None else page,
+                    item["cmd"],
+                )
+
+            groups = {
+                "frequency": [],
+                "transport": [],
+                "addresses": [],
+                "controls": [],
+                "final_protection": [],
+                "user_data": [],
+                "unresolved": [],
+            }
+
+            # Explicit identities prevent a changed profile descriptor
+            # from silently receiving an old restore policy.
+            policies = {
+                "FREQUENCY_SWITCH": (
+                    0x33, "word", False, "frequency"
+                ),
+                "MFR_CONFIG_ALL": (
+                    0xD1, "byte", False, "transport"
+                ),
+                "MFR_ADDRESS": (
+                    0xE6, "byte", False, "addresses"
+                ),
+                "MFR_RAIL_ADDRESS": (
+                    0xFA, "byte", True, "addresses"
+                ),
+                "OPERATION": (
+                    0x01, "byte", True, "controls"
+                ),
+                "ON_OFF_CONFIG": (
+                    0x02, "byte", True, "controls"
+                ),
+                "WRITE_PROTECT": (
+                    0x10, "byte", False, "final_protection"
+                ),
+                "USER_DATA_00": (
+                    0xB0, "word", False, "user_data"
+                ),
+                "USER_DATA_01": (
+                    0xB1, "word", True, "user_data"
+                ),
+                "USER_DATA_02": (
+                    0xB2, "word", False, "user_data"
+                ),
+                "USER_DATA_03": (
+                    0xB3, "word", True, "user_data"
+                ),
+                "USER_DATA_04": (
+                    0xB4, "word", False, "user_data"
+                ),
+            }
+
+            for record in sorted(
+                inspection["candidates"], key=record_order
+            ):
+                policy = policies.get(record["name"])
+                group = "unresolved"
+
+                if policy is not None:
+                    cmd, size, paged, group = policy
+                    if (
+                        record["cmd"] != cmd
+                        or record["size"] != size
+                        or record["is_paged"] != paged
+                    ):
+                        raise ValueError(
+                            f"{record['name']}: unexpected "
+                            "restore policy descriptor"
+                        )
+
+                groups[group].append(deepcopy(record))
+
+            def require_targets(group, expected):
+                actual = {
+                    (item["page"], item["name"])
+                    for item in groups[group]
+                }
+                if actual != expected:
+                    raise ValueError(
+                        f"Incomplete restore group: {group}"
+                    )
+
+            require_targets(
+                "frequency", {(None, "FREQUENCY_SWITCH")}
+            )
+            require_targets(
+                "transport", {(None, "MFR_CONFIG_ALL")}
+            )
+            require_targets(
+                "addresses",
+                {
+                    (None, "MFR_ADDRESS"),
+                    (0, "MFR_RAIL_ADDRESS"),
+                    (1, "MFR_RAIL_ADDRESS"),
+                },
+            )
+            require_targets(
+                "controls",
+                {
+                    (page, name)
+                    for page in range(2)
+                    for name in ("OPERATION", "ON_OFF_CONFIG")
+                },
+            )
+            require_targets(
+                "user_data",
+                {
+                    (None, "USER_DATA_00"),
+                    (0, "USER_DATA_01"),
+                    (1, "USER_DATA_01"),
+                    (None, "USER_DATA_02"),
+                    (0, "USER_DATA_03"),
+                    (1, "USER_DATA_03"),
+                    (None, "USER_DATA_04"),
+                },
+            )
+            require_targets(
+                "final_protection", {(None, "WRITE_PROTECT")}
+            )
+
+            controls = {
+                (item["page"], item["name"]): item["raw"]
+                for item in groups["controls"]
+            }
+            control_pairs = []
+
+            for page in range(2):
+                config = controls[(page, "ON_OFF_CONFIG")]
+                operation = controls[(page, "OPERATION")]
+                validated = self.validate_ltm4677_operation_target(
+                    config, operation
+                )
+                control_pairs.append({
+                    "page": page,
+                    **validated,
+                    "write_order": None,
+                })
+
+            blockers = [
+                "restore_executor_not_implemented",
+                "live_baselines_and_guards_required",
+                "address_transition_unresolved",
+                "control_transition_unresolved",
+                "transport_transition_unresolved",
+                "protection_transition_unresolved",
+                "user_data_restore_policy_unresolved",
+            ]
+
+            transport_raw = groups["transport"][0]["raw"]
+            target_pec_required = bool(transport_raw & 0x04)
+            if target_pec_required:
+                blockers.append("pec_required_but_unsupported")
+
+            # Match the currently supported dedicated executor.
+            supported_frequency = {
+                0x0000, 0xF3E8, 0xFABC, 0xFB52, 0xFBE8,
+                0x023F, 0x028A, 0x02EE, 0x03E8,
+            }
+            if (
+                groups["frequency"][0]["raw"]
+                not in supported_frequency
+            ):
+                blockers.append("frequency_target_unsupported")
+
+            if groups["final_protection"][0]["raw"] not in {
+                0x00, 0x20, 0x40, 0x80,
+            }:
+                blockers.append("protection_target_unsupported")
+
+            if groups["unresolved"]:
+                blockers.append("register_restore_policy_unresolved")
+
+            user_data_usage = {
+                "USER_DATA_00": "oem_reserved",
+                "USER_DATA_01": "manufacturer_reserved_ltpowerplay",
+                "USER_DATA_02": "oem_reserved",
+                "USER_DATA_03": "user_available",
+                "USER_DATA_04": "user_available",
+            }
+
+            user_data_policy = {
+                "execution_ready": False,
+                "representation": {
+                    "data_bytes": 2,
+                    "format": "RAW",
+                    "minimum_raw": 0x0000,
+                    "maximum_raw": 0xFFFF,
+                    "all_bit_patterns_allowed": True,
+                    "preserve_exact_raw": True,
+                },
+                "nvm": {
+                    "listed_as_nvm": True,
+                    "persistence_mechanism": "store_user_all",
+                    "register_write_destination": "operating_memory",
+                    "readback_verifies": "operating_memory",
+                    "store_scope": "all_user_nvm_backed_operating_memory",
+                    "automatic_store": False,
+                },
+                "requirements": [
+                    "baseline_before_write",
+                    "baseline_recheck_before_write",
+                    "readback_after_write",
+                    "reserved_data_overwrite_confirmation",
+                ],
+                "blockers": [
+                    "user_data_executor_not_implemented",
+                    "reserved_data_confirmation_not_implemented",
+                ],
+                "targets": [],
+            }
+
+            for item in groups["user_data"]:
+                usage = user_data_usage[item["name"]]
+                reserved = usage != "user_available"
+
+                user_data_policy["targets"].append({
+                    "page": item["page"],
+                    "cmd": item["cmd"],
+                    "name": item["name"],
+                    "usage": usage,
+                    "reserved": reserved,
+                    "requires_reserved_data_confirmation": reserved,
+                    "warning": (
+                        "Restoring this reserved field may overwrite "
+                        "product serialization or manufacturing data "
+                        "and affect inventory control or LTpowerPlay "
+                        "compatibility."
+                        if reserved else None
+                    ),
+                })
+
+            return {
+                "execution_ready": False,
+                "user_data_policy": user_data_policy,
+                "write_sequence": None,
+                "total": inspection["total"],
+                "candidate_count": len(inspection["candidates"]),
+                "groups": groups,
+                "excluded": deepcopy(sorted(
+                    inspection["excluded"], key=record_order
+                )),
+                "control_pairs": control_pairs,
+                "target_pec_required": target_pec_required,
+                "blockers": blockers,
+                "constraints": {
+                    "outputs_off_before_configuration": True,
+                    "repeat_guards_before_each_write": True,
+                    "readback_required": True,
+                    "controls_after_configuration": True,
+                    "protection_after_controls": True,
+                    "control_transition_may_enable_outputs": True,
+                    "address_stage_position": None,
+                    "automatic_output_control": False,
+                    "automatic_unlock": False,
+                    "rollback": False,
+                    "store_nvm": False,
+                },
+            }
 
     def preflight_ltm4677_full_restore(self, metadata, records):
         """Inspect targets, protection, transport and baselines.
@@ -2515,7 +2807,18 @@ class PMBusDevice:
             )
             return False
 
-        mask = 0x40 if self.name == "LTM4673" else 0x60
+        if self.name == "LTM4673":
+            mask = 0x40
+        elif self.name == "LTM4677":
+            # Datasheet Rev. B, pages 63 and 115:
+            # not busy, calculations not pending,
+            # output not in transition.
+            # The 0x68 example on page 63 disagrees with
+            # the documented bit assignments.
+            mask = 0x70
+        else:
+            mask = 0x60
+
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
