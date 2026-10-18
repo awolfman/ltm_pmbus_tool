@@ -7,6 +7,26 @@ register_device(0x4100, "LTM4678", 2, __name__)
 
 VOUT_EXPONENT = -12
 
+# Address register identities only, not a transition policy.
+ADDRESS_REGISTERS = (
+    (
+        0xE6,
+        "MFR_ADDRESS",
+        "byte",
+        "BYTE",
+        False,
+        "individual",
+    ),
+    (
+        0xFA,
+        "MFR_RAIL_ADDRESS",
+        "byte",
+        "BYTE",
+        True,
+        "rail",
+    ),
+)
+
 # Commands present in the common PMBus map but absent from LTM4678.
 REMOVE_COMMANDS = {
     0x57,  # VIN_OV_WARN_LIMIT
