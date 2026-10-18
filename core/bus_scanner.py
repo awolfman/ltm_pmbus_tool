@@ -20,16 +20,92 @@ from .pmbus_device import (
     TransportSessionFailedError,
 )
 
-
 GLOBAL_ADDRESSES = {0x5A, 0x5B, 0x7C}
+# Protocol address, not an individual PMBus device address.
+# Alert Response requires its own transaction workflow.
+SMBUS_ALERT_RESPONSE_ADDRESS = 0x0C
 
-# Explicit configuration for the currently connected board.
-# Remove or update this mapping when changing the board or adapter.
-# Do not infer these exclusions from Special ID.
+
+# Board-specific configuration, not model defaults.
+# Recheck this mapping after changing the board or adapter indices.
 CONFIRMED_RAIL_ADDRESSES_BY_BUS = {
+    100: frozenset({0x30}),
+    200: frozenset({0x30}),
     300: frozenset({0x30}),
 }
 
+def confirmed_rail_addresses(bus_num):
+    """Return validated board-specific exclusions without device I/O."""
+    if (
+        isinstance(bus_num, bool)
+        or not isinstance(bus_num, int)
+        or bus_num < 0
+    ):
+        raise ValueError("Invalid bus number")
+
+    configured = CONFIRMED_RAIL_ADDRESSES_BY_BUS.get(
+        bus_num, frozenset()
+    )
+
+    try:
+        addresses = tuple(configured)
+    except TypeError as exc:
+        raise ValueError(
+            "Configured rail addresses must be an iterable"
+        ) from exc
+
+    for address in addresses:
+        if (
+            isinstance(address, bool)
+            or not isinstance(address, int)
+            or not 0x08 <= address <= 0x77
+        ):
+            raise ValueError(
+                f"Invalid configured rail address: {address!r}"
+            )
+
+    return frozenset(addresses)
+
+
+def validate_individual_device_address(bus_num, address):
+    """Reject known group addresses before identification or reads.
+
+    Passing this check does not prove that an unknown address
+    belongs to an individual device.
+    """
+    if (
+        isinstance(address, bool)
+        or not isinstance(address, int)
+        or not 0x08 <= address <= 0x77
+    ):
+        raise ValueError(
+            "Expected a 7-bit device address in 0x08..0x77"
+        )
+
+    rails = confirmed_rail_addresses(bus_num)
+
+    if address == SMBUS_ALERT_RESPONSE_ADDRESS:
+        raise ValueError(
+            f"Address 0x{address:02X} is the SMBus Alert Response "
+            "address, not an individual device address. "
+            "Individual device identification is blocked."
+        )
+
+    if address in GLOBAL_ADDRESSES:
+        raise ValueError(
+            f"Address 0x{address:02X} is a configured global address. "
+            "Individual device identification is blocked."
+        )
+
+    if address in rails:
+        raise ValueError(
+            f"Address 0x{address:02X} is a confirmed rail address "
+            f"on bus {bus_num}. "
+            "Identification and reads through this address are blocked. "
+            "Use the individual device address."
+        )
+
+    return address
 
 class SimDevice:
     """Фиктивное устройство для демо-режима с динамической телеметрией."""
@@ -471,6 +547,15 @@ def scan_bus(bus_num, *, cml_diagnostic=False):
     diagnostic_address = 0x4F
     status_cml_command = 0x7E
 
+    # Validate the complete exclusion set before opening transport.
+    rail_addresses = confirmed_rail_addresses(bus_num)
+
+    # Diagnostic reads must obey the same address restrictions.
+    if cml_diagnostic:
+        validate_individual_device_address(
+            bus_num, diagnostic_address
+        )
+
     print(f"[scan_bus] scanning {bus_label(bus_num)} ...")
     print(
         f"[scan_bus] implementation: "
@@ -558,18 +643,14 @@ def scan_bus(bus_num, *, cml_diagnostic=False):
         f"{PMBusDevice.__module__}"
     )
 
-    confirmed_rail_addresses = (
-        CONFIRMED_RAIL_ADDRESSES_BY_BUS.get(
-            bus_num,
-            frozenset(),
-        )
-    )
-
     for address in range(0x08, 0x78):
+        if address == SMBUS_ALERT_RESPONSE_ADDRESS:
+            continue
+
         if address in GLOBAL_ADDRESSES:
             continue
 
-        if address in confirmed_rail_addresses:
+        if address in rail_addresses:
             print(
                 f"[scan_bus] skip configured rail address "
                 f"0x{address:02X} on bus {bus_num}"

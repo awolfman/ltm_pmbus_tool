@@ -208,6 +208,84 @@ def build_register_map(special_id=None):
 
     return regmap, read_only, global_cmds, name, pages
 
+def _validated_address_registers(declarations, regmap):
+    """Validate address identities without interpreting register RAW.
+
+    None means that the profile supplies no address description.
+    The returned tuples contain immutable scalar fields only.
+    This does not establish address safety or authorize transitions.
+    """
+    if declarations is None:
+        return None
+
+    if not isinstance(declarations, tuple):
+        raise ValueError(
+            "Address register declarations must be a tuple"
+        )
+
+    supported_roles = {
+        "individual",
+        "individual_base",
+        "rail",
+    }
+    seen = set()
+    result = []
+
+    for entry in declarations:
+        if not isinstance(entry, tuple) or len(entry) != 6:
+            raise ValueError(
+                "Invalid address register declaration"
+            )
+
+        cmd, name, size, fmt, paged, role = entry
+
+        if (
+            isinstance(cmd, bool)
+            or not isinstance(cmd, int)
+            or not 0 <= cmd <= 0xFF
+        ):
+            raise ValueError(
+                "Invalid address register command"
+            )
+
+        if cmd in seen:
+            raise ValueError(
+                f"Duplicate address register command 0x{cmd:02X}"
+            )
+        seen.add(cmd)
+
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(size, str)
+            or size not in {"byte", "word"}
+            or not isinstance(fmt, str)
+            or not fmt
+            or not isinstance(paged, bool)
+        ):
+            raise ValueError(
+                f"Invalid address register descriptor 0x{cmd:02X}"
+            )
+
+        if (
+            not isinstance(role, str)
+            or role not in supported_roles
+        ):
+            raise ValueError(
+                f"Unsupported address register role for 0x{cmd:02X}"
+            )
+
+        descriptor = (name, size, fmt, paged)
+        if regmap.get(cmd) != descriptor:
+            raise ValueError(
+                f"Address register descriptor mismatch for 0x{cmd:02X}"
+            )
+
+        result.append(
+            (cmd, name, size, fmt, paged, role)
+        )
+
+    return tuple(result)
 
 def build_device_metadata(special_id=None):
     """Build operation metadata for a recognized device profile."""
@@ -243,6 +321,7 @@ def build_device_metadata(special_id=None):
     metadata = {
         "name": name,
         "pages": pages,
+        "address_registers": None,
         "send_commands": send_commands,
         "special_protocols": special_protocols,
         "special_access": special_access,
@@ -281,6 +360,13 @@ def build_device_metadata(special_id=None):
     if name is not None:
         regmap, _, _, _, _ = build_register_map(special_id)
 
+        metadata["address_registers"] = (
+            _validated_address_registers(
+                extras.get("address_registers"),
+                regmap,
+            )
+        )
+
         overlap = regmap.keys() & send_commands.keys()
         if overlap:
             codes = ', '.join(
@@ -302,6 +388,208 @@ def build_device_metadata(special_id=None):
 
     return metadata
 
+def compare_address_register_raw(metadata, target_records, baseline_records):
+    """Compare declared address RAW values without device I/O.
+
+    metadata must come from build_device_metadata.
+    This checks equality and completeness, not address semantics,
+    effective addresses, bus safety or transition feasibility.
+    """
+    report = {
+        "status": "unresolved",
+        "comparison_complete": False,
+        "address_registers_unchanged": None,
+        "entries": [],
+        "errors": [],
+        "execution_ready": False,
+        "write_sequence": None,
+    }
+
+    def reject(message):
+        report["errors"].append(message)
+        return report
+
+    if not isinstance(metadata, dict):
+        return reject("Invalid device metadata")
+
+    declarations = metadata.get("address_registers")
+    if declarations is None:
+        return reject("address_policy_unavailable")
+
+    # An empty description does not establish address independence.
+    if not isinstance(declarations, tuple) or not declarations:
+        return reject("address_register_description_empty_or_invalid")
+
+    pages = metadata.get("pages")
+    if (
+        isinstance(pages, bool)
+        or not isinstance(pages, int)
+        or pages < 1
+    ):
+        return reject("Invalid profile page count")
+
+    expected = {}
+    commands = set()
+    names = set()
+
+    for declaration in declarations:
+        if (
+            not isinstance(declaration, tuple)
+            or len(declaration) != 6
+        ):
+            return reject("Invalid address register declaration")
+
+        cmd, name, size, fmt, paged, role = declaration
+
+        if (
+            isinstance(cmd, bool)
+            or not isinstance(cmd, int)
+            or not 0 <= cmd <= 0xFF
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(size, str)
+            or size not in {"byte", "word"}
+            or not isinstance(fmt, str)
+            or not fmt
+            or not isinstance(paged, bool)
+            or not isinstance(role, str)
+            or role not in {"individual", "individual_base", "rail"}
+        ):
+            return reject("Invalid address register declaration")
+
+        if cmd in commands or name in names:
+            return reject("Duplicate address register declaration")
+
+        commands.add(cmd)
+        names.add(name)
+
+        for page in range(pages) if paged else (None,):
+            expected[(page, cmd)] = declaration
+
+    def collect(records, raw_field, source):
+        if not isinstance(records, (list, tuple)):
+            raise ValueError(f"{source}: expected a list or tuple")
+
+        collected = {}
+
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError(f"{source}: invalid record")
+
+            cmd = record.get("cmd")
+            name = record.get("name")
+
+            valid_cmd = (
+                isinstance(cmd, int)
+                and not isinstance(cmd, bool)
+                and 0 <= cmd <= 0xFF
+            )
+            if not valid_cmd:
+                raise ValueError(f"{source}: invalid command code")
+
+            is_address_name = (
+                isinstance(name, str) and name in names
+            )
+            if cmd not in commands and not is_address_name:
+                continue
+
+            if "page" not in record:
+                raise ValueError(f"{source}: missing address page")
+
+            page = record["page"]
+            if page is not None and (
+                isinstance(page, bool)
+                or not isinstance(page, int)
+                or not 0 <= page < pages
+            ):
+                raise ValueError(f"{source}: invalid address page")
+
+            identity = (page, cmd)
+            declaration = expected.get(identity)
+            if declaration is None:
+                raise ValueError(
+                    f"{source}: unexpected address identity {identity!r}"
+                )
+
+            _, expected_name, size, fmt, paged, _ = declaration
+            if name != expected_name or record.get("size") != size:
+                raise ValueError(
+                    f"{source}: address descriptor mismatch {identity!r}"
+                )
+
+            if "format" in record and record["format"] != fmt:
+                raise ValueError(
+                    f"{source}: address format mismatch {identity!r}"
+                )
+
+            if "is_paged" in record and record["is_paged"] is not paged:
+                raise ValueError(
+                    f"{source}: address scope mismatch {identity!r}"
+                )
+
+            if identity in collected:
+                raise ValueError(
+                    f"{source}: duplicate address record {identity!r}"
+                )
+
+            raw = record.get(raw_field)
+            maximum = 0xFF if size == "byte" else 0xFFFF
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not 0 <= raw <= maximum
+            ):
+                raise ValueError(
+                    f"{source}: invalid {raw_field} for {identity!r}"
+                )
+
+            collected[identity] = raw
+
+        missing = [
+            identity
+            for identity in expected
+            if identity not in collected
+        ]
+        if missing:
+            raise ValueError(
+                f"{source}: missing address records {missing!r}"
+            )
+
+        return collected
+
+    try:
+        target = collect(target_records, "raw", "target")
+        baseline = collect(
+            baseline_records, "current_raw", "baseline"
+        )
+    except ValueError as exc:
+        return reject(str(exc))
+
+    for identity, declaration in expected.items():
+        page, cmd = identity
+        _, name, size, _, _, role = declaration
+        current_raw = baseline[identity]
+        target_raw = target[identity]
+
+        report["entries"].append({
+            "page": page,
+            "cmd": cmd,
+            "name": name,
+            "size": size,
+            "role": role,
+            "current_raw": current_raw,
+            "target_raw": target_raw,
+            "matches_target": current_raw == target_raw,
+        })
+
+    unchanged = all(
+        entry["matches_target"]
+        for entry in report["entries"]
+    )
+    report["comparison_complete"] = True
+    report["address_registers_unchanged"] = unchanged
+    report["status"] = "unchanged" if unchanged else "changed"
+    return report
 
 # Backward compatibility for modules that still import these names.
 # PMBusDevice must not use this LTM4673 map as its initial map.

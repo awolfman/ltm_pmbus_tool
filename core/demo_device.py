@@ -1,8 +1,11 @@
-"""Read-only GUI demo using actual device register profiles.
+"""GUI demo using actual device register profiles.
 
 No USB or system I2C access is permitted.
-Values are synthetic and are not hardware configuration defaults.
+All-channel output control is simulated in memory.
+Other configuration writes and NVM actions remain disabled.
+Values are synthetic, not hardware configuration defaults.
 """
+
 import random
 import time
 
@@ -16,9 +19,10 @@ from core.pmbus_formats import encode_value
 
 
 class DemoDevice(PMBusDevice):
-    """Profile-aware, read-only device with in-memory register values."""
+    """Profile-aware demo with limited in-memory output control."""
 
     is_demo = True
+    demo_output_control_enabled = True
 
     def __init__(self, address, special_id):
         super().__init__(
@@ -85,7 +89,13 @@ class DemoDevice(PMBusDevice):
                 elif fmt == "L11":
                     raw = encode_value(value, fmt)
 
-            if cmd == Cmd.MFR_SPECIAL_ID:
+            if cmd == Cmd.OPERATION:
+                raw = 0x80
+            elif cmd == Cmd.ON_OFF_CONFIG:
+                raw = 0x1F
+            elif name == "LTM4673" and reg_name == "MFR_PAGE_FF_MASK":
+                raw = 0x0F
+            elif cmd == Cmd.MFR_SPECIAL_ID:
                 raw = special_id
             elif cmd == Cmd.CAPABILITY:
                 raw = 0xB0
@@ -107,6 +117,13 @@ class DemoDevice(PMBusDevice):
             raise RuntimeError(
                 self.last_error or "Demo identification failed"
             )
+
+        if self.name == "LTM4677":
+            for page in range(self.num_pages):
+                self._demo_apply_operation(
+                    page,
+                    self._demo_values[(page, Cmd.OPERATION)],
+                )
 
     def _demo_walk(self, key, nominal, span, step):
         """Bounded random walk around a synthetic nominal value."""
@@ -218,6 +235,15 @@ class DemoDevice(PMBusDevice):
                 step=0.8,
             )
 
+            operation = self._demo_values.get(
+                (page, Cmd.OPERATION), 0x80
+            )
+            output_off = (operation & 0xC0) in {0x00, 0x40}
+
+            if output_off:
+                vout = 0.0
+                iout = 0.0
+
             # Synthetic buck-like duty estimate, not a hardware model.
             duty = 100.0 * vout / vin
 
@@ -241,7 +267,7 @@ class DemoDevice(PMBusDevice):
             )
             self._demo_set_measurement(
                 "MFR_READ_IIN",
-                iin / self.num_pages,
+                0.0 if output_off else iin / self.num_pages,
                 page,
             )
 
@@ -288,27 +314,131 @@ class DemoDevice(PMBusDevice):
             )
             return None
 
-        page = self._demo_page if descriptor[3] else None
+        if (
+            self.name == "LTM4673"
+            and self._demo_page == 0xFF
+            and descriptor[3]
+        ):
+            self._error(
+                f"read_{size}",
+                cmd,
+                "Paged reads with PAGE 0xFF are invalid on LTM4673",
+                quiet=quiet,
+            )
+            return None
+
+        if descriptor[3]:
+            page = (
+                0 if self._demo_page == 0xFF
+                else self._demo_page
+            )
+        else:
+            page = None
+
         return self._demo_values.get((page, cmd))
 
     def _write_transport(self, cmd, value=None, size="byte"):
-        # PAGE is required by normal PMBusDevice read workflows.
-        # This updates memory only.
-        if cmd == Cmd.PAGE and size == "byte":
-            if not self._valid_page(value):
-                return False
-            self._demo_page = value
-            return True
+        """Simulate service PAGE writes and all-channel OPERATION."""
+        with self._lock:
+            supported = self.name in {
+                "LTM4673", "LTM4677", "LTM4678"
+            }
 
-        self._error(
-            f"write_{size}",
-            cmd,
-            "Read-only demo; writes and actions are disabled",
-        )
-        return False
+            if cmd == Cmd.PAGE and size == "byte":
+                broadcast = (
+                    supported
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value == 0xFF
+                )
+
+                if not self._valid_page(value) and not broadcast:
+                    return False
+
+                self._demo_page = value
+                return True
+
+            if (
+                supported
+                and self.demo_output_control_enabled
+                and cmd == Cmd.OPERATION
+                and size == "byte"
+                and self._demo_page == 0xFF
+            ):
+                self.validate_register_raw(cmd, value, size)
+
+                if self.name == "LTM4673":
+                    mask = self._demo_values[(None, 0xE4)]
+                    pages = [
+                        page
+                        for page in range(self.num_pages)
+                        if mask & (1 << page)
+                    ]
+                else:
+                    pages = list(range(self.num_pages))
+
+                # Validate every affected channel before mutation.
+                for page in pages:
+                    config = self._demo_values[
+                        (page, Cmd.ON_OFF_CONFIG)
+                    ]
+                    self._validate_all_operation_pair(config, value)
+
+                for page in pages:
+                    self._demo_values[
+                        (page, Cmd.OPERATION)
+                    ] = value
+                    self._demo_apply_operation(page, value)
+
+                self._demo_last_update = None
+                self._update_demo_telemetry()
+                return True
+
+            self._error(
+                f"write_{size}",
+                cmd,
+                "Demo supports all-channel output control only",
+            )
+            return False
 
     def can_write_register(self, cmd, size=None):
-        return False
+        return (
+            self.name in {"LTM4673", "LTM4677", "LTM4678"}
+            and self.demo_output_control_enabled
+            and cmd == Cmd.OPERATION
+            and super().can_write_register(cmd, size)
+        )
+
+    def _demo_apply_operation(self, page, operation):
+        """Update synthetic output status without transition timing."""
+        off = (operation & 0xC0) in {0x00, 0x40}
+
+        status_key = (page, Cmd.STATUS_WORD)
+        status = self._demo_values.get(status_key, 0)
+
+        if off:
+            status |= 0x0040 | 0x0800
+        else:
+            status &= ~(0x0040 | 0x0800)
+
+        self._demo_values[status_key] = status
+
+        # Preserve the established LTM4677 pads simulation.
+        # Do not copy its bit layout to other models.
+        if self.name != "LTM4677":
+            return
+
+        pads_key = (None, Cmd.MFR_PADS)
+        pads = self._demo_values.get(pads_key, 0)
+        pads |= 0x0030
+        power_good = 1 << (8 + page)
+
+        if off:
+            pads &= ~power_good
+        else:
+            pads |= power_good
+
+        self._demo_values[pads_key] = pads
 
     @property
     def generic_write_blocked(self):

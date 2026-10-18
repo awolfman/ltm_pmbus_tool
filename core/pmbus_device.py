@@ -17,6 +17,7 @@ from core.pmbus_constants import (
     TELEMETRY_COMMANDS,
     build_register_map,
     build_device_metadata,
+    compare_address_register_raw,
 )
 from core.pmbus_formats import decode_value, encode_value
 from core.drivers import CP2112AddressNackError
@@ -60,6 +61,16 @@ class TransportDisconnectedError(RuntimeError):
 class TransportSessionFailedError(TransportDisconnectedError):
     """Transport session is unusable; USB removal is not established."""
 
+class ControlWriteBlockedError(ValueError):
+    """A control write was rejected before configuration transport."""
+
+    def __init__(
+        self, message, *, page, cmd, previous_raw=None
+    ):
+        super().__init__(message)
+        self.page = page
+        self.cmd = cmd
+        self.previous_raw = previous_raw
 
 def _is_device_disconnected(exc):
     current = exc
@@ -120,6 +131,170 @@ class PMBusDevice:
         self.last_error = None
         self.last_errors = {}
         self._reset_profile()
+
+    def start_common_timing_probe(self, duration=30.0):
+        """Observe global MFR_COMMON using the existing device lock.
+
+        No PAGE selection and no configuration writes.
+        Run inside the GUI process, not in a second adapter session.
+        """
+        if not self._identified:
+            raise ValueError("An identified device is required.")
+
+        masks = {
+            "LTM4673": 0x40,
+            "LTM4677": 0x70,
+            "LTM4678": 0x70,
+        }
+
+        if self.name not in masks:
+            raise ValueError(
+                "This probe supports LTM4673, LTM4677 "
+                "and LTM4678 only."
+            )
+
+        mask = masks[self.name]
+        model = self.name
+
+        existing = getattr(self, "_common_probe_thread", None)
+        if existing is not None and existing.is_alive():
+            raise RuntimeError("MFR_COMMON probe is already running.")
+
+        self._common_probe_epoch = time.perf_counter()
+        self._common_probe_write = None
+
+        def worker():
+            previous = object()
+            tracked_event = None
+            ready_reported = False
+            saw_not_ready = False
+            last_sample_time = None
+            maximum_gap = 0.0
+            deadline = time.perf_counter() + duration
+
+            print(
+                f"\n[COMMON] Probe started. "
+                f"Model={model}; mask=0x{mask:02X}. "
+                "Global reads only.",
+                flush=True,
+            )
+
+            try:
+                while time.perf_counter() < deadline:
+                    # The same lock protects GUI transactions.
+                    with self._lock:
+                        started = time.perf_counter()
+                        raw = self._read_transport(
+                            Cmd.MFR_COMMON,
+                            "byte",
+                            attempts=1,
+                            quiet=True,
+                        )
+                        finished = time.perf_counter()
+                        event = self._common_probe_write
+
+                    if last_sample_time is not None:
+                        maximum_gap = max(
+                            maximum_gap,
+                            finished - last_sample_time,
+                        )
+                    last_sample_time = finished
+
+                    valid = (
+                        isinstance(raw, int)
+                        and not isinstance(raw, bool)
+                        and 0 <= raw < 0xFF
+                    )
+
+                    ready = (
+                        valid and (raw & mask) == mask
+                    )
+
+                    command_ready = (
+                        valid and (raw & 0x60) == 0x60
+                    )
+
+                    if event is not tracked_event:
+                        tracked_event = event
+                        ready_reported = False
+                        saw_not_ready = False
+
+                    if raw != previous:
+                        raw_text = (
+                            f"0x{raw:02X}" if valid else repr(raw)
+                        )
+                        missing = (
+                            f"0x{mask & ~raw:02X}"
+                            if valid else "unknown"
+                        )
+                        extra = (
+                            f" command_ready_60={command_ready}"
+                            if model in {"LTM4677", "LTM4678"}
+                            else ""
+                        )
+
+                        print(
+                            f"[COMMON] "
+                            f"t={finished - self._common_probe_epoch:.6f}s "
+                            f"raw={raw_text} "
+                            f"ready_{mask:02X}={ready}"
+                            f"{extra} "
+                            f"missing={missing} "
+                            f"read={(finished - started) * 1000:.3f}ms",
+                            flush=True,
+                        )
+                        previous = raw
+
+                    if event is not None:
+                        if valid and not ready:
+                            saw_not_ready = True
+
+                        if ready and not ready_reported:
+                            elapsed = finished - event["started"]
+                            print(
+                                f"[COMMON] PAGE {event['page']} "
+                                f"{event['name']}="
+                                f"0x{event['value']:02X}: "
+                                f"first READY after write start "
+                                f"{elapsed * 1000:.3f}ms; "
+                                f"observed NOT_READY={saw_not_ready}",
+                                flush=True,
+                            )
+                            ready_reported = True
+
+                    time.sleep(0.01)
+
+            except TransportDisconnectedError as exc:
+                print(
+                    f"[COMMON] Transport stopped: {exc}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[COMMON] Probe failed: {exc}",
+                    flush=True,
+                )
+            finally:
+                if tracked_event is not None and not ready_reported:
+                    print(
+                        "[COMMON] No READY sample observed "
+                        "after the latest write during this probe.",
+                        flush=True,
+                    )
+
+                print(
+                    f"[COMMON] Probe stopped. "
+                    f"Maximum sample gap={maximum_gap * 1000:.3f}ms",
+                    flush=True,
+                )
+
+        thread = threading.Thread(
+            target=worker,
+            name="ltm4677-common-probe",
+            daemon=True,
+        )
+        self._common_probe_thread = thread
+        thread.start()
 
     def apply_ltm4677_frequency(self, target_raw):
         """Write a supported frequency only after observing both OFF.
@@ -484,6 +659,360 @@ class PMBusDevice:
             "pmbus_on_off_enabled": pmbus_on_off_enabled,
             "execution_ready": False,
         }
+
+    def _analyze_ltm4677_control_channel(self, channel):
+        """Analyze a freshly validated comparison channel without I/O.
+
+        Private helper for compare_ltm4677_control_raw.
+        Hypothetical pairs are not observed hardware states.
+        No command acceptance, timing or transition safety is inferred.
+        """
+        report = {
+            "status": "unresolved",
+            "analysis_complete": False,
+            "changed_commands": [],
+            "variants": [],
+            "errors": [],
+            "basis": "ltm4677_rev_b_tables_21_22",
+            "datasheet_pages": [85, 86],
+            "hardware_state_verified": False,
+            "transition_safety_verified": False,
+            "blockers": ["control_transition_unresolved"],
+            "execution_ready": False,
+            "write_order": None,
+            "write_sequence": None,
+        }
+
+        if channel["comparison_complete"] is not True:
+            report["errors"].append(
+                "Complete baseline and target control pairs required"
+            )
+            return report
+
+        for field in ("baseline_policy", "target_policy"):
+            policy = channel[field]
+            if policy is None or policy["supported"] is not True:
+                report["errors"].append(
+                    f"{field}: supported pair required"
+                )
+
+        if report["errors"]:
+            return report
+
+        registers = {
+            item["cmd"]: item
+            for item in channel["registers"]
+        }
+        changed = [
+            cmd for cmd in (Cmd.OPERATION, Cmd.ON_OFF_CONFIG)
+            if registers[cmd]["changed"] is True
+        ]
+        report["changed_commands"] = changed
+
+        if not changed:
+            report["status"] = "no_control_changes"
+            report["analysis_complete"] = True
+            return report
+
+        def pair_check(config, operation):
+            supported = True
+            error = None
+            try:
+                self.validate_ltm4677_operation_target(
+                    config, operation
+                )
+            except ValueError as exc:
+                supported = False
+                error = str(exc)
+
+            return {
+                "on_off_config_raw": config,
+                "operation_raw": operation,
+                "supported": supported,
+                "error": error,
+            }
+
+        target_config = registers[Cmd.ON_OFF_CONFIG]["target_raw"]
+        target_operation = registers[Cmd.OPERATION]["target_raw"]
+
+        if len(changed) == 1:
+            cmd = changed[0]
+            report["variants"].append({
+                "case": "single_register_change",
+                "hypothetical_first_command": registers[cmd]["name"],
+                "intermediate_pair": None,
+                "target_pair": pair_check(
+                    target_config, target_operation
+                ),
+                "execution_ready": False,
+                "write_order": None,
+                "write_sequence": None,
+            })
+            report["status"] = "single_register_change"
+        else:
+            baseline_config = registers[
+                Cmd.ON_OFF_CONFIG
+            ]["current_raw"]
+            baseline_operation = registers[
+                Cmd.OPERATION
+            ]["current_raw"]
+
+            for case, first, config, operation in (
+                (
+                    "operation_first",
+                    "OPERATION",
+                    baseline_config,
+                    target_operation,
+                ),
+                (
+                    "on_off_config_first",
+                    "ON_OFF_CONFIG",
+                    target_config,
+                    baseline_operation,
+                ),
+            ):
+                report["variants"].append({
+                    "case": case,
+                    "hypothetical_first_command": first,
+                    "intermediate_pair": pair_check(
+                        config, operation
+                    ),
+                    "target_pair": pair_check(
+                        target_config, target_operation
+                    ),
+                    "execution_ready": False,
+                    "write_order": None,
+                    "write_sequence": None,
+                })
+
+            report["status"] = "hypothetical_pairs_checked"
+
+        # Complete means the encoding checks were performed.
+        # An unsupported intermediate pair does not make the
+        # analysis incomplete and does not alter RAW comparison.
+        report["analysis_complete"] = True
+        return report
+
+    def compare_ltm4677_control_raw(
+        self, target_records, baseline_records
+    ):
+        """Compare saved control pairs without I/O or write ordering."""
+        report = {
+            "status": "unresolved",
+            "comparison_complete": False,
+            "control_registers_unchanged": None,
+            "channels": [],
+            "errors": [],
+            "blockers": ["control_transition_unresolved"],
+            "execution_ready": False,
+            "write_order": None,
+        }
+
+        with self._lock:
+            if (
+                not self._identified
+                or self.name != "LTM4677"
+                or self.num_pages != 2
+            ):
+                report["errors"].append(
+                    "Expected an identified two-page LTM4677"
+                )
+                return report
+
+            descriptors = {
+                0x01: ("OPERATION", "byte", "BYTE", True),
+                0x02: ("ON_OFF_CONFIG", "byte", "BYTE", True),
+            }
+            names = {item[0] for item in descriptors.values()}
+
+            for cmd, descriptor in descriptors.items():
+                if self._regmap.get(cmd) != descriptor:
+                    report["errors"].append(
+                        "Unexpected LTM4677 control descriptor"
+                    )
+                    return report
+
+            def collect(records, raw_field, source):
+                if not isinstance(records, (list, tuple)):
+                    raise ValueError(
+                        f"{source}: expected a list or tuple"
+                    )
+
+                collected = {}
+                for item in records:
+                    if not isinstance(item, dict):
+                        raise ValueError(f"{source}: invalid record")
+
+                    cmd = item.get("cmd")
+                    if (
+                        isinstance(cmd, bool)
+                        or not isinstance(cmd, int)
+                        or not 0 <= cmd <= 0xFF
+                    ):
+                        raise ValueError(
+                            f"{source}: invalid command"
+                        )
+
+                    name = item.get("name")
+                    known_name = (
+                        isinstance(name, str) and name in names
+                    )
+                    if cmd not in descriptors and not known_name:
+                        continue
+
+                    if cmd not in descriptors:
+                        raise ValueError(
+                            f"{source}: control command mismatch"
+                        )
+
+                    descriptor = descriptors[cmd]
+                    if (
+                        name != descriptor[0]
+                        or item.get("size") != descriptor[1]
+                        or (
+                            "format" in item
+                            and item["format"] != descriptor[2]
+                        )
+                        or (
+                            "is_paged" in item
+                            and item["is_paged"] is not True
+                        )
+                    ):
+                        raise ValueError(
+                            f"{source}: control descriptor mismatch"
+                        )
+
+                    page = item.get("page")
+                    if (
+                        isinstance(page, bool)
+                        or not isinstance(page, int)
+                        or page not in (0, 1)
+                    ):
+                        raise ValueError(
+                            f"{source}: invalid control page"
+                        )
+
+                    identity = (page, cmd)
+                    if identity in collected:
+                        raise ValueError(
+                            f"{source}: duplicate control record"
+                        )
+
+                    raw = item.get(raw_field)
+                    if (
+                        isinstance(raw, bool)
+                        or not isinstance(raw, int)
+                        or not 0 <= raw <= 0xFF
+                    ):
+                        raise ValueError(
+                            f"{source}: invalid {raw_field}"
+                        )
+                    collected[identity] = raw
+
+                return collected
+
+            try:
+                target = collect(target_records, "raw", "target")
+                baseline = collect(
+                    baseline_records, "current_raw", "baseline"
+                )
+            except ValueError as exc:
+                report["errors"].append(str(exc))
+                return report
+
+            def policy_check(values, page, source):
+                config = values[(page, 0x02)]
+                operation = values[(page, 0x01)]
+                try:
+                    self.validate_ltm4677_operation_target(
+                        config, operation
+                    )
+                except ValueError as exc:
+                    return {
+                        "supported": False,
+                        "error": f"{source}: {exc}",
+                    }
+                return {"supported": True, "error": None}
+
+            all_complete = True
+            all_supported = True
+            all_unchanged = True
+
+            for page in range(2):
+                missing = [
+                    f"{source}: PAGE {page} missing {descriptor[0]}"
+                    for source, values in (
+                        ("target", target), ("baseline", baseline)
+                    )
+                    for cmd, descriptor in descriptors.items()
+                    if (page, cmd) not in values
+                ]
+                complete = not missing
+                all_complete = all_complete and complete
+                report["errors"].extend(missing)
+
+                channel = {
+                    "page": page,
+                    "comparison_complete": complete,
+                    "registers": [],
+                    "baseline_policy": None,
+                    "target_policy": None,
+                    "unchanged": None,
+                    "execution_ready": False,
+                    "write_order": None,
+                }
+
+                for cmd, descriptor in descriptors.items():
+                    identity = (page, cmd)
+                    current = baseline.get(identity)
+                    desired = target.get(identity)
+                    channel["registers"].append({
+                        "cmd": cmd,
+                        "name": descriptor[0],
+                        "current_raw": current,
+                        "target_raw": desired,
+                        "changed": (
+                            current != desired
+                            if identity in baseline and identity in target
+                            else None
+                        ),
+                    })
+
+                if complete:
+                    channel["unchanged"] = all(
+                        not item["changed"]
+                        for item in channel["registers"]
+                    )
+                    all_unchanged = (
+                        all_unchanged and channel["unchanged"]
+                    )
+
+                    for source, values in (
+                        ("baseline", baseline),
+                        ("target", target),
+                    ):
+                        check = policy_check(values, page, source)
+                        channel[f"{source}_policy"] = check
+                        if not check["supported"]:
+                            all_supported = False
+                            report["errors"].append(
+                                f"PAGE {page}: {check['error']}"
+                            )
+
+                channel["transition_analysis"] = (
+                    self._analyze_ltm4677_control_channel(channel)
+                )
+                report["channels"].append(channel)
+
+            report["comparison_complete"] = all_complete
+            if all_complete:
+                report["control_registers_unchanged"] = all_unchanged
+                if all_supported:
+                    report["status"] = (
+                        "unchanged" if all_unchanged else "changed"
+                    )
+
+            return report
 
     def inspect_ltm4677_restore_transport(self, target_raw):
         """Check restore compatibility with a non-PEC transport.
@@ -975,6 +1504,567 @@ class PMBusDevice:
                     ),
                 })
 
+            # Diagnostic requirements only, not restore authorization.
+            requirement_families = {
+                "voltage_relationships": {
+                    "VOUT_COMMAND", "VOUT_MAX",
+                    "VOUT_MARGIN_HIGH", "VOUT_MARGIN_LOW",
+                    "VOUT_OV_FAULT_LIMIT", "VOUT_OV_WARN_LIMIT",
+                    "VOUT_UV_WARN_LIMIT", "VOUT_UV_FAULT_LIMIT",
+                },
+                "input_voltage_relationships": {
+                    "VIN_ON", "VIN_OFF",
+                    "VIN_OV_FAULT_LIMIT", "VIN_OV_WARN_LIMIT",
+                    "VIN_UV_WARN_LIMIT", "VIN_UV_FAULT_LIMIT",
+                },
+                "protection_limits": {
+                    "IOUT_OC_FAULT_LIMIT", "IOUT_OC_WARN_LIMIT",
+                    "IOUT_UC_FAULT_LIMIT", "IIN_OC_WARN_LIMIT",
+                    "OT_FAULT_LIMIT", "OT_WARN_LIMIT",
+                    "UT_WARN_LIMIT", "UT_FAULT_LIMIT",
+                },
+                "fault_response_semantics": {
+                    "VOUT_OV_FAULT_RESPONSE",
+                    "VOUT_UV_FAULT_RESPONSE",
+                    "IOUT_OC_FAULT_RESPONSE",
+                    "IOUT_UC_FAULT_RESPONSE",
+                    "VIN_OV_FAULT_RESPONSE",
+                    "VIN_UV_FAULT_RESPONSE",
+                    "OT_FAULT_RESPONSE", "UT_FAULT_RESPONSE",
+                },
+                "timing_and_transition": {
+                    "VOUT_TRANSITION_RATE",
+                    "TON_DELAY", "TON_RISE",
+                    "TON_MAX_FAULT_LIMIT",
+                    "TON_MAX_FAULT_RESPONSE",
+                    "TOFF_DELAY", "TOFF_FALL",
+                    "TOFF_MAX_WARN_LIMIT",
+                    "MFR_RETRY_DELAY", "MFR_RESTART_DELAY",
+                },
+                "calibration_semantics": {
+                    "IOUT_CAL_GAIN", "IOUT_CAL_OFFSET",
+                    "MFR_IIN_OFFSET", "MFR_IOUT_CAL_GAIN_TC",
+                    "MFR_TEMP_1_GAIN", "MFR_TEMP_1_OFFSET",
+                },
+                "manufacturer_configuration": {
+                    "MFR_CHAN_CONFIG", "MFR_GPIO_PROPAGATE",
+                    "MFR_PWM_MODE", "MFR_GPIO_RESPONSE",
+                    "MFR_ADC_CONTROL", "MFR_PWM_CONFIG",
+                },
+            }
+
+            requirements_by_name = {}
+            for family, names in requirement_families.items():
+                for name in names:
+                    if name in requirements_by_name:
+                        raise ValueError(
+                            f"Duplicate requirement family: {name}"
+                        )
+                    requirements_by_name[name] = family
+
+            unresolved_requirements = [
+                {
+                    "page": item["page"],
+                    "cmd": item["cmd"],
+                    "name": item["name"],
+                    "family": requirements_by_name.get(
+                        item["name"], "unclassified"
+                    ),
+                    "execution_ready": False,
+                    "write_order": None,
+                }
+                for item in groups["unresolved"]
+            ]
+
+            voltage_descriptors = {
+                "VOUT_COMMAND": 0x21,
+                "VOUT_MAX": 0x24,
+                "VOUT_MARGIN_HIGH": 0x25,
+                "VOUT_MARGIN_LOW": 0x26,
+            }
+            voltage_targets = {
+                (item["page"], item["name"]): item
+                for item in inspection["candidates"]
+                if item["name"] in voltage_descriptors
+            }
+            voltage_target_checks = []
+
+            for page in range(2):
+                values = {}
+
+                for name, expected_cmd in voltage_descriptors.items():
+                    item = voltage_targets.get((page, name))
+                    if item is None:
+                        raise ValueError(
+                            f"PAGE {page}: missing voltage target {name}"
+                        )
+
+                    if (
+                        item["cmd"] != expected_cmd
+                        or item["size"] != "word"
+                        or item["format"] != "L16"
+                        or item["is_paged"] is not True
+                    ):
+                        raise ValueError(
+                            f"{name}: unexpected voltage descriptor"
+                        )
+
+                    values[name] = item["raw"]
+
+                # All four targets share the same positive L16 scale.
+                # Compare exact RAW values without float conversion.
+                maximum = values["VOUT_MAX"]
+                for name in (
+                    "VOUT_COMMAND",
+                    "VOUT_MARGIN_HIGH",
+                    "VOUT_MARGIN_LOW",
+                ):
+                    if values[name] > maximum:
+                        raise ValueError(
+                            f"PAGE {page}: target {name} "
+                            f"0x{values[name]:04X} exceeds "
+                            f"target VOUT_MAX 0x{maximum:04X}"
+                        )
+
+                voltage_target_checks.append({
+                    "page": page,
+                    "raw": values,
+                    "within_target_vout_max": True,
+                    "execution_ready": False,
+                    "write_order": None,
+                })
+
+            voltage_chain = (
+                ("VOUT_UV_FAULT_LIMIT", 0x44),
+                ("VOUT_UV_WARN_LIMIT", 0x43),
+                ("VOUT_MARGIN_LOW", 0x26),
+                ("VOUT_COMMAND", 0x21),
+                ("VOUT_MARGIN_HIGH", 0x25),
+                ("VOUT_OV_WARN_LIMIT", 0x42),
+                ("VOUT_OV_FAULT_LIMIT", 0x40),
+            )
+            candidate_targets = {
+                (item["page"], item["name"]): item
+                for item in inspection["candidates"]
+            }
+            voltage_relationship_checks = []
+
+            for page in range(2):
+                values = {}
+                for name, cmd in voltage_chain:
+                    item = candidate_targets.get((page, name))
+                    if item is None:
+                        raise ValueError(
+                            f"PAGE {page}: missing voltage target {name}"
+                        )
+                    if (
+                        item["cmd"] != cmd
+                        or item["size"] != "word"
+                        or item["format"] != "L16"
+                        or item["is_paged"] is not True
+                    ):
+                        raise ValueError(
+                            f"{name}: unexpected voltage descriptor"
+                        )
+                    values[name] = item["raw"]
+
+                relations = []
+                for left, right in zip(
+                    voltage_chain, voltage_chain[1:]
+                ):
+                    lower, upper = left[0], right[0]
+                    basis = (
+                        "datasheet"
+                        if (lower, upper) in {
+                            ("VOUT_MARGIN_LOW", "VOUT_COMMAND"),
+                            ("VOUT_COMMAND", "VOUT_MARGIN_HIGH"),
+                        }
+                        else "restore_policy"
+                    )
+                    relations.append({
+                        "lower": lower,
+                        "upper": upper,
+                        "basis": basis,
+                        "ok": values[lower] < values[upper],
+                    })
+
+                passed = all(item["ok"] for item in relations)
+                voltage_relationship_checks.append({
+                    "page": page,
+                    "raw": values,
+                    "relations": relations,
+                    "ok": passed,
+                    "execution_ready": False,
+                    "write_order": None,
+                })
+
+            if any(
+                not item["ok"]
+                for item in voltage_relationship_checks
+            ):
+                blockers.append(
+                    "voltage_target_relationships_failed"
+                )
+
+            # Datasheet Rev. B, page 120.
+            # A supported encoding does not imply restore safety.
+            adc_modes = {
+                0x00: "standard_round_robin",
+                0x01: "svin",
+                0x04: "internal_ic_temperature",
+                0x05: "channel_0_vout",
+                0x06: "channel_0_iout",
+                0x08: "channel_0_temperature",
+                0x09: "channel_1_vout",
+                0x0A: "channel_1_iout",
+                0x0C: "channel_1_temperature",
+                0x0D: "short_round_robin",
+            }
+
+            adc_target = candidate_targets.get(
+                (None, "MFR_ADC_CONTROL")
+            )
+            if adc_target is None:
+                raise ValueError(
+                    "Missing global MFR_ADC_CONTROL target"
+                )
+
+            if (
+                adc_target["cmd"] != 0xD8
+                or adc_target["size"] != "byte"
+                or adc_target["is_paged"] is not False
+            ):
+                raise ValueError(
+                    "MFR_ADC_CONTROL: unexpected restore descriptor"
+                )
+
+            adc_raw = adc_target["raw"]
+            adc_supported = adc_raw in adc_modes
+            adc_standard = adc_raw == 0x00
+
+            adc_target_check = {
+                "page": None,
+                "cmd": 0xD8,
+                "name": "MFR_ADC_CONTROL",
+                "raw": adc_raw,
+                "mode": adc_modes.get(adc_raw, "reserved"),
+                "encoding_supported": adc_supported,
+                "encoding_basis": "datasheet",
+                "datasheet_pages": [120],
+                "standard_round_robin": adc_standard,
+                "ok": adc_supported and adc_standard,
+                "policy": "full_restore_requires_standard_adc",
+                "policy_basis": "restore_policy",
+                "effects": (
+                    []
+                    if adc_standard
+                    else [
+                        "voltage_servo_disabled",
+                        "unselected_telemetry_faults_and_warnings_disabled",
+                    ]
+                    if adc_supported
+                    else [
+                        "fallback_to_internal_ic_temperature",
+                        "cml_invalid_data_reasserted_until_valid_command",
+                    ]
+                ),
+                "requirements": [
+                    "live_adc_baseline_required",
+                    "adc_baseline_recheck_before_write",
+                    "telemetry_freshness_validation_required",
+                ],
+                "execution_ready": False,
+                "write_order": None,
+            }
+
+            if not adc_supported:
+                blockers.append("adc_target_reserved")
+            elif not adc_standard:
+                blockers.append(
+                    "adc_target_disables_full_monitoring"
+                )
+
+            # Calibration diagnostics only. No write authorization.
+            # Datasheet Rev. B, pages 93 and 95.
+            calibration_descriptors = (
+                ("MFR_IOUT_CAL_GAIN_TC", 0xF6, "RAW", 93),
+                ("MFR_TEMP_1_GAIN", 0xF8, "RAW", 95),
+                ("MFR_TEMP_1_OFFSET", 0xF9, "L11", 95),
+            )
+            calibration_target_checks = []
+
+            for page in range(2):
+                for name, cmd, fmt, source_page in (
+                    calibration_descriptors
+                ):
+                    item = candidate_targets.get((page, name))
+                    if item is None:
+                        raise ValueError(
+                            f"PAGE {page}: missing calibration target "
+                            f"{name}"
+                        )
+
+                    if (
+                        item["cmd"] != cmd
+                        or item["size"] != "word"
+                        or item["format"] != fmt
+                        or item["is_paged"] is not True
+                    ):
+                        raise ValueError(
+                            f"{name}: unexpected calibration descriptor"
+                        )
+
+                    raw = item["raw"]
+                    signed = raw if raw < 0x8000 else raw - 0x10000
+
+                    check = {
+                        "page": page,
+                        "cmd": cmd,
+                        "name": name,
+                        "raw": raw,
+                        "basis": "datasheet",
+                        "datasheet_pages": [source_page],
+                        "value_check": "representation_only",
+                        "within_documented_range": None,
+                        "minimum_raw": None,
+                        "maximum_raw": None,
+                        "manufacturer_recommendation": None,
+                        "board_safety_checked": False,
+                        "execution_ready": False,
+                        "write_order": None,
+                    }
+
+                    if name == "MFR_TEMP_1_GAIN":
+                        check.update({
+                            "decoded": signed * (2.0 ** -14),
+                            "units": "dimensionless",
+                            "value_check": "documented_range",
+                            "within_documented_range": (
+                                0x2000 <= raw <= 0x7FFF
+                            ),
+                            "minimum_raw": 0x2000,
+                            "maximum_raw": 0x7FFF,
+                        })
+                    elif name == "MFR_IOUT_CAL_GAIN_TC":
+                        check.update({
+                            "decoded": signed,
+                            "units": "ppm/degC",
+                            "manufacturer_recommendation": (
+                                "use_factory_default_writes_not_recommended"
+                            ),
+                        })
+                    else:
+                        check.update({
+                            "decoded": decode_value(raw, "L11"),
+                            "units": "degC",
+                        })
+
+                    calibration_target_checks.append(check)
+
+            if any(
+                item["within_documented_range"] is False
+                for item in calibration_target_checks
+            ):
+                blockers.append(
+                    "temperature_gain_target_out_of_range"
+                )
+
+            # Explicitly verify that the non-writable factory
+            # calibration has not become a restore candidate.
+            excluded_targets = {
+                (item["page"], item["name"]): item
+                for item in inspection["excluded"]
+            }
+            calibration_write_restrictions = []
+
+            for page in range(2):
+                name = "IOUT_CAL_GAIN"
+                if (page, name) in candidate_targets:
+                    raise ValueError(
+                        "IOUT_CAL_GAIN: restore write is prohibited"
+                    )
+
+                item = excluded_targets.get((page, name))
+                if item is None:
+                    raise ValueError(
+                        f"PAGE {page}: missing excluded IOUT_CAL_GAIN"
+                    )
+
+                if (
+                    item["cmd"] != 0x38
+                    or item["size"] != "word"
+                    or item["format"] != "L11"
+                    or item["is_paged"] is not True
+                    or item["exclude_reason"] != "read_only"
+                ):
+                    raise ValueError(
+                        "IOUT_CAL_GAIN: unexpected exclusion descriptor"
+                    )
+
+                calibration_write_restrictions.append({
+                    "page": page,
+                    "cmd": 0x38,
+                    "name": name,
+                    "snapshot_raw": item["raw"],
+                    "basis": "datasheet",
+                    "datasheet_pages": [93],
+                    "write_behavior": "nack_no_telemetry_effect",
+                    "restore_write_allowed": False,
+                    "live_context_required_for_current_limits": True,
+                    "execution_ready": False,
+                })
+
+            # Project policy: representation and an isolated gain
+            # range check cannot establish calibration safety.
+            blockers.append("calibration_context_unresolved")
+
+            # Voltage diagnostics only, not an executable transition.
+            # Use integer arithmetic for exact L16 comparisons.
+            voltage_range_checks = []
+
+            for page in range(2):
+                exponent = self.vout_exp.get(page)
+                if (
+                    isinstance(exponent, bool)
+                    or not isinstance(exponent, int)
+                    or exponent != -12
+                ):
+                    raise ValueError(
+                        f"PAGE {page}: voltage range checks require "
+                        "LTM4677 exponent -12"
+                    )
+
+                mode = candidate_targets.get((page, "MFR_PWM_MODE"))
+                if mode is None:
+                    raise ValueError(
+                        f"PAGE {page}: missing MFR_PWM_MODE target"
+                    )
+
+                if (
+                    mode["cmd"] != 0xD4
+                    or mode["size"] != "byte"
+                    or mode["format"] != "BYTE"
+                    or mode["is_paged"] is not True
+                ):
+                    raise ValueError(
+                        "MFR_PWM_MODE: unexpected voltage range descriptor"
+                    )
+
+                low_range = bool(mode["raw"] & 0x02)
+
+                # Comparator detection envelopes, not a complete
+                # specification of accepted command encodings.
+                comparator_min_mv = 500 if low_range else 1000
+                ov_max_mv = 2700 if low_range else 5600
+                uv_max_mv = 2700 if low_range else 5400
+
+                specifications = (
+                    (
+                        "VOUT_COMMAND", 0x21, 500, 1800,
+                        "module_operating_range", [5, 11],
+                    ),
+                    (
+                        "VOUT_MARGIN_LOW", 0x26, 500, 1800,
+                        "module_operating_range", [5, 11],
+                    ),
+                    (
+                        "VOUT_MARGIN_HIGH", 0x25, 500, 1800,
+                        "module_operating_range", [5, 11],
+                    ),
+                    (
+                        "VOUT_OV_FAULT_LIMIT", 0x40,
+                        comparator_min_mv, ov_max_mv,
+                        "comparator_detection_range", [6],
+                    ),
+                    (
+                        "VOUT_UV_FAULT_LIMIT", 0x44,
+                        comparator_min_mv, uv_max_mv,
+                        "comparator_detection_range", [7],
+                    ),
+                )
+                checks = []
+
+                for name, cmd, minimum_mv, maximum_mv, kind, pages in (
+                    specifications
+                ):
+                    item = candidate_targets.get((page, name))
+                    if item is None:
+                        raise ValueError(
+                            f"PAGE {page}: missing voltage target {name}"
+                        )
+
+                    if (
+                        item["cmd"] != cmd
+                        or item["size"] != "word"
+                        or item["format"] != "L16"
+                        or item["is_paged"] is not True
+                    ):
+                        raise ValueError(
+                            f"{name}: unexpected voltage range descriptor"
+                        )
+
+                    raw = item["raw"]
+                    within = (
+                        minimum_mv * 4096
+                        <= raw * 1000
+                        <= maximum_mv * 4096
+                    )
+                    checks.append({
+                        "name": name,
+                        "cmd": cmd,
+                        "raw": raw,
+                        "range_kind": kind,
+                        "minimum_mv": minimum_mv,
+                        "maximum_mv": maximum_mv,
+                        "range_basis": "datasheet",
+                        "datasheet_pages": pages,
+                        "acceptance_basis": "restore_policy",
+                        "acceptance_policy": (
+                            "exact_decoded_value_inside_envelope"
+                        ),
+                        "within_range": within,
+                    })
+
+                voltage_range_checks.append({
+                    "page": page,
+                    "mfr_pwm_mode_raw": mode["raw"],
+                    "low_range": low_range,
+                    "vout_exponent": exponent,
+                    "checks": checks,
+                    "ranges_ok": all(
+                        item["within_range"] for item in checks
+                    ),
+                    "not_validated_here": [
+                        "VOUT_MAX",
+                        "VOUT_OV_WARN_LIMIT",
+                        "VOUT_UV_WARN_LIMIT",
+                    ],
+                    "high_range_module_applicability_unresolved": (
+                        not low_range
+                    ),
+                    "pwm_mode_other_bits_checked": False,
+                    "comparator_quantization_checked": False,
+                    "board_safety_checked": False,
+                    "execution_ready": False,
+                    "write_order": None,
+                })
+
+            if any(
+                not item["ranges_ok"] for item in voltage_range_checks
+            ):
+                blockers.append("voltage_target_ranges_failed")
+
+            if any(
+                item["high_range_module_applicability_unresolved"]
+                for item in voltage_range_checks
+            ):
+                blockers.append(
+                    "voltage_high_range_module_applicability_unresolved"
+                )
+
+            blockers.append("voltage_board_limits_unresolved")
+            blockers.append("voltage_threshold_semantics_unresolved")
+
             return {
                 "execution_ready": False,
                 "user_data_policy": user_data_policy,
@@ -982,6 +2072,15 @@ class PMBusDevice:
                 "total": inspection["total"],
                 "candidate_count": len(inspection["candidates"]),
                 "groups": groups,
+                "unresolved_requirements": unresolved_requirements,
+                "voltage_relationship_checks": voltage_relationship_checks,
+                "voltage_range_checks": voltage_range_checks,
+                "adc_target_check": adc_target_check,
+                "calibration_target_checks": calibration_target_checks,
+                "calibration_write_restrictions": (
+                    calibration_write_restrictions
+                ),
+                "voltage_target_checks": voltage_target_checks,
                 "excluded": deepcopy(sorted(
                     inspection["excluded"], key=record_order
                 )),
@@ -1003,6 +2102,185 @@ class PMBusDevice:
                 },
             }
 
+    def summarize_ltm4677_full_restore(
+        self, metadata, records, preflight
+    ):
+        """Combine target planning and saved diagnostics without I/O.
+
+        Exact target agreement establishes data consistency only.
+        Saved diagnostics do not authenticate a physical device
+        or establish baseline freshness.
+        """
+        with self._lock:
+            if not isinstance(preflight, dict):
+                raise ValueError("Expected a preflight report")
+
+            if type(preflight.get("ok")) is not bool:
+                raise ValueError("Invalid preflight diagnostic status")
+
+            inspection = preflight.get("inspection")
+            if not isinstance(inspection, dict):
+                raise ValueError(
+                    "Preflight target inspection is unavailable"
+                )
+
+            source_metadata = deepcopy(metadata)
+            source_records = deepcopy(list(records))
+            saved_inspection = deepcopy(inspection)
+
+            plan = self.plan_ltm4677_full_restore(
+                source_metadata, source_records
+            )
+
+            def index_records(items, source):
+                if not isinstance(items, (list, tuple)):
+                    raise ValueError(
+                        f"{source}: expected record list"
+                    )
+
+                indexed = {}
+                required = (
+                    "page", "cmd", "name", "size",
+                    "format", "is_paged", "raw",
+                )
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise ValueError(
+                            f"{source}: invalid record"
+                        )
+                    if any(field not in item for field in required):
+                        raise ValueError(
+                            f"{source}: incomplete record descriptor"
+                        )
+
+                    page = item["page"]
+                    cmd = item["cmd"]
+                    raw = item["raw"]
+
+                    if (
+                        isinstance(cmd, bool)
+                        or not isinstance(cmd, int)
+                        or not 0 <= cmd <= 0xFF
+                    ):
+                        raise ValueError(
+                            f"{source}: invalid command"
+                        )
+                    if page is not None and (
+                        isinstance(page, bool)
+                        or not isinstance(page, int)
+                        or not 0 <= page < self.num_pages
+                    ):
+                        raise ValueError(
+                            f"{source}: invalid page"
+                        )
+                    if type(item["is_paged"]) is not bool:
+                        raise ValueError(
+                            f"{source}: invalid scope"
+                        )
+                    if any(
+                        not isinstance(item[field], str)
+                        for field in ("name", "size", "format")
+                    ):
+                        raise ValueError(
+                            f"{source}: invalid descriptor"
+                        )
+                    if raw is not None and (
+                        isinstance(raw, bool)
+                        or not isinstance(raw, int)
+                    ):
+                        raise ValueError(
+                            f"{source}: invalid RAW type"
+                        )
+
+                    identity = (page, cmd)
+                    if identity in indexed:
+                        raise ValueError(
+                            f"{source}: duplicate target {identity!r}"
+                        )
+
+                    # Source display flags and decoded floats do not
+                    # define the target. Preserve exact scalar RAW.
+                    indexed[identity] = tuple(
+                        item[field] for field in required
+                    )
+
+                return indexed
+
+            planned_candidates = [
+                item
+                for items in plan["groups"].values()
+                for item in items
+            ]
+
+            for label, expected in (
+                ("candidates", planned_candidates),
+                ("excluded", plan["excluded"]),
+            ):
+                saved = index_records(
+                    saved_inspection.get(label),
+                    f"preflight {label}",
+                )
+                current = index_records(
+                    expected, f"planned {label}"
+                )
+                if saved != current:
+                    raise ValueError(
+                        f"Preflight target mismatch: {label}"
+                    )
+
+            baseline_report = preflight.get("baseline_report")
+            address_comparison = None
+            control_comparison = None
+            baseline_ok = None
+
+            if baseline_report is not None:
+                if not isinstance(baseline_report, dict):
+                    raise ValueError("Invalid saved baseline report")
+                if type(baseline_report.get("ok")) is not bool:
+                    raise ValueError("Invalid saved baseline status")
+
+                baseline_ok = baseline_report["ok"]
+                address_comparison = compare_address_register_raw(
+                    self._metadata,
+                    planned_candidates,
+                    deepcopy(baseline_report.get("baselines")),
+                )
+                control_comparison = self.compare_ltm4677_control_raw(
+                    planned_candidates,
+                    deepcopy(baseline_report.get("baselines")),
+                )
+
+            return {
+                "execution_ready": False,
+                "write_sequence": None,
+                "target_matches_preflight": True,
+                "plan": plan,
+                "diagnostics": {
+                    "reported_ok": preflight["ok"],
+                    "baseline_reported_ok": baseline_ok,
+                    "reason": preflight.get("reason"),
+                    "error": preflight.get("error"),
+                    # Preserve the original exception object.
+                    "disconnect": preflight.get("disconnect"),
+                },
+                "address_comparison": address_comparison,
+                "control_comparison": control_comparison,
+                "evidence": {
+                    "target_consistency_checked": True,
+                    "physical_device_identity_verified": False,
+                    "baseline_freshness_verified": False,
+                    "saved_report_authenticity_verified": False,
+                },
+                "limitations": [
+                    "saved_diagnostics_are_not_execution_authorization",
+                    "physical_device_identity_not_established",
+                    "baseline_freshness_not_established",
+                    "saved_report_authenticity_not_established",
+                    "live_guards_and_baseline_rechecks_required",
+                ],
+            }
+
     def preflight_ltm4677_full_restore(self, metadata, records):
         """Inspect targets, protection, transport and baselines.
 
@@ -1019,6 +2297,7 @@ class PMBusDevice:
             "protection_before": None,
             "transport_before": None,
             "baseline_report": None,
+            "address_comparison": None,
             "transport_after": None,
             "protection_after": None,
             "reason": None,
@@ -1108,7 +2387,42 @@ class PMBusDevice:
                     source_metadata,
                     source_records,
                 )
-                if not accept_stage("baseline_report", baselines):
+                baseline_ok = accept_stage(
+                    "baseline_report", baselines
+                )
+
+                # Offline diagnostics over already collected records.
+                # Preserve the baseline failure before comparing.
+                # Address equality never authorizes restoration.
+                active = "Compare address register RAW"
+                try:
+                    report["address_comparison"] = (
+                        compare_address_register_raw(
+                            self._metadata,
+                            inspection["candidates"],
+                            baselines["baselines"],
+                        )
+                    )
+                except Exception as exc:
+                    report["address_comparison"] = {
+                        "status": "unresolved",
+                        "comparison_complete": False,
+                        "address_registers_unchanged": None,
+                        "entries": [],
+                        "errors": [
+                            "Address comparison failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        ],
+                        "execution_ready": False,
+                        "write_sequence": None,
+                    }
+                    # A comparison failure must not replace an
+                    # already recorded transport or baseline error.
+                    if baseline_ok:
+                        raise
+                    return report
+
+                if not baseline_ok:
                     return report
 
                 def baseline_raw(target):
@@ -2767,18 +4081,59 @@ class PMBusDevice:
         return self.read_block_data(cmd)
 
     def _write_transport(self, cmd, value=None, size="byte"):
+        # Diagnostic marker for control command transmission.
+        if (
+            self.name in {"LTM4673", "LTM4677", "LTM4678"}
+            and cmd in (Cmd.OPERATION, Cmd.ON_OFF_CONFIG)
+            and size == "byte"
+        ):
+            with self._lock:
+                started = time.perf_counter()
+                probe = getattr(
+                    self, "_common_probe_thread", None
+                )
+
+                if probe is not None and probe.is_alive():
+                    self._common_probe_write = {
+                        "started": started,
+                        "page": self._page,
+                        "name": self._regmap[cmd][0],
+                        "value": value,
+                    }
+
+                print(
+                    f"[CONTROL TX ATTEMPT] "
+                    f"model={self.name} "
+                    f"clock={started:.6f}s "
+                    f"page={self._page!r} "
+                    f"cmd=0x{cmd:02X} value={value!r}",
+                    flush=True,
+                )
+
+        # Existing transport implementation.
         try:
             bus = self._get_bus()
+
             if size == "send":
-                result = bus.write_byte(self.address, cmd)
+                result = bus.write_byte(
+                    self.address,
+                    cmd,
+                )
+
             elif size == "byte":
                 result = bus.write_byte_data(
-                    self.address, cmd, value
+                    self.address,
+                    cmd,
+                    value,
                 )
+
             elif size == "word":
                 result = bus.write_word_data(
-                    self.address, cmd, value
+                    self.address,
+                    cmd,
+                    value,
                 )
+
             else:
                 raise ValueError("Unsupported write type")
 
@@ -2790,10 +4145,16 @@ class PMBusDevice:
 
         except Exception as exc:
             self._raise_if_transport_lost(
-                exc, f"write_{size}", cmd
+                exc,
+                f"write_{size}",
+                cmd,
             )
 
-            self._error(f"write_{size}", cmd, exc)
+            self._error(
+                f"write_{size}",
+                cmd,
+                exc,
+            )
             return False
 
     def _wait_ready(self, timeout=READY_TIMEOUT):
@@ -2846,6 +4207,124 @@ class PMBusDevice:
             and not isinstance(page, bool)
             and 0 <= page < self.num_pages
         )
+
+    def _wait_ltm4677_observation_ready(
+        self, timeout=READY_TIMEOUT
+    ):
+        """Check interface readiness, not output transition completion.
+
+        Diagnostic read policy only. Never authorizes configuration
+        writes or establishes the physical output state.
+        """
+        if (
+            self.name != "LTM4677"
+            or not (self._identified or self._identifying)
+            or not self.can_read_register(Cmd.MFR_COMMON, "byte")
+        ):
+            return False
+
+        deadline = time.monotonic() + timeout
+        last_raw = None
+
+        while time.monotonic() < deadline:
+            last_raw = self._read_transport(
+                Cmd.MFR_COMMON,
+                "byte",
+                attempts=1,
+                quiet=True,
+            )
+
+            valid = (
+                isinstance(last_raw, int)
+                and not isinstance(last_raw, bool)
+                and 0 <= last_raw < 0xFF
+            )
+
+            if valid and (last_raw & 0x60) == 0x60:
+                return True
+
+            time.sleep(PMBUS_PAUSE)
+
+        raw_text = (
+            f"0x{last_raw:02X}"
+            if isinstance(last_raw, int)
+            and not isinstance(last_raw, bool)
+            and 0 <= last_raw <= 0xFF
+            else repr(last_raw)
+        )
+
+        self._error(
+            "wait_observation_ready",
+            Cmd.MFR_COMMON,
+            f"Mask 0x60 was not satisfied within {timeout:g} seconds. "
+            f"Last RAW={raw_text}.",
+        )
+        return False
+
+    def _set_page_for_read(self, page):
+        """Select and verify PAGE for observation.
+
+        LTM4677 observation does not require bit 4 of MFR_COMMON.
+        Other models retain their existing PAGE policy.
+        """
+        with self._lock:
+            if not (self._identified or self._identifying):
+                self._error(
+                    "set_page_for_read",
+                    Cmd.PAGE,
+                    "Unknown device",
+                )
+                return False
+
+            if not self._valid_page(page):
+                self._error(
+                    "set_page_for_read",
+                    Cmd.PAGE,
+                    f"Invalid page {page!r}",
+                )
+                return False
+
+            if self.name != "LTM4677":
+                return self.set_page(page)
+
+            # Never trust a cached PAGE for this diagnostic path.
+            self._page = None
+
+            for _ in range(RETRY_COUNT):
+                if not self._wait_ltm4677_observation_ready():
+                    return False
+
+                if not self._write_transport(
+                    Cmd.PAGE, page, "byte"
+                ):
+                    return False
+
+                time.sleep(PAGE_PAUSE)
+
+                if not self._wait_ltm4677_observation_ready():
+                    return False
+
+                current = self._read_transport(
+                    Cmd.PAGE,
+                    "byte",
+                    attempts=1,
+                    quiet=True,
+                )
+
+                if (
+                    isinstance(current, int)
+                    and not isinstance(current, bool)
+                    and current == page
+                ):
+                    self._page = page
+                    return True
+
+            self._error(
+                "set_page_for_read",
+                Cmd.PAGE,
+                f"PAGE {page} verification failed.",
+            )
+            return False
 
     def set_page(self, page):
         with self._lock:
@@ -2939,11 +4418,535 @@ class PMBusDevice:
 
         return value
 
+    def _is_ltm4677_control_command(self, cmd):
+        return (
+            self.name == "LTM4677"
+            and isinstance(cmd, int)
+            and not isinstance(cmd, bool)
+            and cmd in (Cmd.OPERATION, Cmd.ON_OFF_CONFIG)
+        )
+
+    def _validate_all_operation_pair(self, config, target):
+        """Validate effectiveness prerequisites for panel actions."""
+        if self.name == "LTM4677":
+            return self.validate_ltm4677_operation_target(
+                config, target
+            )
+
+        for label, raw in (
+            ("ON_OFF_CONFIG", config),
+            ("OPERATION", target),
+        ):
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not 0 <= raw <= 0xFF
+            ):
+                raise ValueError(f"{label} must be an integer byte.")
+
+        if target not in {0x00, 0x40, 0x80}:
+            raise ValueError(
+                "All-channel panel supports On, Sequence Off "
+                "and Immediate Off only."
+            )
+
+        if self.name == "LTM4678":
+            if config not in {0x16, 0x17, 0x1E, 0x1F}:
+                raise ValueError(
+                    f"Unsupported LTM4678 ON_OFF_CONFIG 0x{config:02X}."
+                )
+
+            if not config & 0x08:
+                raise ValueError(
+                    "LTM4678 OPERATION on/off control is ignored "
+                    "with the current ON_OFF_CONFIG. "
+                    "ON_OFF_CONFIG was not changed."
+                )
+
+        elif self.name == "LTM4673":
+            rule = self._metadata["write_value_rules"].get(
+                Cmd.ON_OFF_CONFIG
+            )
+            if rule is None or config not in rule["allowed"]:
+                raise ValueError(
+                    "ON_OFF_CONFIG is outside the LTM4673 "
+                    "profile policy."
+                )
+
+            if (config & 0x18) != 0x18:
+                raise ValueError(
+                    "LTM4673 all-channel output control requires "
+                    "ON_OFF_CONFIG bit 4 and bit 3 set. "
+                    "Otherwise startup is automatic or PMBus "
+                    "on/off control is ignored. "
+                    "ON_OFF_CONFIG was not changed."
+                )
+
+        else:
+            raise ValueError("Unsupported output-control model.")
+
+    def _check_all_operation_mask(self):
+        """Require all four LTM4673 channels without changing the mask."""
+        if self.name != "LTM4673":
+            return
+
+        cmd = self.command_code("MFR_PAGE_FF_MASK")
+        descriptor = (
+            "MFR_PAGE_FF_MASK", "byte", "BYTE", False
+        )
+        if (
+            cmd != 0xE4
+            or self._regmap.get(cmd) != descriptor
+            or not self.can_read_register(cmd, "byte")
+        ):
+            raise ValueError(
+                "LTM4673 MFR_PAGE_FF_MASK access is unavailable."
+            )
+
+        raw = self.read_register(None, cmd)
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, int)
+            or not 0 <= raw <= 0x0F
+        ):
+            raise OSError(
+                f"Invalid MFR_PAGE_FF_MASK response: {raw!r}."
+            )
+
+        if raw != 0x0F:
+            raise ValueError(
+                f"MFR_PAGE_FF_MASK is 0x{raw:02X}. "
+                "All-channel control requires 0x0F. "
+                "No OPERATION was sent and the mask was not changed."
+            )
+
+    def apply_operation_all(self, target_raw):
+        """Send one OPERATION command to all channels of this device.
+
+        Uses PAGE 0xFF at the individual device address.
+        LTM4673 requires every channel enabled in MFR_PAGE_FF_MASK.
+        Readback uses explicit individual pages.
+        No ON_OFF_CONFIG or mask changes, rollback or NVM store.
+        """
+        report = {
+            "ok": False,
+            "target_raw": target_raw,
+            "attempted": False,
+            "write_completed": False,
+            "channels": [],
+            "error": None,
+            "exception": None,
+            "disconnect": None,
+        }
+
+        with self._lock:
+            active = "Validate all-channel OPERATION"
+
+            try:
+                expected_pages = {
+                    "LTM4673": 4,
+                    "LTM4677": 2,
+                    "LTM4678": 2,
+                }
+
+                if (
+                    not self._identified
+                    or self.name not in expected_pages
+                    or self.num_pages != expected_pages[self.name]
+                ):
+                    raise ValueError(
+                        "An identified supported device with "
+                        "the expected page count is required."
+                    )
+
+                if (
+                    getattr(self, "is_demo", False)
+                    and not getattr(
+                        self, "demo_output_control_enabled", False
+                    )
+                ):
+                    raise ValueError(
+                        "Demo output control is disabled."
+                    )
+
+                descriptors = {
+                    Cmd.OPERATION: (
+                        "OPERATION", "byte", "BYTE", True
+                    ),
+                    Cmd.ON_OFF_CONFIG: (
+                        "ON_OFF_CONFIG", "byte", "BYTE", True
+                    ),
+                }
+
+                for cmd, descriptor in descriptors.items():
+                    if self._regmap.get(cmd) != descriptor:
+                        raise ValueError(
+                            "Unexpected output-control descriptor."
+                        )
+                    if not self.can_read_register(cmd, "byte"):
+                        raise ValueError(
+                            f"{descriptor[0]} cannot be read."
+                        )
+
+                self.validate_register_raw(
+                    Cmd.OPERATION, target_raw, "byte"
+                )
+
+                status_cmd = self.command_code("STATUS_WORD")
+                status_info = self._regmap.get(status_cmd)
+                if (
+                    status_info is None
+                    or status_info[1] != "word"
+                    or not status_info[3]
+                    or not self.can_read_register(status_cmd, "word")
+                ):
+                    raise ValueError(
+                        "Paged STATUS_WORD access is unavailable."
+                    )
+
+                def read_control(cmd):
+                    raw = self._read_scalar(cmd)
+                    if (
+                        isinstance(raw, bool)
+                        or not isinstance(raw, int)
+                        or not 0 <= raw < 0xFF
+                    ):
+                        raise OSError(
+                            f"Invalid control response at 0x{cmd:02X}: "
+                            f"{raw!r}"
+                        )
+                    return raw
+
+                active = "Check all-channel broadcast mask"
+                self._check_all_operation_mask()
+
+                # Validate every target before sending OPERATION.
+                for page in range(self.num_pages):
+                    active = f"Check control pair on PAGE {page}"
+
+                    if not self.set_page(page):
+                        raise OSError(
+                            self.last_error
+                            or f"Cannot select PAGE {page}."
+                        )
+
+                    previous = read_control(Cmd.OPERATION)
+                    config = read_control(Cmd.ON_OFF_CONFIG)
+
+                    channel = {
+                        "page": page,
+                        "previous_raw": previous,
+                        "on_off_config_raw": config,
+                        "actual_raw": None,
+                        "verified": False,
+                        "status_word_raw": None,
+                        "off": None,
+                    }
+                    report["channels"].append(channel)
+
+                    self._validate_all_operation_pair(
+                        config, target_raw
+                    )
+
+                active = "Wait before selecting all channels"
+                if not self._wait_ready():
+                    raise OSError(
+                        self.last_error or "Device is not ready."
+                    )
+
+                active = "Recheck all-channel broadcast mask"
+                self._check_all_operation_mask()
+
+                active = "Select PAGE 0xFF"
+                self._page = None
+
+                if not self._write_transport(
+                    Cmd.PAGE, 0xFF, "byte"
+                ):
+                    raise OSError(
+                        self.last_error
+                        or "Cannot select all channels."
+                    )
+
+                # Never read paged registers while PAGE is 0xFF.
+                # LTM4673 reports CML for such reads.
+                self._page = 0xFF
+                time.sleep(PAGE_PAUSE)
+
+                active = "Wait before all-channel OPERATION"
+                if not self._wait_ready():
+                    raise OSError(
+                        self.last_error or "Device is not ready."
+                    )
+
+                active = "Write OPERATION to all channels"
+                report["attempted"] = True
+
+                if not self._write_transport(
+                    Cmd.OPERATION, target_raw, "byte"
+                ):
+                    raise OSError(
+                        self.last_error or "OPERATION write failed."
+                    )
+
+                report["write_completed"] = True
+
+                # Leave broadcast selection out of the software cache.
+                # Every following paged read selects an explicit page.
+                self._page = None
+
+                for channel in report["channels"]:
+                    page = channel["page"]
+                    active = f"Read OPERATION on PAGE {page}"
+
+                    if self.name == "LTM4677":
+                        actual = self.read_ltm4677_control_readback(
+                            page, Cmd.OPERATION
+                        )
+                    else:
+                        actual = self.read_register(
+                            page, Cmd.OPERATION
+                        )
+
+                    if (
+                        isinstance(actual, bool)
+                        or not isinstance(actual, int)
+                        or not 0 <= actual < 0xFF
+                    ):
+                        raise OSError(
+                            f"PAGE {page}: OPERATION readback failed."
+                        )
+
+                    channel["actual_raw"] = actual
+                    channel["verified"] = actual == target_raw
+
+                    if not channel["verified"]:
+                        raise OSError(
+                            f"PAGE {page}: OPERATION mismatch; "
+                            f"requested 0x{target_raw:02X}, "
+                            f"received 0x{actual:02X}."
+                        )
+
+                # Output state is an observation, not a condition
+                # for successful OPERATION register verification.
+                for channel in report["channels"]:
+                    page = channel["page"]
+                    active = f"Read STATUS_WORD on PAGE {page}"
+                    status = self.read_register(page, status_cmd)
+
+                    if (
+                        isinstance(status, bool)
+                        or not isinstance(status, int)
+                        or not 0 <= status < 0xFFFF
+                    ):
+                        raise OSError(
+                            f"PAGE {page}: invalid STATUS_WORD "
+                            f"response {status!r}."
+                        )
+
+                    channel["status_word_raw"] = status
+                    channel["off"] = bool(status & 0x0040)
+
+                report["ok"] = True
+
+            except TransportDisconnectedError as exc:
+                report["disconnect"] = exc
+                report["exception"] = exc
+                report["error"] = f"{active}\n{exc}"
+
+            except Exception as exc:
+                report["exception"] = exc
+                report["error"] = f"{active}\n{exc}"
+
+            finally:
+                # No cleanup transactions after failure.
+                # The next paged operation selects its own page.
+                self._page = None
+
+            return report
+
+    def apply_ltm4677_operation_both(self, target_raw):
+        """Compatibility entry point restricted to LTM4677."""
+        with self._lock:
+            if self.name != "LTM4677":
+                exc = ValueError(
+                    "An identified two-page LTM4677 is required."
+                )
+                return {
+                    "ok": False,
+                    "target_raw": target_raw,
+                    "attempted": False,
+                    "write_completed": False,
+                    "channels": [],
+                    "error": str(exc),
+                    "exception": exc,
+                    "disconnect": None,
+                }
+
+            return self.apply_operation_all(target_raw)
+
+    def _write_ltm4677_control_checked(
+        self, page, cmd, value, size
+    ):
+        """Check the live same-page pair before a control write.
+
+        The lock covers context reads and configuration transport.
+        No rollback, output sequencing or NVM store is performed.
+        Private transport callers must not bypass this guard.
+        """
+        with self._lock:
+            previous = None
+
+            def blocked(message):
+                return ControlWriteBlockedError(
+                    message,
+                    page=page,
+                    cmd=cmd,
+                    previous_raw=previous,
+                )
+
+            try:
+                if (
+                    not self._identified
+                    or self.name != "LTM4677"
+                    or self.num_pages != 2
+                ):
+                    raise ValueError(
+                        "An identified two-page LTM4677 is required."
+                    )
+
+                if getattr(self, "is_demo", False):
+                    raise ValueError("Demo writes are disabled.")
+
+                if not self._valid_page(page):
+                    raise ValueError(
+                        "An explicit PAGE 0 or PAGE 1 is required. "
+                        "Broadcast control writes are blocked."
+                    )
+
+                descriptors = {
+                    Cmd.OPERATION: (
+                        "OPERATION", "byte", "BYTE", True
+                    ),
+                    Cmd.ON_OFF_CONFIG: (
+                        "ON_OFF_CONFIG", "byte", "BYTE", True
+                    ),
+                }
+
+                if cmd not in descriptors:
+                    raise ValueError("Unexpected control command.")
+
+                for code, descriptor in descriptors.items():
+                    if self._regmap.get(code) != descriptor:
+                        raise ValueError(
+                            "Unexpected LTM4677 control descriptor."
+                        )
+                    if not self.can_read_register(code, "byte"):
+                        raise ValueError(
+                            f"{descriptor[0]} cannot be read."
+                        )
+
+                if size != "byte":
+                    raise ValueError(
+                        "Control writes require byte access."
+                    )
+
+                # Preserve all existing access and profile rules.
+                self.validate_register_raw(cmd, value, size)
+
+                if not self.set_page(page):
+                    raise OSError(
+                        self.last_error
+                        or "Cannot select the control page."
+                    )
+
+                def read_control(code):
+                    raw = self._read_scalar(code)
+                    if (
+                        isinstance(raw, bool)
+                        or not isinstance(raw, int)
+                        or not 0 <= raw <= 0xFF
+                        or raw == 0xFF
+                    ):
+                        raise OSError(
+                            f"Cannot confirm {descriptors[code][0]} "
+                            f"on PAGE {page}. "
+                            f"Response was {raw!r}."
+                        )
+                    return raw
+
+                # Read the edited register first so a confirmed
+                # display value is available if context reading fails.
+                previous = read_control(cmd)
+
+                other_cmd = (
+                    Cmd.ON_OFF_CONFIG
+                    if cmd == Cmd.OPERATION
+                    else Cmd.OPERATION
+                )
+                other = read_control(other_cmd)
+
+                config = (
+                    value
+                    if cmd == Cmd.ON_OFF_CONFIG
+                    else other
+                )
+                operation = (
+                    value
+                    if cmd == Cmd.OPERATION
+                    else other
+                )
+
+                try:
+                    self.validate_ltm4677_operation_target(
+                        config, operation
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"PAGE {page}\n"
+                        f"Proposed ON_OFF_CONFIG = 0x{config:02X}\n"
+                        f"Proposed OPERATION = 0x{operation:02X}\n\n"
+                        "This combination is not supported by "
+                        "Tables 21 and 22 of the LTM4677 "
+                        "Rev. B datasheet.\n"
+                        f"{exc}"
+                    ) from exc
+
+                if not self._wait_ready():
+                    raise OSError(
+                        self.last_error
+                        or "Control write readiness was not confirmed."
+                    )
+
+            except TransportDisconnectedError:
+                raise
+
+            except ControlWriteBlockedError:
+                raise
+
+            except Exception as exc:
+                raise blocked(str(exc)) from exc
+
+            # All pre-write checks have completed.
+            # Keep the device lock held through the transport call.
+            # Transport failures below are NOT pre-write rejections.
+            return self._write_transport(cmd, value, size)
+
     def _write_checked(self, cmd, value, size):
         with self._lock:
+            if self._is_ltm4677_control_command(cmd):
+                return self._write_ltm4677_control_checked(
+                    self._page,
+                    cmd,
+                    value,
+                    size,
+                )
+
             try:
                 self.validate_register_raw(
-                    cmd, value, size
+                    cmd,
+                    value,
+                    size,
                 )
             except ValueError as exc:
                 error_cmd = (
@@ -2954,11 +4957,11 @@ class PMBusDevice:
                     else 0
                 )
                 self._error(
-                    "write_register", error_cmd, exc
+                    "write_register",
+                    error_cmd,
+                    exc,
                 )
                 return False
-
-
 
             if self._regmap[cmd][3]:
                 page = self._page
@@ -2967,7 +4970,11 @@ class PMBusDevice:
             elif not self._wait_ready():
                 return False
 
-            return self._write_transport(cmd, value, size)
+            return self._write_transport(
+                cmd,
+                value,
+                size,
+            )
 
     def write_byte_data(self, cmd, val):
         return self._write_checked(cmd, val, "byte")
@@ -3082,7 +5089,7 @@ class PMBusDevice:
                 self._identifying = True
 
                 for page in range(pages):
-                    if not self.set_page(page):
+                    if not self._set_page_for_read(page):
                         raise OSError(f"Cannot select PAGE {page}")
 
                     mode = self._rb(Cmd.VOUT_MODE)
@@ -3108,7 +5115,7 @@ class PMBusDevice:
                 self.pmbus_revision = self._rb(Cmd.PMBUS_REVISION)
                 self.revision = f"ID revision 0x{sid & 0x0F:X}"
 
-                if not self.set_page(0):
+                if not self._set_page_for_read(0):
                     raise OSError("Cannot restore PAGE 0")
 
                 self._identified = True
@@ -3166,17 +5173,75 @@ class PMBusDevice:
             raw, info[2], exponent if exponent is not None else -13
         )
 
+    def _select_page_for_observation(self, page):
+        """Use the common verified observation PAGE path."""
+        return self._set_page_for_read(page)
+
+    def read_ltm4677_control_readback(self, page, cmd):
+        """Read LTM4677 control registers during a transition.
+
+        This method is for observation after a command has been sent.
+        It deliberately does not call _wait_ready().
+        """
+
+        with self._lock:
+            if (
+                self.name != "LTM4677"
+                or not self._identified
+                or self.num_pages != 2
+                or not self._valid_page(page)
+                or cmd not in {
+                    Cmd.OPERATION,
+                    Cmd.ON_OFF_CONFIG,
+                }
+            ):
+                return None
+
+            if not self.can_read_register(cmd, "byte"):
+                return None
+
+            if not self._select_page_for_observation(page):
+                return None
+
+            raw = self._read_transport(
+                cmd,
+                "byte",
+                attempts=1,
+                quiet=True,
+            )
+
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not 0 <= raw <= 0xFF
+                or raw == 0xFF
+            ):
+                self._error(
+                    "control_readback",
+                    cmd,
+                    f"Invalid control response: {raw!r}",
+                )
+                return None
+
+            return raw
+
     def read_register(self, page, cmd):
         with self._lock:
-            if not self._identified or not self.can_read_register(cmd):
+            if (
+                not self._identified
+                or not self.can_read_register(cmd)
+            ):
                 self._error(
-                    "read_register", cmd,
+                    "read_register",
+                    cmd,
                     "Generic register read unavailable",
                 )
                 return None
 
-            if self._regmap[cmd][3] and not self.set_page(page):
-                return None
+            if self._regmap[cmd][3]:
+                if not self._set_page_for_read(page):
+                    return None
+
             return self._read_scalar(cmd)
 
     def _config_commands(self, paged):
@@ -3198,7 +5263,7 @@ class PMBusDevice:
             if not self._identified:
                 return {}
 
-            ready = not paged or self.set_page(page)
+            ready = not paged or self._set_page_for_read(page)
             result = {}
             for cmd in self._config_commands(paged):
                 name, _, fmt, _ = self._regmap[cmd]
@@ -3257,18 +5322,51 @@ class PMBusDevice:
 
     def _read_named_telemetry(self, names, page):
         result = dict.fromkeys(names)
+
         with self._lock:
-            if not self._identified or not self.set_page(page):
+            if not self._identified:
                 return result
+
+            if self.name != "LTM4677":
+                if not self.set_page(page):
+                    return result
+
+                for label, name in names.items():
+                    cmd = self.command_code(name)
+                    if cmd is None or not self.can_read_register(cmd):
+                        continue
+
+                    raw = self._read_scalar(cmd)
+                    result[label] = self._decode(
+                        cmd, raw, page, custom=True
+                    )
+
+                return result
+
+            page_selected = False
 
             for label, name in names.items():
                 cmd = self.command_code(name)
+
                 if cmd is None or not self.can_read_register(cmd):
                     continue
+
+                if self._regmap[cmd][3] and not page_selected:
+                    if not self._set_page_for_read(page):
+                        return result
+                    page_selected = True
+
+                if not self._wait_ltm4677_observation_ready():
+                    return result
+
                 raw = self._read_scalar(cmd)
+                if raw is None:
+                    return result
+
                 result[label] = self._decode(
                     cmd, raw, page, custom=True
                 )
+
         return result
 
     def read_global_telemetry(self):
@@ -3407,11 +5505,28 @@ class PMBusDevice:
             "STATUS_MFR": Cmd.STATUS_MFR_SPECIFIC,
         }
         result = dict.fromkeys(commands)
+
         with self._lock:
-            if not self._identified or not self.set_page(page):
+            if not self._identified:
                 return result
+
+            if not self._set_page_for_read(page):
+                return result
+
             for name, cmd in commands.items():
-                result[name] = self._read_scalar(cmd)
+                if not self.can_read_register(cmd):
+                    continue
+
+                if self.name == "LTM4677":
+                    if not self._wait_ltm4677_observation_ready():
+                        return result
+
+                raw = self._read_scalar(cmd)
+                result[name] = raw
+
+                if raw is None:
+                    return result
+
         return result
 
     def read_status(self, page=0):
@@ -3422,10 +5537,20 @@ class PMBusDevice:
 
     def write_register(self, page, cmd_code, raw_value, size):
         with self._lock:
+            if self._is_ltm4677_control_command(cmd_code):
+                return self._write_ltm4677_control_checked(
+                    page,
+                    cmd_code,
+                    raw_value,
+                    size,
+                )
+
             # Validate before PAGE selection or any device I/O.
             try:
                 self.validate_register_raw(
-                    cmd_code, raw_value, size
+                    cmd_code,
+                    raw_value,
+                    size,
                 )
             except ValueError as exc:
                 error_cmd = (
@@ -3436,7 +5561,9 @@ class PMBusDevice:
                     else 0
                 )
                 self._error(
-                    "write_register", error_cmd, exc
+                    "write_register",
+                    error_cmd,
+                    exc,
                 )
                 return False
 
@@ -3445,7 +5572,9 @@ class PMBusDevice:
                     return False
 
             return self._write_checked(
-                cmd_code, raw_value, size
+                cmd_code,
+                raw_value,
+                size,
             )
 
     def encode_register_value(self, page, cmd, value, fmt):
@@ -3667,7 +5796,7 @@ class PMBusDevice:
                 self._valid_page(previous_page)
                 and self._page != previous_page
             ):
-                if not self.set_page(previous_page):
+                if not self._set_page_for_read(previous_page):
                     raise OSError(
                         "Full dump read completed, but restoring "
                         f"PAGE {previous_page} failed"
@@ -3679,7 +5808,7 @@ class PMBusDevice:
         with self._lock:
             if not self._identified:
                 raise RuntimeError("Device is not identified")
-            if not self.set_page(page):
+            if not self._set_page_for_read(page):
                 raise OSError(f"Cannot select PAGE {page}")
 
             result = []
@@ -3697,7 +5826,9 @@ class PMBusDevice:
                     "format": fmt,
                     "is_paged": paged,
                     "raw": raw,
-                    "decoded": self._decode(cmd, raw, page),
+                    "decoded": self._decode(
+                        cmd, raw, page, custom=True
+                    ),
                     "readonly": not self.can_write_register(cmd, size),
                 })
             return result
@@ -3734,9 +5865,7 @@ def diagnostic_read_ltm4677_current(device):
                 raw = device.read_register(page, cmd)
 
                 if raw is None:
-                    print(
-                        f"{name:22} raw=None"
-                    )
+                    print(f"{name:22} raw=None")
                     continue
 
                 try:
@@ -3756,6 +5885,9 @@ def diagnostic_read_ltm4677_current(device):
                     f"raw=0x{raw:0{width}X}  "
                     f"decoded={decoded!r}"
                 )
+
+            except TransportDisconnectedError:
+                raise
 
             except Exception as exc:
                 print(
@@ -3781,10 +5913,14 @@ def diagnostic_read_ltm4677_current(device):
                     f"{telemetry.get(key)!r}"
                 )
 
+        except TransportDisconnectedError:
+            raise
+
         except Exception as exc:
             print(f"public telemetry ERROR: {exc}")
 
         print()
+
 
 def diagnostic_repeat_ltm4677_current(device, count=10):
     """Repeat read-only LTM4677 current and channel diagnostics."""
@@ -3815,6 +5951,7 @@ def diagnostic_repeat_ltm4677_current(device, count=10):
 
     print()
     print("GLOBAL")
+
     for name, cmd in global_commands:
         try:
             raw = device.read_register(0, cmd)
@@ -3823,6 +5960,9 @@ def diagnostic_repeat_ltm4677_current(device, count=10):
                 print(f"{name:24} raw=None")
             else:
                 print(f"{name:24} raw=0x{raw:02X}")
+
+        except TransportDisconnectedError:
+            raise
 
         except Exception as exc:
             print(f"{name:24} ERROR: {exc}")
@@ -3841,14 +5981,20 @@ def diagnostic_repeat_ltm4677_current(device, count=10):
                     if raw is None:
                         text = "None"
                     else:
-                        width = 2 if cmd == 0x80 else 4
+                        size = device._regmap[cmd][1]
+                        width = 2 if size == "byte" else 4
                         text = f"0x{raw:0{width}X}"
 
                     values.append(f"{name}={text}")
+
+                except TransportDisconnectedError:
+                    raise
 
                 except Exception as exc:
                     values.append(
                         f"{name}=ERROR:{exc}"
                     )
 
-            print(f"{sample + 1:02d}: " + " ".join(values))
+            print(
+                f"{sample + 1:02d}: " + " ".join(values)
+            )

@@ -123,7 +123,15 @@ def dump_to_csv_string(device, dump_data, page, *, metadata=None):
         else:
             rh = rd = "N/A"
         dec = r.get("decoded")
-        ds = f"{dec:.6f}" if dec is not None and r['format'] in ('L11','L16') else (str(int(dec)) if dec is not None else "N/A")
+
+        if dec is None:
+            ds = "N/A"
+        elif r["format"] in ("L11", "L16"):
+            ds = f"{dec:.6f}"
+        elif isinstance(dec, float):
+            ds = repr(dec)
+        else:
+            ds = str(dec)
         w.writerow([r['page'], f"0x{r['cmd']:02X}", r['cmd'], r['name'],
                      r['size'], r['format'], 'Y' if r.get('is_paged') else 'N',
                      rh, rd, ds, 'YES' if r['readonly'] else 'NO'])
