@@ -23,6 +23,9 @@ def get_device_profile(special_id):
                 info['name'],
                 info['num_pages'],
                 {
+                    'address_registers': getattr(
+                        mod, 'ADDRESS_REGISTERS', None
+                    ),
                     'register_overrides': getattr(
                         mod, 'REGISTER_OVERRIDES', {}
                     ),
