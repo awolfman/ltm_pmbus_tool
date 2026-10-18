@@ -7,6 +7,19 @@ register_device(0x0230, "LTM4673", 4, __name__)
 
 VOUT_EXPONENT = -13
 
+# Address register identity only, not a transition policy.
+# 0xFA is current-sense telemetry on this model, not a rail address.
+ADDRESS_REGISTERS = (
+    (
+        0xE6,
+        "MFR_I2C_BASE_ADDRESS",
+        "byte",
+        "BYTE",
+        False,
+        "individual_base",
+    ),
+)
+
 REGISTER_OVERRIDES = {
     0x38: ("IOUT_CAL_GAIN", "word", "L11", True),
     0x4B: ("IOUT_UC_FAULT_LIMIT", "word", "L11", True),
