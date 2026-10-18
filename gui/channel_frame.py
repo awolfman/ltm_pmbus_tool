@@ -114,6 +114,53 @@ class ChannelColumn(ttk.LabelFrame):
         self._build_telemetry()
         self._build_config()
         self._build_status()
+        self.update_rail_address()
+
+    def update_rail_address(self, *, disconnected=False):
+        """Show the channel's last-read rail RAW without device I/O."""
+        if self.device.name != "LTM4677":
+            return
+
+        editor = self.config_editor
+        item = editor._rows.get(0xFA)
+
+        if disconnected or editor._stale:
+            text = "STALE"
+
+        elif item is None:
+            text = "N/A"
+
+        else:
+            raw = item["baseline_raw"]
+
+            if raw is None:
+                displayed = item["variable"].get()
+                text = (
+                    displayed
+                    if displayed in {
+                        "---", "ERR", "N/A", "N/S", "STALE",
+                    }
+                    else "---"
+                )
+
+            elif (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not 0 <= raw <= 0xFF
+            ):
+                text = "ERR"
+
+            else:
+                text = f"0x{raw:02X}"
+
+                if raw == 0x80:
+                    text += " / disabled"
+                elif not 0x08 <= raw <= 0x77:
+                    text += " / check RAW"
+
+        self.configure(
+            text=f"  CH{self.page}   MFR_RAIL_ADDRESS {text}  "
+        )
 
     #   telemetry
     def _build_telemetry(self):

@@ -10,7 +10,12 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from core.bus_scanner import find_buses, scan_bus, bus_label
+from core.bus_scanner import (
+    find_buses,
+    scan_bus,
+    bus_label,
+    validate_individual_device_address,
+)
 from core.bus_factory import (
     CH341_OFFSET,
     FTDI_OFFSET,
@@ -31,7 +36,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("LTM PMBus Tool v4.8.11")
+        self.title("LTM PMBus Tool v4.8.14")
         self.geometry("1380x850")
         self.minsize(1100, 700)
 
@@ -144,6 +149,13 @@ class App(tk.Tk):
             command=self.connect_manual,
         )
         self.connect_btn.pack(side="left", padx=3)
+
+        self.exit_btn = ttk.Button(
+            toolbar,
+            text="Exit",
+            command=self._quit,
+        )
+        self.exit_btn.pack(side="right", padx=3)
 
     def _refresh_buses_silent(self):
         new_map = {}
@@ -258,7 +270,7 @@ class App(tk.Tk):
         tk.Label(
             frame,
             text=(
-                "LTM PMBus Tool v4.8.11\n\n"
+                "LTM PMBus Tool v4.8.14\n\n"
                 "Device profiles\n"
                 "LTM4673 / LTM4677 / LTM4678\n\n"
                 "USB adapters\n"
@@ -437,6 +449,18 @@ class App(tk.Tk):
             )
             return
 
+        try:
+            validate_individual_device_address(
+                bus_num, address
+            )
+        except ValueError as exc:
+            messagebox.showerror(
+                "Address blocked",
+                str(exc),
+                parent=self,
+            )
+            return
+
         for tab in self.tabs:
             device = tab.device
             if (
@@ -492,7 +516,18 @@ class App(tk.Tk):
         self._closing = True
 
         try:
-            self._stop_monitoring()
-            close_all_buses()
+            try:
+                self._stop_monitoring()
+            except Exception:
+                logger.exception(
+                    "Failed to stop monitoring during shutdown"
+                )
+
+            try:
+                close_all_buses()
+            except Exception:
+                logger.exception(
+                    "Failed to close buses during shutdown"
+                )
         finally:
             self.destroy()

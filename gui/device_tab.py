@@ -72,6 +72,264 @@ class DeviceTab(ttk.Frame):
         self._build_buttons()
         self.do_read_all()
 
+    def _output_control_available(self):
+        device = self.device
+        expected_pages = {
+            "LTM4673": 4,
+            "LTM4677": 2,
+            "LTM4678": 2,
+        }
+
+        return (
+            not self._disconnected
+            and device.identified
+            and device.name in expected_pages
+            and device.num_pages == expected_pages[device.name]
+            and (
+                not getattr(device, "is_demo", False)
+                or getattr(
+                    device, "demo_output_control_enabled", False
+                )
+            )
+        )
+
+    def _build_output_controls(self, parent):
+        panel = ttk.LabelFrame(
+            parent,
+            text=" Output Control ",
+        )
+        panel.pack(
+            side="right",
+            fill="y",
+            padx=(4, 2),
+        )
+
+        ttk.Label(
+            panel,
+            text=(
+                f"All {self.device.num_pages} channels\n"
+                f"{self.device.name} / "
+                f"0x{self.device.address:02X}"
+            ),
+            justify="center",
+            anchor="center",
+        ).pack(fill="x", padx=5, pady=(5, 3))
+
+        self._both_operation_buttons = {}
+
+        for raw, label in (
+            (0x80, "All On"),
+            (0x40, "All Sequence Off"),
+            (0x00, "All Immediate Off"),
+        ):
+            button = ttk.Button(
+                panel,
+                text=label,
+                width=19,
+                command=lambda value=raw:
+                    self.do_operation_both(value),
+            )
+            button.pack(fill="x", padx=5, pady=3)
+            self._both_operation_buttons[raw] = button
+
+            if not self._output_control_available():
+                button.state(["disabled"])
+
+        if not self._output_control_available():
+            notice = "Control unavailable"
+        elif getattr(self.device, "is_demo", False):
+            notice = "DEMO\nMemory only"
+        else:
+            notice = "This device only"
+
+        ttk.Label(
+            panel,
+            text=notice,
+            justify="center",
+            anchor="center",
+        ).pack(fill="x", padx=5, pady=(4, 5))
+
+    def do_operation_both(self, target_raw):
+        return self._run_guarded_action(
+            lambda: self._do_operation_both_impl(target_raw)
+        )
+
+    def _do_operation_both_impl(self, target_raw):
+        if not self._output_control_available():
+            return
+
+        labels = {
+            0x80: "On",
+            0x40: "Sequence Off",
+            0x00: "Immediate Off",
+        }
+
+        if target_raw not in labels:
+            raise ValueError("Unsupported all-channel action.")
+
+        demo = getattr(self.device, "is_demo", False)
+
+        mode_notice = (
+            "DEMO: register changes are simulated in memory.\n"
+            "No hardware access. Transition timing is not simulated.\n\n"
+            if demo else ""
+        )
+
+        confirmed = messagebox.askyesno(
+            f"All {self.device.name} channels",
+            (
+                f"{self.device.name} at "
+                f"0x{self.device.address:02X}\n\n"
+                f"{mode_notice}"
+                f"OPERATION = 0x{target_raw:02X} / "
+                f"{labels[target_raw]}\n\n"
+                "Send one command to all channels using PAGE 0xFF?\n"
+                "Every channel control pair will be checked first.\n"
+                "ON_OFF_CONFIG will not be changed.\n"
+                "LTM4673 requires MFR_PAGE_FF_MASK = 0x0F.\n"
+                "The mask will not be changed automatically.\n\n"
+                "OPERATION fields will be replaced by readback or ERR.\n"
+                "Other Config input will be preserved.\n"
+                "Monitoring will stop. NVM will not be stored."
+            ),
+            parent=self,
+        )
+
+        if not confirmed or not self._output_control_available():
+            return
+
+        self.stop_all()
+        button = self._both_operation_buttons[target_raw]
+
+        try:
+            with self._button_activity(button, "Writing..."):
+                report = self.device.apply_operation_all(
+                    target_raw
+                )
+
+                if report["disconnect"] is not None:
+                    exc = report["disconnect"]
+                    self._handle_disconnect(
+                        type(exc)(
+                            self._operation_both_report_text(report)
+                        )
+                    )
+                    return
+
+                if report["attempted"]:
+                    by_page = {
+                        item["page"]: item
+                        for item in report["channels"]
+                    }
+
+                    for channel in self.channels:
+                        result = by_page.get(channel.page, {})
+                        editor = channel.config_editor
+
+                        if 0x01 in editor._rows:
+                            editor._show(
+                                0x01, result.get("actual_raw")
+                            )
+
+                        channel.update_status({
+                            "STATUS_WORD": result.get(
+                                "status_word_raw"
+                            ),
+                        })
+
+        except TransportDisconnectedError as exc:
+            self._handle_disconnect(exc)
+            return
+
+        except Exception as exc:
+            messagebox.showerror(
+                "All-channel operation failed",
+                f"{exc}\n\n"
+                "The operation may have reached the device.\n"
+                "No automatic retry or rollback was performed.\n"
+                "Monitoring remains stopped.",
+                parent=self,
+            )
+            return
+
+        text = self._operation_both_report_text(report)
+
+        if demo:
+            text = (
+                "DEMO: in-memory register verification only.\n"
+                "No physical output was controlled.\n\n"
+                + text
+            )
+
+        if report["ok"]:
+            messagebox.showinfo(
+                "All-channel OPERATION verified",
+                text,
+                parent=self,
+            )
+        else:
+            messagebox.showwarning(
+                "All-channel operation stopped",
+                text,
+                parent=self,
+            )
+
+    @staticmethod
+    def _operation_both_report_text(report):
+        lines = [
+            f"Target OPERATION = 0x{report['target_raw']:02X}",
+            f"Control write attempted = {report['attempted']}",
+            f"Transport completed = {report['write_completed']}",
+        ]
+
+        for item in report["channels"]:
+            actual = item["actual_raw"]
+            actual_text = (
+                "unknown" if actual is None
+                else f"0x{actual:02X}"
+            )
+            verified = (
+                "matched" if item["verified"] else "not verified"
+            )
+
+            status = item["status_word_raw"]
+            status_text = (
+                "unknown" if status is None
+                else f"0x{status:04X}"
+            )
+            off_text = (
+                "unknown" if item["off"] is None
+                else "set" if item["off"] else "clear"
+            )
+
+            lines.extend((
+                "",
+                f"PAGE {item['page']}",
+                f"OPERATION = {actual_text} / {verified}",
+                f"STATUS_WORD = {status_text}",
+                f"OFF bit = {off_text}",
+            ))
+
+        if report["error"]:
+            lines.extend(("", report["error"]))
+
+        if not report["attempted"]:
+            lines.extend((
+                "",
+                "No OPERATION write was sent.",
+                "Service PAGE writes may have occurred.",
+            ))
+
+        lines.extend((
+            "",
+            "Register verification does not confirm output voltage.",
+            "Status values are point-in-time observations.",
+            "No automatic retry, rollback or NVM store.",
+            "Monitoring remains stopped.",
+        ))
+
+        return "\n".join(lines)
+
     def _check_full_restore_impl(self):
         """Run diagnostic preflight under the existing action guard."""
         if not self._allow_device_action():
@@ -143,12 +401,31 @@ class DeviceTab(ttk.Frame):
                 try:
                     report = (
                         self.device.preflight_ltm4677_full_restore(
-                            metadata, records
+                            deepcopy(metadata),
+                            deepcopy(records),
                         )
                     )
                     self._full_restore_report = report
 
+                    report["offline_summary"] = None
+                    report["offline_summary_error"] = None
+
+                    if report.get("inspection") is not None:
+                        try:
+                            report["offline_summary"] = (
+                                self.device.summarize_ltm4677_full_restore(
+                                    metadata, records, report
+                                )
+                            )
+                        except Exception as exc:
+                            # Do not replace the original diagnostic
+                            # error or prevent disconnect handling.
+                            report["offline_summary_error"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+
                     disconnect = report.get("disconnect")
+
                     if disconnect is not None:
                         # Mark stale before leaving the activity
                         # context so controls cannot be re-enabled.
@@ -176,7 +453,11 @@ class DeviceTab(ttk.Frame):
 
         text = self._full_restore_report_text(report)
 
-        if report["ok"]:
+        if (
+            report["ok"]
+            and report.get("offline_summary") is not None
+            and not report.get("offline_summary_error")
+        ):
             messagebox.showinfo(
                 "Full Restore diagnostic check completed",
                 text,
@@ -260,6 +541,251 @@ class DeviceTab(ttk.Frame):
 
         if report.get("error"):
             lines.extend(("", str(report["error"])))
+
+        summary = report.get("offline_summary")
+
+        if summary is None:
+            lines.extend((
+                "",
+                "Combined offline audit unavailable.",
+                "Planner blockers have not been displayed.",
+            ))
+
+            summary_error = report.get("offline_summary_error")
+            if summary_error:
+                lines.append(str(summary_error))
+
+            # A preflight-only comparison remains diagnostic.
+            comparison = report.get("address_comparison")
+        else:
+            lines.extend((
+                "",
+                "Combined offline audit",
+                "Target consistency with saved inspection checked.",
+                "Saved diagnostic success is not restore readiness.",
+                "",
+                "Planner blockers",
+            ))
+
+            blockers = summary["plan"]["blockers"]
+            if blockers:
+                lines.extend(str(item) for item in blockers)
+            else:
+                lines.append(
+                    "No listed blockers; execution remains unauthorized."
+                )
+
+            comparison = summary.get("address_comparison")
+
+        lines.extend(("", "Address register RAW comparison"))
+
+        if comparison is None:
+            lines.append("Not performed.")
+        else:
+            status = comparison.get("status", "unresolved")
+            descriptions = {
+                "unchanged": (
+                    "All declared address RAW values match. "
+                    "Address semantics and bus safety are not established."
+                ),
+                "changed": (
+                    "Declared address RAW values differ. "
+                    "No address transition is authorized."
+                ),
+                "unresolved": (
+                    "Address comparison did not establish "
+                    "complete matching data."
+                ),
+            }
+            lines.append(descriptions.get(
+                status, descriptions["unresolved"]
+            ))
+
+            for item in comparison.get("entries", []):
+                scope = (
+                    "GLOBAL"
+                    if item["page"] is None
+                    else f"PAGE {item['page']}"
+                )
+                width = 2 if item["size"] == "byte" else 4
+                state = (
+                    "match"
+                    if item["matches_target"]
+                    else "different"
+                )
+                lines.append(
+                    f"{scope} / {item['name']} "
+                    f"0x{item['cmd']:02X} | "
+                    f"baseline 0x{item['current_raw']:0{width}X} | "
+                    f"target 0x{item['target_raw']:0{width}X} | "
+                    f"{state}"
+                )
+
+            for error in comparison.get("errors", []):
+                lines.append(str(error))
+
+        lines.extend(("", "Control register RAW comparison"))
+
+        if summary is None:
+            lines.append(
+                "Unavailable without a combined offline audit."
+            )
+        else:
+            controls = summary.get("control_comparison")
+
+            if controls is None:
+                lines.append("Not performed.")
+            else:
+                descriptions = {
+                    "unchanged": (
+                        "All control RAW values match."
+                    ),
+                    "changed": (
+                        "Control RAW values differ."
+                    ),
+                    "unresolved": (
+                        "Control comparison is unresolved. "
+                        "Review missing data and pair-policy results."
+                    ),
+                }
+                lines.append(descriptions.get(
+                    controls.get("status"),
+                    descriptions["unresolved"],
+                ))
+                lines.append(
+                    "RAW comparison complete"
+                    if controls.get("comparison_complete")
+                    else "RAW comparison incomplete"
+                )
+
+                def control_raw(raw):
+                    return "N/A" if raw is None else f"0x{raw:02X}"
+
+                for channel in controls.get("channels", []):
+                    lines.extend((
+                        "",
+                        f"PAGE {channel['page']}",
+                    ))
+
+                    for item in channel.get("registers", []):
+                        changed = item.get("changed")
+                        state = (
+                            "different" if changed is True
+                            else "match" if changed is False
+                            else "not compared"
+                        )
+                        lines.append(
+                            f"{item['name']} "
+                            f"0x{item['cmd']:02X} | "
+                            f"baseline {control_raw(item['current_raw'])} | "
+                            f"target {control_raw(item['target_raw'])} | "
+                            f"{state}"
+                        )
+
+                    for field, title in (
+                        ("baseline_policy", "Baseline pair policy"),
+                        ("target_policy", "Target pair policy"),
+                    ):
+                        policy = channel.get(field)
+                        state = (
+                            "not checked"
+                            if policy is None
+                            else "supported"
+                            if policy.get("supported") is True
+                            else "not supported"
+                        )
+                        lines.append(f"{title} | {state}")
+
+                    analysis = channel.get("transition_analysis")
+                    lines.append(
+                        "Hypothetical control pair analysis"
+                    )
+
+                    if analysis is None:
+                        lines.append(
+                            "Analysis unavailable in this report."
+                        )
+                    else:
+                        descriptions = {
+                            "no_control_changes": (
+                                "No changes to these two control "
+                                "registers are required by the saved RAW."
+                            ),
+                            "single_register_change": (
+                                "One control register differs. "
+                                "No intermediate pair is needed."
+                            ),
+                            "hypothetical_pairs_checked": (
+                                "Both hypothetical first-command "
+                                "cases were checked."
+                            ),
+                            "unresolved": (
+                                "Analysis unresolved. Complete "
+                                "supported endpoint pairs required."
+                            ),
+                        }
+                        lines.append(descriptions.get(
+                            analysis.get("status"),
+                            descriptions["unresolved"],
+                        ))
+
+                        for variant in analysis.get("variants", []):
+                            first = variant[
+                                "hypothetical_first_command"
+                            ]
+                            lines.append(
+                                f"Hypothetical first command | {first}"
+                            )
+
+                            for field, title in (
+                                ("intermediate_pair", "Intermediate pair"),
+                                ("target_pair", "Target pair"),
+                            ):
+                                pair = variant.get(field)
+                                if pair is None:
+                                    continue
+
+                                state = (
+                                    "supported"
+                                    if pair.get("supported") is True
+                                    else "not supported"
+                                )
+                                lines.append(
+                                    f"{title} | "
+                                    "ON_OFF_CONFIG "
+                                    f"{control_raw(pair['on_off_config_raw'])}"
+                                    " | OPERATION "
+                                    f"{control_raw(pair['operation_raw'])}"
+                                    f" | {state}"
+                                )
+                                if pair.get("error"):
+                                    lines.append(str(pair["error"]))
+
+                        for error in analysis.get("errors", []):
+                            lines.append(str(error))
+
+                        lines.append(
+                            "Hypothetical pairs are not observed "
+                            "hardware states or an execution plan."
+                        )
+
+                for error in controls.get("errors", []):
+                    lines.append(str(error))
+
+        lines.extend((
+            "",
+            "Matching control RAW does not establish outputs OFF.",
+            "Supported pairs do not establish transition safety.",
+            "No control write order is defined.",
+        ))
+
+        lines.extend((
+            "",
+            "Physical device identity is not established "
+            "by the combined report.",
+            "Baseline freshness and saved report authenticity "
+            "are not established.",
+        ))
 
         lines.extend((
             "",
@@ -606,9 +1132,11 @@ class DeviceTab(ttk.Frame):
             ):
                 messagebox.showwarning(
                     "Preview is outdated",
-                    "Config fields have changed since this "
-                    "preview was opened.\n\n"
-                    "Close this window and use Preview Changes again.",
+                    (
+                        "Config fields have changed since this "
+                        "preview was opened.\n\n"
+                        "Close this window and use Write All again."
+                    ),
                     parent=window,
                 )
                 return
@@ -787,7 +1315,7 @@ class DeviceTab(ttk.Frame):
                     raise ValueError(
                         "Preview is outdated.\n"
                         "Close this window and use "
-                        "Preview Changes again."
+                        "Write All again."
                     )
 
             ensure_current()
@@ -1246,8 +1774,8 @@ class DeviceTab(ttk.Frame):
         )
 
         info_items = [
-            ("IC", self.device.name),
             ("Address", f"0x{self.device.address:02X}"),
+            ("IC", self.device.name),
             (
                 "ID",
                 f"0x{self.device.special_id:04X}"
@@ -1381,6 +1909,8 @@ class DeviceTab(ttk.Frame):
             pady=2,
         )
 
+        self._build_output_controls(top)
+
         # Right: global status.
         gs = ttk.LabelFrame(
             top,
@@ -1511,7 +2041,7 @@ class DeviceTab(ttk.Frame):
 
         for text, command in [
             ("Read All", self.do_read_all),
-            ("Preview Changes", self.do_write_all),
+            ("Write All", self.do_write_all),
             ("Store NVM", self.do_store),
             ("Restore NVM", self.do_restore),
             ("Clear Faults", self.do_clear),
@@ -1699,6 +2229,16 @@ class DeviceTab(ttk.Frame):
             width=13 if full_mode else 11,
         )
 
+    def _update_address_info_from_config(self):
+        """Refresh channel address labels without device I/O."""
+        if self.device.name != "LTM4677":
+            return
+
+        for channel in self.channels:
+            channel.update_rail_address(
+                disconnected=self._disconnected
+            )
+
     def update_device_info(self):
         values = {
             "IC": self.device.name,
@@ -1722,6 +2262,7 @@ class DeviceTab(ttk.Frame):
             variable = self.device_info_vars.get(key)
             if variable is not None:
                 variable.set(str(value))
+        self._update_address_info_from_config()
 
     def _disable_controls(self, parent):
         for widget in parent.winfo_children():
@@ -1807,6 +2348,7 @@ class DeviceTab(ttk.Frame):
             if hasattr(channel, "config_editor"):
                 channel.config_editor.mark_stale()
 
+        self._update_address_info_from_config()
         self.global_cfg_data = {}
 
         for variable in self.global_cfg_vars.values():
@@ -2410,6 +2952,7 @@ class DeviceTab(ttk.Frame):
         # No event-loop calls between the two assignments.
         self._full_dump_data = snapshot
         self._full_dump_metadata = source_metadata
+        self._full_restore_report = None
 
         messagebox.showinfo(
             "Full Dump read completed",
@@ -2570,13 +3113,14 @@ class DeviceTab(ttk.Frame):
             f"Pages: {', '.join(map(str, pages))}\n"
             f"Total records: {len(snapshot)}\n"
             f"Marked writable in CSV: {writable}\n\n"
-            "Compatibility with the connected device will be "
-            "checked before writing.\n"
+            "Use Check Restore for compatibility and diagnostic checks.\n"
+            "Full Restore execution is unavailable.\n"
             "Page Dump snapshots have not been changed."
         )
 
         self._full_dump_data = snapshot
         self._full_dump_metadata = source_metadata
+        self._full_restore_report = None
         self.dump_mode_var.set("Full Dump")
         self._update_dump_mode()
 

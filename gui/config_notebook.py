@@ -6,10 +6,14 @@ Register availability and access come from the device profile.
 """
 
 import math
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from core.pmbus_device import TransportDisconnectedError
+from core.pmbus_device import (
+    ControlWriteBlockedError,
+    TransportDisconnectedError,
+)
 from core.pmbus_formats import decode_value
 from gui.profiles.gui_config import (
     TAB_TITLES,
@@ -874,18 +878,38 @@ class ConfigNotebook(ttk.Frame):
         item["baseline"] = None
         item["baseline_raw"] = None
 
-        self._show_value(cmd, raw)
+        try:
+            self._show_value(cmd, raw)
 
-        if self._is_disconnected() or raw is None:
-            return
+            if self._is_disconnected() or raw is None:
+                return
 
-        text = item["variable"].get()
+            text = item["variable"].get()
 
-        if text in {"", "---", "ERR", "N/A", "N/S", "STALE"}:
-            return
+            if text in {
+                "", "---", "ERR", "N/A", "N/S", "STALE",
+            }:
+                return
 
-        item["baseline"] = text
-        item["baseline_raw"] = raw
+            item["baseline"] = text
+            item["baseline_raw"] = raw
+
+        finally:
+            if (
+                self.device.name == "LTM4677"
+                and item["row"].name in {
+                    "MFR_ADDRESS",
+                    "MFR_RAIL_ADDRESS",
+                }
+            ):
+                owner = self._owner()
+                refresh = getattr(
+                    owner,
+                    "_update_address_info_from_config",
+                    None,
+                )
+                if callable(refresh):
+                    refresh()
 
     def _show_value(self, cmd, raw):
         item = self._rows[cmd]
@@ -1003,6 +1027,106 @@ class ConfigNotebook(ttk.Frame):
 
         try:
             self._write_one(cmd)
+
+        except ControlWriteBlockedError as exc:
+            if self._is_disconnected():
+                return
+
+            same_target = (
+                exc.cmd == cmd
+                and exc.page == self.page
+            )
+
+            previous = (
+                exc.previous_raw if same_target else None
+            )
+
+            if (
+                isinstance(previous, int)
+                and not isinstance(previous, bool)
+                and 0 <= previous <= 0xFF
+            ):
+                self._show(cmd, previous)
+                display_notice = (
+                    "The value read before this attempt "
+                    "has been restored in the UI."
+                )
+
+            elif item["baseline"] is not None:
+                item["variable"].set(item["baseline"])
+                display_notice = (
+                    "The previously read value has been restored "
+                    "in the UI.\n"
+                    "It was not re-confirmed during this attempt."
+                )
+
+            else:
+                self._show(cmd, None)
+                display_notice = (
+                    "No confirmed previous value is available.\n"
+                    "The field is marked ERR."
+                )
+
+            self._finish_feedback(
+                cmd, "write_button", False
+            )
+
+            messagebox.showwarning(
+                "Control write blocked",
+                f"{row.name}\n\n"
+                f"{exc}\n\n"
+                f"{display_notice}\n"
+                "No control configuration write was sent.\n"
+                "No automatic rollback was performed.",
+                parent=self,
+            )
+
+            previous = None
+
+            if (
+                exc.cmd == cmd
+                and exc.page == self.page
+            ):
+                previous = exc.previous_raw
+
+            if (
+                isinstance(previous, int)
+                and not isinstance(previous, bool)
+                and 0 <= previous <= 0xFF
+            ):
+                self._show(cmd, previous)
+                restored = (
+                    "The value read before this attempt "
+                    "has been restored in the UI."
+                )
+            elif item["baseline"] is not None:
+                item["variable"].set(item["baseline"])
+                restored = (
+                    "The previously confirmed value has been "
+                    "restored in the UI."
+                )
+            else:
+                self._show(cmd, None)
+                restored = (
+                    "No confirmed previous value is available. "
+                    "The field is marked ERR."
+                )
+
+            self._finish_feedback(
+                cmd,
+                "write_button",
+                False,
+            )
+
+            messagebox.showwarning(
+                "Control write blocked",
+                f"{row.name}\n\n"
+                f"{exc}\n\n"
+                f"{restored}\n"
+                "No control configuration write was sent.\n"
+                "No automatic retry was performed.",
+                parent=self,
+            )
 
         except TransportDisconnectedError as exc:
             self._handle_disconnect(exc)
@@ -1140,6 +1264,11 @@ class ConfigNotebook(ttk.Frame):
         if not confirmed or not self._can_write(row):
             return
 
+        # The dialog runs a nested Tk event loop.
+        # Monitoring may detect a disconnect while it is open.
+        if not confirmed or not self._can_write(row):
+            return
+
         self._begin_feedback(cmd, "write_button")
 
         try:
@@ -1157,6 +1286,9 @@ class ConfigNotebook(ttk.Frame):
                     value,
                     row.fmt,
                 )
+        except ControlWriteBlockedError:
+            # The control configuration write was not sent.
+            raise
 
         except TransportDisconnectedError:
             item["baseline"] = None
@@ -1199,9 +1331,39 @@ class ConfigNotebook(ttk.Frame):
         self._begin_feedback(cmd, "read_button")
 
         try:
-            readback = self.device.read_register(
-                self.page, cmd
-            )
+            readback = None
+
+            for attempt in range(5):
+                if (
+                    self.device.name == "LTM4677"
+                    and row.name in {
+                        "OPERATION",
+                        "ON_OFF_CONFIG",
+                    }
+                    and callable(
+                        getattr(
+                            self.device,
+                            "read_ltm4677_control_readback",
+                            None,
+                        )
+                    )
+                ):
+                    readback = (
+                        self.device.read_ltm4677_control_readback(
+                            self.page,
+                            cmd,
+                        )
+                    )
+                else:
+                    readback = self.device.read_register(
+                        self.page,
+                        cmd,
+                    )
+
+                if readback is not None:
+                    break
+
+                time.sleep(0.1)
 
         except TransportDisconnectedError:
             raise
