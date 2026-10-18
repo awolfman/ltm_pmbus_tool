@@ -6,6 +6,26 @@ register_device(0x47B0, "LTM4677", 2, __name__)
 
 VOUT_EXPONENT = -12
 
+# Address register identities only, not a transition policy.
+ADDRESS_REGISTERS = (
+    (
+        0xE6,
+        "MFR_ADDRESS",
+        "byte",
+        "BYTE",
+        False,
+        "individual",
+    ),
+    (
+        0xFA,
+        "MFR_RAIL_ADDRESS",
+        "byte",
+        "BYTE",
+        True,
+        "rail",
+    ),
+)
+
 REGISTER_OVERRIDES = {
     0x27: ('VOUT_TRANSITION_RATE',      'word', 'L11',  True),
     0x33: ('FREQUENCY_SWITCH',          'word', 'L11',  False),
